@@ -142,6 +142,11 @@ impl From<std::io::Error> for CompactError {
         Self::Io(e)
     }
 }
+impl From<arrow::error::ArrowError> for CompactError {
+    fn from(e: arrow::error::ArrowError) -> Self {
+        Self::Parquet(e.into())
+    }
+}
 
 pub type Result<T> = std::result::Result<T, CompactError>;
 
@@ -294,9 +299,10 @@ pub fn compact_bucket(
         |r| r.get(0),
     )?;
 
-    // Committed files for this exact bucket. Their count is the sequence
-    // number of the file this run would create — recomputed identically on
-    // a post-crash re-run, so the rewrite lands on the same name.
+    // Active files for this exact bucket (drives the no-op/already-done
+    // logic). The file *name* sequence comes from `bucket_seq` — a count
+    // over rows of any status, so a superseded file's name is never
+    // reused (GC of the old row would otherwise delete the new file).
     let committed = silodb_catalog::entries_for_bucket(
         conn,
         spec.logical_table,
@@ -319,13 +325,17 @@ pub fn compact_bucket(
         });
     }
 
+    let seq = silodb_catalog::bucket_seq(
+        conn,
+        spec.logical_table,
+        spec.bucket_start,
+        spec.bucket_end,
+    )?;
     let table_dir = base_dir.join(spec.logical_table);
     std::fs::create_dir_all(&table_dir)?;
     let out_path = table_dir.join(format!(
-        "bucket-{}-{}-{}.parquet",
-        spec.bucket_start,
-        spec.bucket_end,
-        committed.len(),
+        "bucket-{}-{}-{seq}.parquet",
+        spec.bucket_start, spec.bucket_end,
     ));
     let out_str = out_path.display().to_string();
 
@@ -452,6 +462,174 @@ pub fn compact_bucket(
         Ok(()) => {
             conn.execute_batch("COMMIT")?;
             Ok(CompactOutcome::Compacted {
+                rows: total_rows,
+                path: out_path,
+            })
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
+}
+
+/// Outcome of a tier-promotion merge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeOutcome {
+    /// Children rewritten into one file, catalog updated in one
+    /// transaction (children flipped to `superseded`, not yet unlinked —
+    /// GC is the caller's step).
+    Merged {
+        children: usize,
+        rows: usize,
+        path: std::path::PathBuf,
+    },
+    /// Fewer than one strictly-finer active file inside the window.
+    NothingToMerge,
+}
+
+/// Merge every active file lying strictly inside `[window_start,
+/// window_end)` (each narrower than the window) into a single new file
+/// covering the window, then — in one transaction — insert the new
+/// catalog row and mark the children `superseded`. Child *files* are left
+/// on disk for the caller to GC after commit.
+///
+/// This is the one write-path operation that reads Parquet — it copies
+/// its own children (batch-wise, memory bounded by one batch) and never
+/// touches the hot table. `compact_bucket`'s never-reads-Parquet
+/// invariant is per-function and unaffected.
+///
+/// Idempotent like compaction: a crash between rename and commit leaves
+/// an invisible file; a re-run recomputes the same children and sequence
+/// and rewrites it identically.
+pub fn merge_window(
+    conn: &Connection,
+    logical_table: &str,
+    base_dir: &Path,
+    window_start: i64,
+    window_end: i64,
+) -> Result<MergeOutcome> {
+    silodb_catalog::ensure_catalog(conn)?;
+    let children =
+        silodb_catalog::entries_within(conn, logical_table, window_start, window_end)?;
+    // Nothing to do when the window is empty, or already exactly one file
+    // covering the whole window (that IS the tier's end state).
+    let already_converged = children.len() == 1
+        && children[0].range_start == window_start
+        && children[0].range_end == window_end;
+    if children.is_empty() || already_converged {
+        return Ok(MergeOutcome::NothingToMerge);
+    }
+    for c in &children {
+        if !Path::new(&c.path).is_file() {
+            return Err(CompactError::MissingCompactedFile {
+                path: c.path.clone(),
+            });
+        }
+    }
+
+    let seq = silodb_catalog::bucket_seq(conn, logical_table, window_start, window_end)?;
+    let table_dir = base_dir.join(logical_table);
+    std::fs::create_dir_all(&table_dir)?;
+    let out_path = table_dir.join(format!(
+        "bucket-{window_start}-{window_end}-{seq}.parquet"
+    ));
+    let tmp_path = {
+        let mut p = out_path.as_os_str().to_owned();
+        p.push(".tmp");
+        std::path::PathBuf::from(p)
+    };
+
+    let write_result: Result<usize> = (|| {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        let mut writer: Option<ArrowWriter<File>> = None;
+        let mut schema: Option<std::sync::Arc<arrow::datatypes::Schema>> = None;
+        let mut total_rows = 0usize;
+        // Children are ordered by (range_start, path); non-overlapping
+        // ranges concatenate in time order. Overlapping late-arrival
+        // files may interleave out of order — harmless: row-group
+        // statistics stay exact per group, which is all pruning needs.
+        for child in &children {
+            let file = File::open(&child.path)?;
+            let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
+            for batch in reader {
+                let batch = batch?;
+                let schema = schema.get_or_insert_with(|| batch.schema());
+                if batch.schema() != *schema {
+                    return Err(CompactError::Parquet(
+                        parquet::errors::ParquetError::General(format!(
+                            "merge children disagree on schema at '{}'",
+                            child.path
+                        )),
+                    ));
+                }
+                let w = match writer.as_mut() {
+                    Some(w) => w,
+                    None => {
+                        let props = WriterProperties::builder()
+                            .set_max_row_group_row_count(Some(ROW_GROUP_ROWS))
+                            .build();
+                        writer = Some(ArrowWriter::try_new(
+                            File::create(&tmp_path)?,
+                            schema.clone(),
+                            Some(props),
+                        )?);
+                        writer.as_mut().unwrap()
+                    }
+                };
+                total_rows += batch.num_rows();
+                w.write(&batch)?;
+            }
+        }
+        let Some(writer) = writer else {
+            return Ok(0);
+        };
+        let file = writer.into_inner()?;
+        file.sync_all()?;
+        Ok(total_rows)
+    })();
+
+    let total_rows = match write_result {
+        Ok(0) => {
+            // All children empty (shouldn't happen — compaction never
+            // writes empty files) — treat as nothing to do.
+            let _ = std::fs::remove_file(&tmp_path);
+            return Ok(MergeOutcome::NothingToMerge);
+        }
+        Ok(n) => n,
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e);
+        }
+    };
+
+    std::fs::rename(&tmp_path, &out_path)?;
+    File::open(&table_dir)?.sync_all()?;
+
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let txn: Result<()> = (|| {
+        silodb_catalog::insert_entry(
+            conn,
+            &CatalogEntry {
+                logical_table: logical_table.to_owned(),
+                path: out_path.display().to_string(),
+                range_start: window_start,
+                range_end: window_end,
+                row_count: Some(total_rows as i64),
+                created_at: 0,
+                status: "active".into(),
+            },
+        )?;
+        for c in &children {
+            silodb_catalog::supersede_entry(conn, logical_table, &c.path)?;
+        }
+        Ok(())
+    })();
+    match txn {
+        Ok(()) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(MergeOutcome::Merged {
+                children: children.len(),
                 rows: total_rows,
                 path: out_path,
             })

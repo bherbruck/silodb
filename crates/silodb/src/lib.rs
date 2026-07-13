@@ -34,7 +34,7 @@
 use std::path::Path;
 
 use rusqlite::functions::FunctionFlags;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 pub use silodb_compact::{compact_bucket, BucketSpec, CompactError, CompactOutcome};
 pub use silodb_vtab::{last_scan_stats, ScanStats};
@@ -189,6 +189,84 @@ pub fn init_table(
     schema: &str,
     base_dir: impl AsRef<Path>,
 ) -> Result<(), InitError> {
+    init_table_tiered(conn, table, schema, base_dir, "1d")
+}
+
+/// [`init_table`] plus an explicit compaction-tier policy, e.g.
+/// `"1d, 7d, 28d"`: hot rows compact into 1-day bucket files; once a
+/// 7-day window is fully in the past its daily files merge into one
+/// weekly file; likewise weekly → 28-day. Units: `s m h d w`. Each tier
+/// must be an exact multiple of the previous one (windows are
+/// epoch-aligned; `30d` after `7d` would strand straddling files — use
+/// `28d`). The policy persists in `_silodb_policy`; [`maintain`] executes
+/// it.
+pub fn init_table_tiered(
+    conn: &Connection,
+    table: &str,
+    schema: &str,
+    base_dir: impl AsRef<Path>,
+    tiers: &str,
+) -> Result<(), InitError> {
+    let tiers_us = parse_tiers(tiers)?;
+    catalog::set_policy(
+        conn,
+        &catalog::TablePolicy {
+            logical_table: table.to_owned(),
+            tiers_us,
+            safety_margin_us: 2 * 3600 * 1_000_000, // 2h, per spec contract
+        },
+    )?;
+    init_table_inner(conn, table, schema, base_dir)
+}
+
+/// Parse `"1d, 7d, 28d"` into ascending microsecond windows, validating
+/// that each tier is a multiple of the previous.
+fn parse_tiers(tiers: &str) -> Result<Vec<i64>, InitError> {
+    let bad = |m: String| InitError::BadSchema(m);
+    let mut out = Vec::new();
+    for part in tiers.split(',') {
+        let part = part.trim();
+        let (num, unit) = part.split_at(part.len().saturating_sub(1));
+        let n: i64 = num
+            .trim()
+            .parse()
+            .map_err(|_| bad(format!("bad tier '{part}'")))?;
+        let secs = match unit {
+            "s" => 1,
+            "m" => 60,
+            "h" => 3600,
+            "d" => 86_400,
+            "w" => 7 * 86_400,
+            _ => return Err(bad(format!("bad tier unit in '{part}' (use s/m/h/d/w)"))),
+        };
+        let us = n
+            .checked_mul(secs)
+            .and_then(|s| s.checked_mul(1_000_000))
+            .filter(|&us| us > 0)
+            .ok_or_else(|| bad(format!("tier '{part}' out of range")))?;
+        if let Some(&prev) = out.last()
+            && (us <= prev || us % prev != 0)
+        {
+            return Err(bad(format!(
+                "tier '{part}' must be an ascending exact multiple of the \
+                 previous tier (epoch-aligned windows can't merge \
+                 straddling files — e.g. use 28d after 7d, not 30d)"
+            )));
+        }
+        out.push(us);
+    }
+    if out.is_empty() {
+        return Err(bad("no tiers".into()));
+    }
+    Ok(out)
+}
+
+fn init_table_inner(
+    conn: &Connection,
+    table: &str,
+    schema: &str,
+    base_dir: impl AsRef<Path>,
+) -> Result<(), InitError> {
     let cols = parse_schema(schema)?;
     // A bucket axis must be resolvable: TIMESTAMP-typed column (preferred),
     // or the legacy INTEGER `ts` name.
@@ -302,4 +380,176 @@ pub fn compact_table(
         },
         base_dir.as_ref(),
     )
+}
+
+/// One thing [`maintain`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MaintainAction {
+    /// Hot rows for a closed tier-0 bucket aged out to a new file.
+    Compacted {
+        window: (i64, i64),
+        rows: usize,
+        path: std::path::PathBuf,
+    },
+    /// Finer files promoted into one tier-N window file (children
+    /// superseded).
+    Merged {
+        window: (i64, i64),
+        children: usize,
+        rows: usize,
+        path: std::path::PathBuf,
+    },
+    /// A superseded file unlinked and its catalog row removed.
+    Gc { path: String },
+}
+
+#[derive(Debug)]
+pub enum MaintainError {
+    /// No `_silodb_policy` row for this table — init it with
+    /// [`init_table`]/[`init_table_tiered`] first.
+    NoPolicy(String),
+    Compact(CompactError),
+    Sqlite(rusqlite::Error),
+}
+
+impl std::fmt::Display for MaintainError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoPolicy(t) => write!(f, "no maintenance policy for table '{t}'"),
+            Self::Compact(e) => write!(f, "{e}"),
+            Self::Sqlite(e) => write!(f, "sqlite error: {e}"),
+        }
+    }
+}
+impl std::error::Error for MaintainError {}
+impl From<CompactError> for MaintainError {
+    fn from(e: CompactError) -> Self {
+        Self::Compact(e)
+    }
+}
+impl From<rusqlite::Error> for MaintainError {
+    fn from(e: rusqlite::Error) -> Self {
+        Self::Sqlite(e)
+    }
+}
+
+/// Converge one table's storage toward its tier policy: compact every
+/// closed tier-0 bucket out of the hot table, promote finer files into
+/// every higher-tier window that is fully in the past, and GC superseded
+/// files. Idempotent — call it on a dumb timer and at boot; when nothing
+/// is due it costs a few indexed queries and returns an empty report.
+///
+/// `now_us` is the clock (epoch µs): pass real time in production; tests
+/// pass whatever they like. Nothing newer than `now - safety_margin` is
+/// ever touched. Contract: one maintainer process at a time (same as the
+/// compaction scheduling contract).
+pub fn maintain(
+    conn: &Connection,
+    table: &str,
+    base_dir: impl AsRef<Path>,
+    now_us: i64,
+) -> Result<Vec<MaintainAction>, MaintainError> {
+    let base = base_dir.as_ref();
+    let policy = catalog::get_policy(conn, table)?
+        .ok_or_else(|| MaintainError::NoPolicy(table.to_owned()))?;
+    let cutoff = now_us.saturating_sub(policy.safety_margin_us);
+    let t0 = policy.tiers_us[0];
+    let mut actions = Vec::new();
+
+    // --- tier 0: age closed buckets out of the hot table -------------
+    let hot = format!("{table}_hot");
+    let hot_exists: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+            [&hot],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if hot_exists.is_some() {
+        // The ts column: same discovery compact_bucket uses.
+        let cols: Vec<silodb_schema::ColumnDecl> = conn
+            .prepare(&format!("PRAGMA table_info({})", quote_ident(&hot)))?
+            .query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?
+            .filter_map(|r| r.ok().and_then(|(n, d)| silodb_schema::ColumnDecl::parse(&n, &d)))
+            .collect();
+        if let Ok(ts_idx) = silodb_schema::resolve_ts_index(&cols, None) {
+            let ts_q = quote_ident(&cols[ts_idx].name);
+            let (lo, hi) = conn.query_row(
+                &format!(
+                    "SELECT min({ts_q}), max({ts_q}) FROM {} WHERE {ts_q} < ?1",
+                    quote_ident(&hot)
+                ),
+                [cutoff],
+                |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<i64>>(1)?)),
+            )?;
+            let bounds = lo.zip(hi);
+            if let Some((lo, hi)) = bounds {
+                let first = lo.div_euclid(t0);
+                let last = hi.div_euclid(t0);
+                for b in first..=last {
+                    let (start, end) = (b * t0, (b + 1) * t0);
+                    if end > cutoff {
+                        break; // bucket still open (or inside the margin)
+                    }
+                    match compact_table(conn, table, start, end, base)? {
+                        CompactOutcome::Compacted { rows, path } => {
+                            actions.push(MaintainAction::Compacted {
+                                window: (start, end),
+                                rows,
+                                path,
+                            })
+                        }
+                        CompactOutcome::AlreadyCompacted | CompactOutcome::EmptyBucket => {}
+                    }
+                }
+            }
+        }
+    }
+
+    // --- higher tiers: promote finer files into closed windows -------
+    for &w in &policy.tiers_us[1..] {
+        // Candidate windows = distinct epoch-aligned windows containing
+        // active files strictly finer than w, where the window itself is
+        // fully behind the cutoff.
+        let entries = catalog::entries_for_table(conn, table)?;
+        let mut windows: Vec<i64> = entries
+            .iter()
+            .filter(|e| (e.range_end - e.range_start) < w)
+            .map(|e| e.range_start.div_euclid(w))
+            .collect();
+        windows.sort_unstable();
+        windows.dedup();
+        for win in windows {
+            let (start, end) = (win * w, (win + 1) * w);
+            if end > cutoff {
+                continue;
+            }
+            match silodb_compact::merge_window(conn, table, base, start, end)? {
+                silodb_compact::MergeOutcome::Merged {
+                    children,
+                    rows,
+                    path,
+                } => actions.push(MaintainAction::Merged {
+                    window: (start, end),
+                    children,
+                    rows,
+                    path,
+                }),
+                silodb_compact::MergeOutcome::NothingToMerge => {}
+            }
+        }
+    }
+
+    // --- GC superseded files ------------------------------------------
+    for entry in catalog::superseded_entries(conn, table)? {
+        match std::fs::remove_file(&entry.path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(MaintainError::Compact(e.into())),
+        }
+        catalog::delete_entry(conn, table, &entry.path)?;
+        actions.push(MaintainAction::Gc { path: entry.path });
+    }
+
+    Ok(actions)
 }

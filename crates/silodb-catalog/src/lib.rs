@@ -163,6 +163,140 @@ pub fn entries_for_bucket(
     rows.collect()
 }
 
+/// How many rows — of ANY status — exist for exactly `[start, end)`.
+/// This is the sequence-number source for new file names: counting only
+/// active rows would reuse a superseded file's name, and a later GC of
+/// the superseded row would then delete the new live file.
+pub fn bucket_seq(conn: &Connection, logical_table: &str, start: i64, end: i64) -> Result<i64> {
+    conn.query_row(
+        "SELECT count(*) FROM _silodb_catalog
+         WHERE logical_table = ?1 AND range_start = ?2 AND range_end = ?3",
+        params![logical_table, start, end],
+        |r| r.get(0),
+    )
+}
+
+/// Active files lying entirely inside `[start, end)` — merge candidates
+/// for tier promotion, *including* a previously merged window-sized file
+/// (so a late straggler re-consolidates with it instead of accumulating
+/// beside it). Ordered by (range_start, path) so concatenation preserves
+/// time order for non-overlapping children.
+pub fn entries_within(
+    conn: &Connection,
+    logical_table: &str,
+    start: i64,
+    end: i64,
+) -> Result<Vec<CatalogEntry>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {SELECT_COLS} FROM _silodb_catalog
+         WHERE logical_table = ?1 AND status = 'active'
+           AND range_start >= ?2 AND range_end <= ?3
+         ORDER BY range_start, path"
+    ))?;
+    let rows = stmt.query_map(params![logical_table, start, end], entry_from_row)?;
+    rows.collect()
+}
+
+/// Flip one file to `status = 'superseded'` (invisible to readers, file
+/// awaiting GC). Runs in the caller's ambient transaction.
+pub fn supersede_entry(conn: &Connection, logical_table: &str, path: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE _silodb_catalog SET status = 'superseded'
+         WHERE logical_table = ?1 AND path = ?2",
+        params![logical_table, path],
+    )?;
+    Ok(())
+}
+
+/// Superseded rows for a table — GC work list.
+pub fn superseded_entries(conn: &Connection, logical_table: &str) -> Result<Vec<CatalogEntry>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {SELECT_COLS} FROM _silodb_catalog
+         WHERE logical_table = ?1 AND status = 'superseded' ORDER BY path"
+    ))?;
+    let rows = stmt.query_map([logical_table], entry_from_row)?;
+    rows.collect()
+}
+
+/// Remove one catalog row (after its file has been unlinked by GC).
+pub fn delete_entry(conn: &Connection, logical_table: &str, path: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM _silodb_catalog WHERE logical_table = ?1 AND path = ?2",
+        params![logical_table, path],
+    )?;
+    Ok(())
+}
+
+/// Per-table maintenance policy, set at init and read by `maintain()`.
+/// `tiers_us` ascending, each dividing the next; buckets/windows are
+/// epoch-aligned multiples of these.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TablePolicy {
+    pub logical_table: String,
+    /// Tier window sizes in microseconds, finest first.
+    pub tiers_us: Vec<i64>,
+    /// Don't touch data newer than now - margin.
+    pub safety_margin_us: i64,
+}
+
+/// Create the policy table if needed. Idempotent.
+pub fn ensure_policy_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS _silodb_policy (
+            logical_table     TEXT PRIMARY KEY,
+            tiers_us          TEXT NOT NULL,  -- comma-separated i64 µs
+            safety_margin_us  INTEGER NOT NULL
+        );",
+    )
+}
+
+/// Insert or replace a table's policy.
+pub fn set_policy(conn: &Connection, policy: &TablePolicy) -> Result<()> {
+    ensure_policy_table(conn)?;
+    let tiers = policy
+        .tiers_us
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    conn.execute(
+        "INSERT OR REPLACE INTO _silodb_policy VALUES (?1, ?2, ?3)",
+        params![policy.logical_table, tiers, policy.safety_margin_us],
+    )?;
+    Ok(())
+}
+
+/// A table's policy, if one was set.
+pub fn get_policy(conn: &Connection, logical_table: &str) -> Result<Option<TablePolicy>> {
+    let table_exists: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_silodb_policy'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if table_exists.is_none() {
+        return Ok(None);
+    }
+    conn.query_row(
+        "SELECT logical_table, tiers_us, safety_margin_us FROM _silodb_policy
+         WHERE logical_table = ?1",
+        [logical_table],
+        |r| {
+            let tiers: String = r.get(1)?;
+            Ok(TablePolicy {
+                logical_table: r.get(0)?,
+                tiers_us: tiers
+                    .split(',')
+                    .filter_map(|t| t.parse().ok())
+                    .collect(),
+                safety_margin_us: r.get(2)?,
+            })
+        },
+    )
+    .optional()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

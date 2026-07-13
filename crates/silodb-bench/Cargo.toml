@@ -1,5 +1,6 @@
 [package]
 name = "silodb-bench"
+default-run = "silodb-bench"
 version = "0.1.0"
 edition = "2024"
 

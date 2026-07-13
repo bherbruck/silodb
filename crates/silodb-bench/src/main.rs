@@ -203,11 +203,12 @@ fn main() {
     conn.pragma_update(None, "journal_mode", "WAL").unwrap();
     conn.pragma_update(None, "synchronous", "NORMAL").unwrap();
     silodb::load_module(&conn).unwrap();
-    silodb::init_table(
+    silodb::init_table_tiered(
         &conn,
         "readings",
         "ts TIMESTAMP, device TEXT, sensor TEXT, value REAL",
         &base,
+        "1d,7d,28d",
     )
     .unwrap();
 
@@ -305,6 +306,45 @@ fn main() {
         }
     }
     println!("{table_md}");
+
+    // ---------- tiered maintenance (1d -> 7d -> 28d), then re-measure ----
+    let t = Instant::now();
+    // Clock just past the end of the data + safety margin: everything due.
+    let now = days * BUCKET_US + 3 * 3600 * 1_000_000;
+    let actions = silodb::maintain(&conn, "readings", &base, now).unwrap();
+    let (mut merges, mut gcs) = (0, 0);
+    for a in &actions {
+        match a {
+            silodb::MaintainAction::Merged { .. } => merges += 1,
+            silodb::MaintainAction::Gc { .. } => gcs += 1,
+            silodb::MaintainAction::Compacted { .. } => {}
+        }
+    }
+    let active = silodb::catalog::entries_for_table(&conn, "readings")
+        .unwrap()
+        .len();
+    println!(
+        "\n## tiered maintenance (1d,7d,28d): {merges} merges, {gcs} files GC'd in {:.1}s -> {active} active files, parquet {:.1} MB",
+        t.elapsed().as_secs_f64(),
+        mb(dir_size(&base)),
+    );
+
+    let duck_times = run_duckdb(&qs, &out);
+    let mut tiered_md = String::new();
+    writeln!(
+        tiered_md,
+        "\n| query | silodb tiered | duckdb tiered |\n|---|---|---|"
+    )
+    .unwrap();
+    for (i, (label, sqlite_sql, _)) in qs.queries.iter().enumerate() {
+        let (med, min) = time_query(|| count_query(&conn, sqlite_sql));
+        let duck = duck_times
+            .as_ref()
+            .map(|t| format!("{:.1} ({:.1})", t[i].0, t[i].1))
+            .unwrap_or_else(|| "n/a".into());
+        writeln!(tiered_md, "| {label} | {med:.1} ({min:.1}) | {duck} |").unwrap();
+    }
+    println!("{tiered_md}");
 }
 
 /// Run each duckdb query 13 times (3 warmups) in one CLI session with
