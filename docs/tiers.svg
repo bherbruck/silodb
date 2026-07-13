@@ -1,0 +1,106 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 640" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif">
+  <defs>
+    <marker id="arr" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L8,4 L0,8 z" fill="#52514e"/>
+    </marker>
+  </defs>
+
+  <rect width="1040" height="640" rx="14" fill="#fcfcfb"/>
+
+  <!-- title -->
+  <text x="40" y="42" font-size="19" font-weight="700" fill="#0b0b0b">silodb tiered compaction</text>
+  <text x="40" y="64" font-size="13" fill="#52514e">policy <tspan font-family="ui-monospace, monospace" fill="#0b0b0b">tiers('1d, 7d, 28d')</tspan> — maintain() runs on a dumb timer and executes whatever is due; storage converges to this shape</text>
+
+  <!-- time axis: newest at left, aging to the right -->
+  <line x1="150" y1="96" x2="1000" y2="96" stroke="#c9c8c2" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="150" y="88" font-size="12" fill="#52514e">now</text>
+  <text x="1000" y="88" font-size="12" fill="#52514e" text-anchor="end">older</text>
+  <text x="575" y="88" font-size="11.5" fill="#8a887f" text-anchor="middle">time — not to scale (recent zoomed)</text>
+
+  <!-- ============ HOT lane ============ -->
+  <text x="40" y="147" font-size="12.5" font-weight="600" fill="#0b0b0b">hot tier</text>
+  <text x="40" y="163" font-size="11.5" fill="#52514e">sqlite table</text>
+  <rect x="150" y="118" width="107" height="52" rx="6" fill="#fdeae2" stroke="#d95926" stroke-width="1.5"/>
+  <text x="203" y="140" font-size="12" font-weight="600" fill="#0b0b0b" text-anchor="middle">open bucket</text>
+  <text x="203" y="156" font-size="11" fill="#52514e" text-anchor="middle">+ 2h margin</text>
+  <!-- writes arrow -->
+  <line x1="203" y1="82" x2="203" y2="112" stroke="#d95926" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="215" y="78" font-size="11.5" fill="#52514e">INSERTs (~430k rows/s)</text>
+  <text x="271" y="147" font-size="11" fill="#8a887f">← never touched by maintain()</text>
+
+  <!-- compact arrow: hot -> tier 0 -->
+  <path d="M 250 172 C 266 196, 270 200, 274 214" fill="none" stroke="#52514e" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="292" y="190" font-size="11.5" fill="#0b0b0b">compact — bucket closed &amp; past margin:</text>
+  <text x="292" y="204" font-size="11.5" fill="#52514e">rows → new file, then one txn: DELETE hot + INSERT catalog row</text>
+
+  <!-- ============ TIER 0 lane (1d files) ============ -->
+  <text x="40" y="242" font-size="12.5" font-weight="600" fill="#0b0b0b">tier 0 — 1d</text>
+  <text x="40" y="258" font-size="11.5" fill="#52514e">daily files</text>
+  <!-- live dailies (current week) -->
+  <g fill="#cde2fb" stroke="#5598e7" stroke-width="1.5">
+    <rect x="266" y="222" width="30" height="40" rx="4"/>
+    <rect x="300" y="222" width="30" height="40" rx="4"/>
+    <rect x="334" y="222" width="30" height="40" rx="4"/>
+  </g>
+  <text x="315" y="216" font-size="11" fill="#0b0b0b" text-anchor="middle">1d files</text>
+  <text x="315" y="278" font-size="10.5" fill="#8a887f" text-anchor="middle">current week, still accumulating</text>
+  <!-- ghost dailies already promoted (over the 7d span) -->
+  <g stroke="#a5a49b" stroke-dasharray="4 3" fill="none" stroke-width="1.2">
+    <rect x="375" y="222" width="17" height="40" rx="4"/>
+    <rect x="396" y="222" width="17" height="40" rx="4"/>
+    <rect x="417" y="222" width="17" height="40" rx="4"/>
+    <rect x="438" y="222" width="17" height="40" rx="4"/>
+    <rect x="459" y="222" width="17" height="40" rx="4"/>
+    <rect x="480" y="222" width="17" height="40" rx="4"/>
+    <rect x="501" y="222" width="17" height="40" rx="4"/>
+  </g>
+  <text x="455" y="278" font-size="10.5" fill="#8a887f">superseded → GC</text>
+
+  <!-- merge arrow tier0 -> tier1 -->
+  <line x1="446" y1="266" x2="446" y2="308" stroke="#52514e" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="458" y="296" font-size="11.5" fill="#0b0b0b">merge 7×1d → one 7d file</text>
+  <text x="458" y="310" font-size="11.5" fill="#52514e">(7d window fully in the past)</text>
+
+  <!-- ============ TIER 1 lane (7d files) ============ -->
+  <text x="40" y="336" font-size="12.5" font-weight="600" fill="#0b0b0b">tier 1 — 7d</text>
+  <text x="40" y="352" font-size="11.5" fill="#52514e">weekly files</text>
+  <!-- live weekly -->
+  <rect x="375" y="316" width="143" height="40" rx="4" fill="#9ec5f4" stroke="#2a78d6" stroke-width="1.5"/>
+  <text x="446" y="341" font-size="11.5" fill="#0b0b0b" text-anchor="middle" font-weight="600">7d file</text>
+  <!-- ghost weeklies already promoted (over the newest 28d span) -->
+  <g stroke="#a5a49b" stroke-dasharray="4 3" fill="none" stroke-width="1.2">
+    <rect x="530" y="316" width="54" height="40" rx="4"/>
+    <rect x="588" y="316" width="54" height="40" rx="4"/>
+    <rect x="646" y="316" width="54" height="40" rx="4"/>
+    <rect x="704" y="316" width="54" height="40" rx="4"/>
+  </g>
+  <text x="540" y="372" font-size="10.5" fill="#8a887f">superseded → GC</text>
+
+  <!-- merge arrow tier1 -> tier2 -->
+  <line x1="644" y1="360" x2="644" y2="402" stroke="#52514e" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="656" y="386" font-size="11.5" fill="#0b0b0b">merge 4×7d → one 28d file</text>
+  <text x="656" y="400" font-size="11.5" fill="#52514e">(late rows re-merge the window — converges)</text>
+
+  <!-- ============ TIER 2 lane (28d files) ============ -->
+  <text x="40" y="430" font-size="12.5" font-weight="600" fill="#0b0b0b">tier 2 — 28d</text>
+  <text x="40" y="446" font-size="11.5" fill="#52514e">monthly files</text>
+  <g fill="#6da7ec" stroke="#184f95" stroke-width="1.5">
+    <rect x="522" y="410" width="236" height="40" rx="4"/>
+    <rect x="764" y="410" width="236" height="40" rx="4"/>
+  </g>
+  <text x="640" y="435" font-size="11.5" fill="#0b0b0b" text-anchor="middle" font-weight="600">28d file</text>
+  <text x="882" y="435" font-size="11.5" fill="#0b0b0b" text-anchor="middle" font-weight="600">28d file</text>
+
+  <!-- tier N hint -->
+  <rect x="764" y="474" width="236" height="34" rx="4" fill="none" stroke="#a5a49b" stroke-width="1.2" stroke-dasharray="5 4"/>
+  <text x="752" y="495" font-size="11.5" fill="#52514e" text-anchor="end">… tier N — any depth; each window an exact multiple of the previous (epoch-aligned)</text>
+
+  <!-- ============ invariants ============ -->
+  <line x1="40" y1="530" x2="1000" y2="530" stroke="#e5e4e0" stroke-width="1"/>
+  <g font-size="12" fill="#52514e">
+    <text x="40" y="554"><tspan font-weight="600" fill="#0b0b0b">immutable:</tspan> files are never reopened — merges write a new file, fsync, atomic rename</text>
+    <text x="40" y="576"><tspan font-weight="600" fill="#0b0b0b">transactional:</tspan> a file exists iff its catalog row committed — supersede + insert happen in one sqlite transaction</text>
+    <text x="40" y="598"><tspan font-weight="600" fill="#0b0b0b">convergent:</tspan> crash anywhere, rerun maintain() — same file names recomputed, byte-identical rewrites, no duplicates</text>
+    <text x="40" y="620"><tspan font-weight="600" fill="#0b0b0b">bounded:</tspan> a year of daily buckets ends as ~14 active files instead of 365 (~130 per decade, not 3,650)</text>
+  </g>
+</svg>
