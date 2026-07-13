@@ -1135,7 +1135,11 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 name = "silodb"
 version = "0.1.0"
 dependencies = [
+ "rusqlite",
+ "silodb-catalog",
+ "silodb-compact",
  "silodb-vtab",
+ "tempfile",
 ]
 
 [[package]]
@@ -1149,7 +1153,12 @@ dependencies = [
 name = "silodb-compact"
 version = "0.1.0"
 dependencies = [
+ "arrow",
+ "parquet",
+ "rusqlite",
  "silodb-catalog",
+ "silodb-schema",
+ "tempfile",
 ]
 
 [[package]]

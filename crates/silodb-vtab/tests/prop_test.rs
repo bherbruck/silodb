@@ -1,7 +1,7 @@
 //! Property test (spec: "the test that actually catches 'pruning silently
 //! drops a row it shouldn't'"): random data split across random bucket
 //! files + random range constraints; the doubly-pruned (catalog file level
-//! + row-group level) vtab scan must return exactly the rows a straight
+//! plus row-group level) vtab scan must return exactly the rows a straight
 //! in-memory filter of the same data returns.
 
 mod common;

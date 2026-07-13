@@ -22,7 +22,8 @@ fn env_with_fixture() -> ColdEnv {
 fn full_scan_returns_all_rows_in_order() {
     let env = env_with_fixture();
 
-    let rows: Vec<(i64, i64, Option<f64>, Option<String>, Option<Vec<u8>>, i64)> = env
+    type Row = (i64, i64, Option<f64>, Option<String>, Option<Vec<u8>>, i64);
+    let rows: Vec<Row> = env
         .conn
         .prepare("SELECT id, ts, value, name, payload, flag FROM cold")
         .unwrap()

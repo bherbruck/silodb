@@ -12,19 +12,20 @@ separate crates. Neither should import the other. If you find yourself
 wanting `silodb-compact` to call into `silodb-vtab`, or vice versa, that's a
 sign the thing you actually need belongs in `silodb-schema` instead.
 
-Dependency direction is one-way, outward from `silodb-schema`:
+Dependency direction is one-way, outward from the two shared base crates:
 
 ```
-        silodb-schema
-         /          \
-  silodb-vtab   silodb-compact
-         \          /
-          silodb-loadable   silodb  (facades — see below)
+   silodb-schema   silodb-catalog
+          \         /      \
+        silodb-vtab      silodb-compact
+                \           /
+       silodb-loadable    silodb  (facades — see below)
 ```
 
 `silodb-schema` must never depend on `rusqlite`. It's pure Parquet↔SQLite
 type-mapping logic and should be testable without a SQLite connection in
-scope at all.
+scope at all. Symmetrically, `silodb-catalog` must never depend on
+`parquet`/`arrow` — it's pure SQLite.
 
 ## Crates
 
@@ -33,20 +34,31 @@ scope at all.
   one thing both the read and write paths need to agree on, so it's the
   single source of truth for that mapping, not duplicated in each.
 
-- **`silodb-vtab`** — `VTab`/`VTabCursor` implementation (Phases 1–2 of the
-  spec). Depends on `rusqlite` (`vtab` feature), `parquet`, and
-  `silodb-schema`. Does not know anything about compaction, buckets, or the
-  hot SQLite table's schema.
+- **`silodb-catalog`** — the `_silodb_catalog` table (specv2 Phase 2.5):
+  schema, ensure/insert, and the indexed range-overlap query. Lives in the
+  hot database, so a compaction is durable exactly when its transaction
+  commits. Depends on `rusqlite` only — never on `parquet`/`arrow`. Like
+  `silodb-schema`, it's a base crate both paths share without importing
+  each other.
+
+- **`silodb-vtab`** — `VTab`/`VTabCursor` implementation (Phases 1–2.5 of
+  the spec). Takes a directory (one per logical table); asks the catalog
+  which files can overlap the query's timestamp bounds, then row-group
+  prunes within them (footers cached per `(path, mtime, size)`). Depends on
+  `rusqlite` (`vtab` feature), `parquet`, `silodb-schema`, and
+  `silodb-catalog`. Does not know anything about compaction or the hot
+  SQLite table's schema.
 
 - **`silodb-compact`** — the compaction routine (Phase 3 of the spec).
-  Depends on `rusqlite`, `parquet`, and `silodb-schema`. Does not depend on
-  `silodb-vtab` — it writes Parquet files, it doesn't need to read them back
-  through the vtab to do its job. Owns the temp-file/fsync/atomic-rename/
-  delete-after-rename sequencing and the idempotency guarantee described in
-  the spec. Trigger logic (schedule vs. manual) is intentionally **not**
-  here — this crate exposes `compact_bucket()`; deciding *when* to call it
-  is the embedding application's job, documented as a contract in the spec,
-  not enforced by this crate.
+  Depends on `rusqlite`, `parquet`, `silodb-schema`, and `silodb-catalog`.
+  Does not depend on `silodb-vtab` — it writes Parquet files, it doesn't
+  need to read them back through the vtab to do its job. Owns the
+  temp-file/fsync/atomic-rename sequencing and the single transaction that
+  deletes hot rows *and* inserts the catalog row (specv2), plus the
+  idempotency guarantee. Trigger logic (schedule vs. manual) is
+  intentionally **not** here — this crate exposes `compact_bucket()`;
+  deciding *when* to call it is the embedding application's job, documented
+  as a contract in the spec, not enforced by this crate.
 
 - **`silodb-loadable`** — optional `cdylib` wrapper that exposes
   `silodb-vtab` as a standalone loadable SQLite extension (for ad-hoc
@@ -71,25 +83,38 @@ silodb/
     spec.md
   crates/
     silodb-schema/
+    silodb-catalog/
     silodb-vtab/
     silodb-compact/
     silodb-loadable/
     silodb/
   fixtures/
-    *.parquet              # shared hand-built test files, used by both
-                            # silodb-vtab and silodb-compact test suites
+    *.parquet              # shared hand-built test files — regenerate with
+                            # `cargo run --manifest-path fixtures/gen/Cargo.toml`,
+                            # never edit by hand (row-group boundaries are
+                            # load-bearing for pruning tests)
+    gen/                   # the deterministic generator for the above
 ```
 
 ## Testing
 
 - `silodb-schema`: pure unit tests, no I/O.
-- `silodb-vtab`: integration tests against `fixtures/*.parquet` — see spec
-  Phase 1/2 acceptance criteria (correct rows on full scan; row-group skip
-  count assertions on constrained queries, not wall-clock timing).
-- `silodb-compact`: integration tests including a simulated-crash case —
-  interrupt between temp-file rename and row delete, re-run compaction, and
-  assert no duplication/corruption. This is the idempotency guarantee from
-  the spec and it needs an actual test, not just code review.
+- `silodb-catalog`: unit tests against in-memory SQLite (range-overlap
+  boundary semantics live here — entry ranges are half-open).
+- `silodb-vtab`: integration tests against `fixtures/*.parquet` plus
+  generated multi-file setups — file-level and row-group skip-count
+  assertions on `last_scan_stats()`, not wall-clock timing; plus the
+  proptest comparing pruned scans to an in-memory filter (the
+  highest-value test in the crate, per spec).
+- `silodb-compact`: integration tests including the simulated-crash case
+  (file renamed, delete+catalog transaction never ran → re-run produces a
+  byte-identical file, no duplication) and the specv2 bounded-cost test
+  (per-run work flat across 100 accumulating buckets).
+- `silodb` (facade): the end-to-end hot→compact→`UNION ALL` view test —
+  the only place the read and write paths meet.
+- Test suites use a dev-dependency on rusqlite `bundled` so `cargo test`
+  is self-contained; linking against libSQL is the embedding binary's
+  concern (recipe in `docs/phase0-results.md`).
 
 ## Tooling: use the CLI, don't hand-write what a tool can tell you
 

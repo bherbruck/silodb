@@ -149,10 +149,11 @@ impl SiloTab {
         let mtime = stat.modified().map_err(module_err)?;
         let size = stat.len();
 
-        if let Some(hit) = self.meta_cache.borrow().get(path) {
-            if hit.mtime == mtime && hit.size == size {
-                return Ok((hit.meta.clone(), true));
-            }
+        if let Some(hit) = self.meta_cache.borrow().get(path)
+            && hit.mtime == mtime
+            && hit.size == size
+        {
+            return Ok((hit.meta.clone(), true));
         }
 
         let file = File::open(path).map_err(module_err)?;
@@ -291,7 +292,11 @@ unsafe impl<'vtab> VTab<'vtab> for SiloTab {
 
         let ts_col = schema.index_of(&parsed.ts_column).ok();
         let sql = silodb_schema::create_table_sql(&schema).map_err(module_err)?;
-        db.config(VTabConfig::DirectOnly)?;
+        // Deliberately NOT VTabConfig::DirectOnly: the intended usage pattern
+        // is a `hot UNION ALL cold` view over this vtab, and DirectOnly
+        // forbids vtab access from views. Innocuous is the honest setting —
+        // the vtab only reads files the catalog points at.
+        db.config(VTabConfig::Innocuous)?;
 
         let vtab = Self {
             base: ffi::sqlite3_vtab::default(),
@@ -672,7 +677,7 @@ fn set_result_from_array(ctx: &mut Context, array: &dyn Array, row: usize) -> Re
         return ctx.set_result(&Null);
     }
 
-    fn down<'a, T: 'static>(array: &'a dyn Array) -> Result<&'a T> {
+    fn down<T: 'static>(array: &dyn Array) -> Result<&T> {
         array
             .as_any()
             .downcast_ref::<T>()

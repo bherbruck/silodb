@@ -4,4 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+arrow = "59.1.0"
+parquet = "59.1.0"
+rusqlite = "0.40.1"
 silodb-catalog = { version = "0.1.0", path = "../silodb-catalog" }
+silodb-schema = { version = "0.1.0", path = "../silodb-schema" }
+
+[dev-dependencies]
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+tempfile = "3.27.0"
