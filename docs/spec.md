@@ -240,6 +240,14 @@ Single source of truth for both directions; never depends on `rusqlite`.
   `silodb-schema`): `silodb_ts(x)` parses ISO 8601 text to epoch µs
   (INTEGER passes through, so `WHERE ts > silodb_ts(?1)` takes either);
   `silodb_datetime(µs)` formats back to ISO 8601 UTC text.
+  Known trade-off of the integer passthrough: a caller accidentally
+  binding epoch *seconds* is passed through unvalidated — off by 10⁶,
+  symptom is queries silently matching nothing near a boundary that
+  should match. Deliberately not guarded: a magnitude plausibility check
+  would bake wall-clock assumptions into an engine that legitimately runs
+  on any i64 axis (synthetic data, test fixtures). If a bug report reads
+  "range query returns nothing that should be there", check the caller's
+  units first.
 
 ## Testing strategy
 
