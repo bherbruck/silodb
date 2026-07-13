@@ -186,11 +186,11 @@ fn main() {
     let buckets = rows * US_PER_SEC / BUCKET_US + 1;
     let mut files = 0;
     for b in 0..buckets {
-        match silodb::compact_table(&conn, "readings", b * BUCKET_US, (b + 1) * BUCKET_US, &base)
-            .unwrap()
+        if let silodb::CompactOutcome::Compacted { .. } =
+            silodb::compact_table(&conn, "readings", b * BUCKET_US, (b + 1) * BUCKET_US, &base)
+                .unwrap()
         {
-            silodb::CompactOutcome::Compacted { .. } => files += 1,
-            _ => {}
+            files += 1;
         }
     }
     let compact_s = t.elapsed().as_secs_f64();
@@ -302,7 +302,7 @@ fn run_duckdb(qs: &QuerySet, out: &Path) -> Option<Vec<(f64, f64)>> {
     let mut reals: Vec<f64> = Vec::new();
     for line in text.lines() {
         if let Some(rest) = line.trim().strip_prefix("Run Time (s): real") {
-            let secs: f64 = rest.trim().split_whitespace().next()?.parse().ok()?;
+            let secs: f64 = rest.split_whitespace().next()?.parse().ok()?;
             reals.push(secs * 1e3);
         }
     }
