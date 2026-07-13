@@ -1,9 +1,10 @@
 //! Phase 3 acceptance: temp-file/fsync/rename/transactional-delete
-//! sequencing, idempotency across a simulated crash, refusal paths, and the
-//! bounded-cost invariant from specv2.
+//! sequencing, idempotency across every calling pattern (specv2: no
+//! user-visible failure modes short of real data loss), and the
+//! bounded-cost invariant.
 
 use std::fs::File;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use rusqlite::{params, Connection};
@@ -46,7 +47,14 @@ fn hot_count(conn: &Connection) -> i64 {
         .unwrap()
 }
 
-/// (ts values, total rows) read straight from a Parquet file.
+fn compacted(outcome: CompactOutcome) -> (usize, std::path::PathBuf) {
+    match outcome {
+        CompactOutcome::Compacted { rows, path } => (rows, path),
+        other => panic!("expected Compacted, got {other:?}"),
+    }
+}
+
+/// ts values read straight from a Parquet file.
 fn parquet_ts(path: &Path) -> Vec<i64> {
     use arrow::array::{Array, TimestampMicrosecondArray};
     let reader = ParquetRecordBatchReaderBuilder::try_new(File::open(path).unwrap())
@@ -69,10 +77,6 @@ fn parquet_ts(path: &Path) -> Vec<i64> {
     out
 }
 
-fn out_path(dir: &tempfile::TempDir, name: &str) -> PathBuf {
-    dir.path().join(name)
-}
-
 #[test]
 fn round_trip_moves_exactly_the_bucket() {
     let conn = hot_db();
@@ -90,20 +94,28 @@ fn round_trip_moves_exactly_the_bucket() {
     insert_row(&conn, 2500, Some(9.9), Some("after"));
 
     let dir = tempfile::tempdir().unwrap();
-    let out = out_path(&dir, "bucket-1000.parquet");
-    let outcome = compact_bucket(&conn, &spec(1000, 2000), &out).unwrap();
-    assert_eq!(outcome, CompactOutcome::Compacted { rows: 10 });
+    let (rows, path) = compacted(compact_bucket(&conn, &spec(1000, 2000), dir.path()).unwrap());
+    assert_eq!(rows, 10);
+    assert_eq!(
+        path.file_name().unwrap().to_str().unwrap(),
+        "bucket-1000-2000-0.parquet",
+        "range and sequence encoded for human debuggability"
+    );
 
     // Parquet holds exactly the bucket, ordered by ts.
-    let ts = parquet_ts(&out);
+    let ts = parquet_ts(&path);
     assert_eq!(ts, (0..10).map(|i| 1000 + i * 100).collect::<Vec<_>>());
-    assert!(!out.with_extension("parquet.tmp").exists(), "no temp left");
+    assert_eq!(
+        std::fs::read_dir(dir.path()).unwrap().count(),
+        1,
+        "no temp file left behind"
+    );
 
     // Hot table keeps only out-of-bucket rows.
     assert_eq!(hot_count(&conn), 2);
 
     // Catalog row committed with the right range and count.
-    let entry = silodb_catalog::entry_for_path(&conn, "readings", &out.display().to_string())
+    let entry = silodb_catalog::entry_for_path(&conn, "readings", &path.display().to_string())
         .unwrap()
         .unwrap();
     assert_eq!(entry.range_start, 1000);
@@ -119,10 +131,9 @@ fn null_and_type_round_trip_through_parquet() {
     insert_row(&conn, 1100, Some(1.5), None);
 
     let dir = tempfile::tempdir().unwrap();
-    let out = out_path(&dir, "b.parquet");
-    compact_bucket(&conn, &spec(1000, 2000), &out).unwrap();
+    let (_, path) = compacted(compact_bucket(&conn, &spec(1000, 2000), dir.path()).unwrap());
 
-    let reader = ParquetRecordBatchReaderBuilder::try_new(File::open(&out).unwrap())
+    let reader = ParquetRecordBatchReaderBuilder::try_new(File::open(&path).unwrap())
         .unwrap()
         .build()
         .unwrap();
@@ -158,15 +169,9 @@ fn empty_bucket_is_a_clean_noop() {
     let conn = hot_db();
     insert_row(&conn, 5000, Some(1.0), Some("elsewhere"));
     let dir = tempfile::tempdir().unwrap();
-    let out = out_path(&dir, "empty.parquet");
-    let outcome = compact_bucket(&conn, &spec(1000, 2000), &out).unwrap();
+    let outcome = compact_bucket(&conn, &spec(1000, 2000), dir.path()).unwrap();
     assert_eq!(outcome, CompactOutcome::EmptyBucket);
-    assert!(!out.exists());
-    assert!(
-        silodb_catalog::entry_for_path(&conn, "readings", &out.display().to_string())
-            .unwrap()
-            .is_none()
-    );
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     assert_eq!(hot_count(&conn), 1);
 }
 
@@ -175,13 +180,12 @@ fn rerun_after_success_is_a_noop() {
     let conn = hot_db();
     insert_row(&conn, 1000, Some(1.0), Some("x"));
     let dir = tempfile::tempdir().unwrap();
-    let out = out_path(&dir, "b.parquet");
-    compact_bucket(&conn, &spec(1000, 2000), &out).unwrap();
-    let bytes_before = std::fs::read(&out).unwrap();
+    let (_, path) = compacted(compact_bucket(&conn, &spec(1000, 2000), dir.path()).unwrap());
+    let bytes_before = std::fs::read(&path).unwrap();
 
-    let outcome = compact_bucket(&conn, &spec(1000, 2000), &out).unwrap();
+    let outcome = compact_bucket(&conn, &spec(1000, 2000), dir.path()).unwrap();
     assert_eq!(outcome, CompactOutcome::AlreadyCompacted);
-    assert_eq!(std::fs::read(&out).unwrap(), bytes_before, "file untouched");
+    assert_eq!(std::fs::read(&path).unwrap(), bytes_before, "file untouched");
 
     // Still exactly one catalog row.
     let n: i64 = conn
@@ -192,14 +196,13 @@ fn rerun_after_success_is_a_noop() {
 
 /// The spec's simulated-crash case: the process dies between the rename and
 /// the delete+catalog transaction. On disk: a complete Parquet file. In the
-/// DB: hot rows intact, no catalog row. Re-running must produce the same
-/// file and a committed catalog row — no duplication, no corruption.
+/// DB: hot rows intact, no catalog row. Re-running must land on the same
+/// sequence — producing the same file — and commit. No duplication.
 #[test]
 fn rerun_after_crash_between_rename_and_commit() {
     // Build the crashed state directly: run a full compaction on a throwaway
     // DB to obtain the exact file a finished run produces...
     let dir = tempfile::tempdir().unwrap();
-    let out = out_path(&dir, "b.parquet");
     let make_hot = || {
         let conn = hot_db();
         for i in 0..5 {
@@ -209,44 +212,61 @@ fn rerun_after_crash_between_rename_and_commit() {
         conn
     };
     let throwaway = make_hot();
-    compact_bucket(&throwaway, &spec(1000, 2000), &out).unwrap();
-    let file_from_finished_run = std::fs::read(&out).unwrap();
+    let (_, path) = compacted(compact_bucket(&throwaway, &spec(1000, 2000), dir.path()).unwrap());
+    let file_from_finished_run = std::fs::read(&path).unwrap();
 
     // ...and pair that file with a fresh DB whose transaction "never ran".
     let conn = make_hot();
     assert_eq!(hot_count(&conn), 6);
 
-    let outcome = compact_bucket(&conn, &spec(1000, 2000), &out).unwrap();
-    assert_eq!(outcome, CompactOutcome::Compacted { rows: 5 });
+    let (rows, rerun_path) =
+        compacted(compact_bucket(&conn, &spec(1000, 2000), dir.path()).unwrap());
+    assert_eq!(rows, 5);
+    assert_eq!(rerun_path, path, "same sequence number recomputed");
     assert_eq!(
-        std::fs::read(&out).unwrap(),
+        std::fs::read(&rerun_path).unwrap(),
         file_from_finished_run,
         "re-run must produce an identical file"
     );
     assert_eq!(hot_count(&conn), 1, "bucket rows deleted exactly once");
-    let entry = silodb_catalog::entry_for_path(&conn, "readings", &out.display().to_string())
-        .unwrap()
-        .unwrap();
+    let entry =
+        silodb_catalog::entry_for_path(&conn, "readings", &rerun_path.display().to_string())
+            .unwrap()
+            .unwrap();
     assert_eq!(entry.row_count, Some(5));
 }
 
+/// Late rows landing in an already-compacted bucket are not an error: the
+/// next run writes a follow-up file (next sequence number) for the same
+/// range, invisible to the caller.
 #[test]
-fn refuses_when_rows_reappear_after_compaction() {
+fn late_rows_get_a_follow_up_file() {
     let conn = hot_db();
     insert_row(&conn, 1000, Some(1.0), Some("x"));
     let dir = tempfile::tempdir().unwrap();
-    let out = out_path(&dir, "b.parquet");
-    compact_bucket(&conn, &spec(1000, 2000), &out).unwrap();
+    let (_, first) = compacted(compact_bucket(&conn, &spec(1000, 2000), dir.path()).unwrap());
 
-    // A write lands inside the already-compacted bucket (safety margin bug
-    // in the embedding app).
+    // A write lands inside the already-compacted bucket.
     insert_row(&conn, 1500, Some(2.0), Some("late"));
-    let err = compact_bucket(&conn, &spec(1000, 2000), &out).unwrap_err();
-    assert!(matches!(
-        err,
-        CompactError::BucketChangedAfterCompaction { rows: 1 }
-    ));
-    assert_eq!(hot_count(&conn), 1, "late row must NOT be deleted");
+    let (rows, second) = compacted(compact_bucket(&conn, &spec(1000, 2000), dir.path()).unwrap());
+    assert_eq!(rows, 1);
+    assert_eq!(
+        second.file_name().unwrap().to_str().unwrap(),
+        "bucket-1000-2000-1.parquet"
+    );
+    assert_ne!(first, second);
+    assert_eq!(parquet_ts(&second), vec![1500]);
+    assert_eq!(hot_count(&conn), 0, "late row aged out too");
+
+    // Both files are catalog-committed for the same range.
+    let entries = silodb_catalog::entries_for_bucket(&conn, "readings", 1000, 2000).unwrap();
+    assert_eq!(entries.len(), 2);
+
+    // And a further re-run is back to a no-op.
+    assert_eq!(
+        compact_bucket(&conn, &spec(1000, 2000), dir.path()).unwrap(),
+        CompactOutcome::AlreadyCompacted
+    );
 }
 
 #[test]
@@ -254,11 +274,10 @@ fn refuses_when_catalog_references_missing_file() {
     let conn = hot_db();
     insert_row(&conn, 1000, Some(1.0), Some("x"));
     let dir = tempfile::tempdir().unwrap();
-    let out = out_path(&dir, "b.parquet");
-    compact_bucket(&conn, &spec(1000, 2000), &out).unwrap();
-    std::fs::remove_file(&out).unwrap();
+    let (_, path) = compacted(compact_bucket(&conn, &spec(1000, 2000), dir.path()).unwrap());
+    std::fs::remove_file(&path).unwrap();
 
-    let err = compact_bucket(&conn, &spec(1000, 2000), &out).unwrap_err();
+    let err = compact_bucket(&conn, &spec(1000, 2000), dir.path()).unwrap_err();
     assert!(matches!(err, CompactError::MissingCompactedFile { .. }));
 }
 
@@ -273,11 +292,13 @@ fn type_mismatch_aborts_without_side_effects() {
     )
     .unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let out = out_path(&dir, "b.parquet");
-    let err = compact_bucket(&conn, &spec(1000, 2000), &out).unwrap_err();
+    let err = compact_bucket(&conn, &spec(1000, 2000), dir.path()).unwrap_err();
     assert!(matches!(err, CompactError::TypeMismatch { .. }), "{err}");
-    assert!(!out.exists());
-    assert!(!dir.path().join("b.parquet.tmp").exists(), "tmp cleaned up");
+    assert_eq!(
+        std::fs::read_dir(dir.path()).unwrap().count(),
+        0,
+        "no file, no tmp"
+    );
     assert_eq!(hot_count(&conn), 1, "nothing deleted");
 }
 
@@ -297,7 +318,7 @@ fn unsupported_declared_type_is_rejected() {
             bucket_start: 0,
             bucket_end: 2000,
         },
-        &out_path(&dir, "w.parquet"),
+        dir.path(),
     )
     .unwrap_err();
     assert!(matches!(err, CompactError::UnsupportedDecl { .. }), "{err}");
@@ -314,7 +335,7 @@ fn bad_timestamp_column_is_rejected() {
             ts_column: "name", // TEXT column
             ..spec(1000, 2000)
         },
-        &out_path(&dir, "b.parquet"),
+        dir.path(),
     )
     .unwrap_err();
     assert!(matches!(err, CompactError::BadTimestampColumn { .. }), "{err}");
@@ -342,15 +363,11 @@ fn compaction_cost_stays_flat_as_history_accumulates() {
         let changes_before: i64 = conn
             .query_row("SELECT total_changes()", [], |r| r.get(0))
             .unwrap();
-        let out = dir.path().join(format!("bucket-{start}.parquet"));
-        let outcome = compact_bucket(&conn, &spec(start, start + 1000), &out).unwrap();
+        let (rows, _) = compacted(compact_bucket(&conn, &spec(start, start + 1000), dir.path()).unwrap());
         let changes_after: i64 = conn
             .query_row("SELECT total_changes()", [], |r| r.get(0))
             .unwrap();
 
-        let CompactOutcome::Compacted { rows } = outcome else {
-            panic!("bucket {b} not compacted: {outcome:?}");
-        };
         rows_per_run.push(rows);
         changes_per_run.push(changes_after - changes_before);
 

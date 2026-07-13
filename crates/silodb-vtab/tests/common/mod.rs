@@ -40,10 +40,13 @@ pub fn cold_env() -> ColdEnv {
 
 impl ColdEnv {
     pub fn create_vtab(&self) {
+        // Base dir + explicit table= (the vtab's name, `cold`, differs from
+        // the logical table). The vtab-name-default path is covered in
+        // directory_test.
         self.conn
             .execute_batch(&format!(
-                "CREATE VIRTUAL TABLE cold USING silodb('{}')",
-                self.table_dir.display()
+                "CREATE VIRTUAL TABLE cold USING silodb('{}', table=sensor)",
+                self.dir.path().display()
             ))
             .unwrap();
     }

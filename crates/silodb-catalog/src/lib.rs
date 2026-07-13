@@ -143,6 +143,26 @@ pub fn entries_for_table(conn: &Connection, logical_table: &str) -> Result<Vec<C
     entries_overlapping(conn, logical_table, i64::MIN, i64::MAX)
 }
 
+/// Files whose range is exactly `[start, end)` — i.e. previous compactions
+/// of this precise bucket. More than one entry means late rows were
+/// compacted into follow-up files. Ordered by path (paths embed a sequence
+/// number, so this is creation order).
+pub fn entries_for_bucket(
+    conn: &Connection,
+    logical_table: &str,
+    start: i64,
+    end: i64,
+) -> Result<Vec<CatalogEntry>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {SELECT_COLS} FROM _silodb_catalog
+         WHERE logical_table = ?1 AND status = 'active'
+           AND range_start = ?2 AND range_end = ?3
+         ORDER BY path"
+    ))?;
+    let rows = stmt.query_map(params![logical_table, start, end], entry_from_row)?;
+    rows.collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

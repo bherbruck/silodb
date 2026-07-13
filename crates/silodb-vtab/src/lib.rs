@@ -1,18 +1,25 @@
-//! `silodb` SQLite virtual table: read-only queries over a directory of
-//! Parquet bucket files, driven by the `_silodb_catalog` table in the same
-//! (hot) database.
+//! `silodb` SQLite virtual table: read-only queries over Parquet bucket
+//! files, driven by the `_silodb_catalog` table in the same (hot) database.
 //!
 //! ```sql
-//! CREATE VIRTUAL TABLE cold USING silodb('buckets/sensor_a/');
+//! -- one base directory for ALL cold tables; the vtab's own name is the
+//! -- logical table (its files conventionally live in buckets/sensor_a/):
+//! CREATE VIRTUAL TABLE sensor_a USING silodb('buckets/');
 //! -- optional overrides:
-//! CREATE VIRTUAL TABLE cold USING silodb('buckets/a/', table=sensor_a, ts_column=ts);
-//! SELECT * FROM cold WHERE ts > ?1 AND ts < ?2;
+//! CREATE VIRTUAL TABLE cold USING silodb('buckets/', table=sensor_a, ts_column=ts, hot_table=sensor_a);
+//! SELECT * FROM sensor_a WHERE ts > ?1 AND ts < ?2;
 //! ```
 //!
-//! One directory per logical table, one immutable Parquet file per compacted
-//! bucket. The catalog — not a directory glob — decides which files exist:
-//! a Parquet file with no catalog row (e.g. a compaction that crashed before
-//! its commit) is invisible here, and its rows are still in the hot table.
+//! One immutable Parquet file per compacted bucket. The catalog — not a
+//! directory glob — decides which files exist: a Parquet file with no
+//! catalog row (e.g. a compaction that crashed before its commit) is
+//! invisible here, and its rows are still in the hot table.
+//!
+//! Day-zero friendly: with no compacted files yet, the declared columns
+//! come from the hot table's schema (same mapping compaction writes with,
+//! via `silodb_schema::bucket_arrow_schema`), and scans are simply empty.
+//! No ordering requirement between `CREATE VIRTUAL TABLE` and the first
+//! compaction.
 //!
 //! Pruning happens in two layers at `xFilter` time:
 //! 1. **File level**: an indexed range query against `_silodb_catalog`
@@ -52,10 +59,10 @@ use parquet::file::statistics::Statistics;
 use rusqlite::ffi;
 use rusqlite::types::{Null, ValueRef};
 use rusqlite::vtab::{
-    Context, CreateVTab, Filters, IndexConstraintOp, IndexInfo, Module, VTab, VTabConfig,
-    VTabConnection, VTabCursor, VTabKind,
+    Context, CreateVTab, Filters, IndexConstraintOp, IndexInfo, Module, VTab, VTabConnection,
+    VTabCursor, VTabKind,
 };
-use rusqlite::{Connection, Error, Result};
+use rusqlite::{Connection, Error, OptionalExtension, Result};
 
 const MODULE_NAME: &CStr = c"silodb";
 const DEFAULT_TS_COLUMN: &str = "ts";
@@ -117,7 +124,9 @@ pub struct SiloTab {
     /// Raw handle of the (hot) database this vtab lives in; used to query
     /// `_silodb_catalog` from inside `filter`. Never closed through here.
     db: *mut ffi::sqlite3,
-    dir: PathBuf,
+    /// Base directory shared by all cold tables. Convention only — file
+    /// locations come from the catalog verbatim.
+    base_dir: PathBuf,
     logical_table: String,
     /// Index of the timestamp column in `schema`, if it exists — drives
     /// catalog file-level range pruning.
@@ -183,28 +192,31 @@ fn parse_str_arg(arg: &[u8]) -> Result<String> {
 }
 
 struct TabArgs {
-    dir: PathBuf,
-    logical_table: String,
+    base_dir: PathBuf,
+    logical_table: Option<String>,
     ts_column: String,
+    hot_table: Option<String>,
 }
 
-/// First argument: directory (quoted). Optional `key=value` arguments:
-/// `table=<logical table>` (default: directory basename) and
-/// `ts_column=<name>` (default: `ts`).
+/// First argument: the base directory shared by every cold table (quoted).
+/// Optional `key=value` arguments: `table=<logical table>` (default: the
+/// virtual table's own name), `ts_column=<name>` (default: `ts`), and
+/// `hot_table=<name>` (default: the logical table name; only consulted
+/// when the catalog has no files yet).
 fn parse_args(args: &[&[u8]]) -> Result<TabArgs> {
     let [dir_arg, rest @ ..] = args else {
         return Err(module_err(
-            "expected a directory argument: USING silodb('buckets/my_table/')",
+            "expected a base directory argument: USING silodb('buckets/')",
         ));
     };
     let dir_str = parse_str_arg(dir_arg)?;
     if dir_str.is_empty() {
         return Err(module_err("empty directory path"));
     }
-    let dir = PathBuf::from(&dir_str);
 
     let mut logical_table = None;
     let mut ts_column = None;
+    let mut hot_table = None;
     for arg in rest {
         let s = parse_str_arg(arg)?;
         let (key, value) = s
@@ -214,29 +226,83 @@ fn parse_args(args: &[&[u8]]) -> Result<TabArgs> {
         match key.trim() {
             "table" => logical_table = Some(value.to_owned()),
             "ts_column" => ts_column = Some(value.to_owned()),
+            "hot_table" => hot_table = Some(value.to_owned()),
             other => return Err(module_err(format!("unrecognized parameter '{other}'"))),
         }
     }
 
-    let logical_table = match logical_table {
-        Some(t) => t,
-        None => dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(str::to_owned)
-            .ok_or_else(|| {
-                module_err(format!(
-                    "cannot derive a logical table name from '{dir_str}'; \
-                     pass table=<name> explicitly"
-                ))
-            })?,
-    };
-
     Ok(TabArgs {
-        dir,
+        base_dir: PathBuf::from(dir_str),
         logical_table,
         ts_column: ts_column.unwrap_or_else(|| DEFAULT_TS_COLUMN.to_owned()),
+        hot_table,
     })
+}
+
+/// Declared schema when the catalog has no files yet: derive it from the
+/// hot table exactly the way `compact_bucket` will when it writes the
+/// first file, so the vtab's columns can't drift from future cold files.
+fn schema_from_hot_table(
+    hot: &Connection,
+    hot_table: &str,
+    ts_column: &str,
+) -> Result<Option<SchemaRef>> {
+    // Only a real (non-virtual) table can be a schema source. This also
+    // protects against recursion: with no table= argument the default
+    // logical/hot table name is the vtab's own name, and running PRAGMA
+    // table_info on the vtab mid-construction would re-enter xCreate.
+    let is_real_table: Option<i64> = hot
+        .query_row(
+            "SELECT 1 FROM sqlite_master
+             WHERE type = 'table' AND name = ?1 AND sql NOT LIKE 'CREATE VIRTUAL%'",
+            [hot_table],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(module_err)?;
+    if is_real_table.is_none() {
+        return Ok(None);
+    }
+    let mut stmt = hot
+        .prepare(&format!(
+            "PRAGMA table_info(\"{}\")",
+            hot_table.replace('"', "\"\"")
+        ))
+        .map_err(module_err)?;
+    let cols = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+        })
+        .map_err(module_err)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(module_err)?;
+    if cols.is_empty() {
+        return Ok(None); // no such hot table
+    }
+    let mapped = cols
+        .into_iter()
+        .map(|(name, decl)| {
+            let ty = silodb_schema::SqliteType::from_decl(&decl).ok_or_else(|| {
+                module_err(format!(
+                    "hot table '{hot_table}' column '{name}' has unsupported \
+                     declared type '{decl}'"
+                ))
+            })?;
+            Ok((name, ty))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let ts_idx = mapped
+        .iter()
+        .position(|(name, ty)| name == ts_column && *ty == silodb_schema::SqliteType::Integer)
+        .ok_or_else(|| {
+            module_err(format!(
+                "hot table '{hot_table}' has no INTEGER column '{ts_column}' \
+                 to use as the timestamp"
+            ))
+        })?;
+    Ok(Some(std::sync::Arc::new(
+        silodb_schema::bucket_arrow_schema(&mapped, ts_idx),
+    )))
 }
 
 unsafe impl<'vtab> VTab<'vtab> for SiloTab {
@@ -248,61 +314,71 @@ unsafe impl<'vtab> VTab<'vtab> for SiloTab {
         _aux: Option<&()>,
         _module_name: &[u8],
         _database_name: &[u8],
-        _table_name: &[u8],
+        table_name: &[u8],
         args: &[&[u8]],
     ) -> Result<(Cow<'static, CStr>, Self)> {
         let parsed = parse_args(args)?;
-        if !parsed.dir.is_dir() {
+        if !parsed.base_dir.is_dir() {
             return Err(module_err(format!(
                 "'{}' is not a directory",
-                parsed.dir.display()
+                parsed.base_dir.display()
             )));
         }
-
-        let handle = unsafe { db.handle() };
-
-        // Column declaration needs a schema, and the catalog is the source
-        // of truth for which files make up this table — so the table must
-        // have at least one compacted bucket before the vtab can connect.
-        // (Known limitation, flagged in the spec discussion: there is no
-        // schema source before the first compaction.)
-        let hot = unsafe { Connection::from_handle(handle) }?;
-        if !silodb_catalog::catalog_exists(&hot)? {
-            return Err(module_err(
-                "no _silodb_catalog table in this database; \
-                 run silodb_catalog::ensure_catalog / a first compaction before \
-                 creating silodb virtual tables",
-            ));
-        }
-        let entries = silodb_catalog::entries_for_table(&hot, &parsed.logical_table)?;
-        drop(hot);
-        let Some(first) = entries.first() else {
-            return Err(module_err(format!(
-                "catalog has no files for logical table '{}'; \
-                 compact at least one bucket first",
-                parsed.logical_table
-            )));
+        let logical_table = match parsed.logical_table {
+            Some(t) => t,
+            None => std::str::from_utf8(table_name)
+                .map_err(|_| module_err("table name is not UTF-8"))?
+                .to_owned(),
         };
 
-        let file = File::open(&first.path)
-            .map_err(|e| module_err(format!("cannot open '{}': {e}", first.path)))?;
-        let reader_meta =
-            ArrowReaderMetadata::load(&file, Default::default()).map_err(module_err)?;
-        let schema = reader_meta.schema().clone();
+        let handle = unsafe { db.handle() };
+        let hot = unsafe { Connection::from_handle(handle) }?;
+
+        // Schema source, in order: the first committed cold file; else the
+        // hot table (so day zero — before any compaction, even before the
+        // catalog exists — just works and scans come back empty).
+        let first_file = if silodb_catalog::catalog_exists(&hot)? {
+            silodb_catalog::entries_for_table(&hot, &logical_table)?
+                .into_iter()
+                .next()
+        } else {
+            None
+        };
+        let schema = match first_file {
+            Some(first) => {
+                let file = File::open(&first.path)
+                    .map_err(|e| module_err(format!("cannot open '{}': {e}", first.path)))?;
+                ArrowReaderMetadata::load(&file, Default::default())
+                    .map_err(module_err)?
+                    .schema()
+                    .clone()
+            }
+            None => {
+                let hot_table = parsed.hot_table.as_deref().unwrap_or(&logical_table);
+                schema_from_hot_table(&hot, hot_table, &parsed.ts_column)?.ok_or_else(|| {
+                    module_err(format!(
+                        "no schema source for '{logical_table}': the catalog has no \
+                         files for it and there is no hot table named '{hot_table}' \
+                         (pass hot_table=<name> or compact a first bucket)"
+                    ))
+                })?
+            }
+        };
+        drop(hot);
 
         let ts_col = schema.index_of(&parsed.ts_column).ok();
         let sql = silodb_schema::create_table_sql(&schema).map_err(module_err)?;
-        // Deliberately NOT VTabConfig::DirectOnly: the intended usage pattern
-        // is a `hot UNION ALL cold` view over this vtab, and DirectOnly
-        // forbids vtab access from views. Innocuous is the honest setting —
-        // the vtab only reads files the catalog points at.
-        db.config(VTabConfig::Innocuous)?;
+        // No VTabConfig trust flag on purpose. DirectOnly would forbid the
+        // intended `hot UNION ALL cold` view pattern; Innocuous would
+        // overclaim for a module that reads files off disk. The default
+        // (usable in views under SQLite's default trusted-schema mode) is
+        // the honest middle.
 
         let vtab = Self {
             base: ffi::sqlite3_vtab::default(),
             db: handle,
-            dir: parsed.dir,
-            logical_table: parsed.logical_table,
+            base_dir: parsed.base_dir,
+            logical_table,
             ts_col,
             schema,
             meta_cache: RefCell::new(HashMap::new()),
@@ -583,15 +659,21 @@ unsafe impl VTabCursor for SiloCursor<'_> {
 
         // Layer 1: catalog range query — whole-file pruning, and the point
         // where files compacted after CREATE VIRTUAL TABLE become visible.
+        // No catalog table yet (nothing ever compacted) → empty cold table.
         let hot = vtab.hot_db()?;
-        let total_files =
-            silodb_catalog::entries_for_table(&hot, &vtab.logical_table)?.len();
-        let (lo, hi) = match vtab.ts_col {
-            Some(ts) => ts_bounds(&pushed, ts),
-            None => (i64::MIN, i64::MAX),
+        let (total_files, candidates) = if silodb_catalog::catalog_exists(&hot)? {
+            let total = silodb_catalog::entries_for_table(&hot, &vtab.logical_table)?.len();
+            let (lo, hi) = match vtab.ts_col {
+                Some(ts) => ts_bounds(&pushed, ts),
+                None => (i64::MIN, i64::MAX),
+            };
+            (
+                total,
+                silodb_catalog::entries_overlapping(&hot, &vtab.logical_table, lo, hi)?,
+            )
+        } else {
+            (0, Vec::new())
         };
-        let candidates =
-            silodb_catalog::entries_overlapping(&hot, &vtab.logical_table, lo, hi)?;
         drop(hot);
 
         // Layer 2: row-group pruning within each candidate (Phase 2 logic).

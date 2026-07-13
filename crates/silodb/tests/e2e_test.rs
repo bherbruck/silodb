@@ -1,6 +1,9 @@
 //! End-to-end through the facade: hot writes → compaction → one connection
 //! querying hot + cold as a single view. This is the product story; if this
 //! passes, the read and write paths actually connect.
+//!
+//! Deliberately runs in the day-zero order: the vtab and view are created
+//! BEFORE anything is compacted (before the catalog even exists).
 
 use rusqlite::{params, Connection};
 use silodb::{compact_bucket, BucketSpec, CompactOutcome};
@@ -15,19 +18,36 @@ fn spec(start: i64, end: i64) -> BucketSpec<'static> {
     }
 }
 
+fn view_count(conn: &Connection) -> i64 {
+    conn.query_row("SELECT count(*) FROM all_readings", [], |r| r.get(0))
+        .unwrap()
+}
+
 #[test]
 fn hot_and_cold_union_view_over_compacted_buckets() {
-    let dir = tempfile::tempdir().unwrap();
-    let cold_dir = dir.path().join("readings");
+    let base = tempfile::tempdir().unwrap();
+    let cold_dir = base.path().join("readings");
     std::fs::create_dir(&cold_dir).unwrap();
 
     let conn = Connection::open_in_memory().unwrap();
-    silodb::catalog::ensure_catalog(&conn).unwrap();
     silodb::load_module(&conn).unwrap();
     conn.execute_batch(
         "CREATE TABLE readings (ts INTEGER NOT NULL, value REAL, name TEXT)",
     )
     .unwrap();
+
+    // Day zero: vtab + view exist before any compaction, before the
+    // catalog exists. Schema comes from the hot table.
+    conn.execute_batch(&format!(
+        "CREATE VIRTUAL TABLE cold USING silodb('{}', table=readings);
+         CREATE VIEW all_readings AS
+           SELECT ts, value, name FROM readings
+           UNION ALL
+           SELECT ts, value, name FROM cold;",
+        base.path().display()
+    ))
+    .unwrap();
+    assert_eq!(view_count(&conn), 0);
 
     // 3 buckets of history plus rows still hot.
     for i in 0..40i64 {
@@ -37,31 +57,19 @@ fn hot_and_cold_union_view_over_compacted_buckets() {
         )
         .unwrap();
     }
+    assert_eq!(view_count(&conn), 40);
 
     // Compact the first three closed buckets ([0,1000), [1000,2000),
-    // [2000,3000)); ts 3000.. stays hot.
+    // [2000,3000)); ts 3000.. stays hot. The view total never changes.
     for b in 0..3i64 {
         let start = b * 1000;
-        let out = cold_dir.join(format!("bucket-{start}.parquet"));
-        let outcome = compact_bucket(&conn, &spec(start, start + 1000), &out).unwrap();
-        assert_eq!(outcome, CompactOutcome::Compacted { rows: 10 });
+        let outcome = compact_bucket(&conn, &spec(start, start + 1000), &cold_dir).unwrap();
+        assert!(
+            matches!(outcome, CompactOutcome::Compacted { rows: 10, .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(view_count(&conn), 40, "moved, never duplicated or lost");
     }
-
-    conn.execute_batch(&format!(
-        "CREATE VIRTUAL TABLE cold USING silodb('{}');
-         CREATE VIEW all_readings AS
-           SELECT ts, value, name FROM readings
-           UNION ALL
-           SELECT ts, value, name FROM cold;",
-        cold_dir.display()
-    ))
-    .unwrap();
-
-    // Every row is visible exactly once through the view.
-    let total: i64 = conn
-        .query_row("SELECT count(*) FROM all_readings", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(total, 40);
     let hot: i64 = conn
         .query_row("SELECT count(*) FROM readings", [], |r| r.get(0))
         .unwrap();
@@ -84,18 +92,28 @@ fn hot_and_cold_union_view_over_compacted_buckets() {
     assert_eq!(stats.total_files, 3);
     assert_eq!(stats.candidate_files, 1);
 
-    // A bucket compacted after the vtab and view exist shows up without DDL.
-    let out = cold_dir.join("bucket-3000.parquet");
-    assert_eq!(
-        compact_bucket(&conn, &spec(3000, 4000), &out).unwrap(),
-        CompactOutcome::Compacted { rows: 10 }
-    );
-    let total: i64 = conn
-        .query_row("SELECT count(*) FROM all_readings", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(total, 40, "still 40 — moved, not duplicated");
+    // A bucket compacted later shows up without DDL.
+    assert!(matches!(
+        compact_bucket(&conn, &spec(3000, 4000), &cold_dir).unwrap(),
+        CompactOutcome::Compacted { rows: 10, .. }
+    ));
+    assert_eq!(view_count(&conn), 40);
     let hot: i64 = conn
         .query_row("SELECT count(*) FROM readings", [], |r| r.get(0))
         .unwrap();
     assert_eq!(hot, 0);
+
+    // Late rows into a compacted bucket: still invisible to the user —
+    // compact again, view stays consistent throughout.
+    conn.execute(
+        "INSERT INTO readings VALUES (1500, 99.0, 'late')",
+        [],
+    )
+    .unwrap();
+    assert_eq!(view_count(&conn), 41);
+    assert!(matches!(
+        compact_bucket(&conn, &spec(1000, 2000), &cold_dir).unwrap(),
+        CompactOutcome::Compacted { rows: 1, .. }
+    ));
+    assert_eq!(view_count(&conn), 41);
 }

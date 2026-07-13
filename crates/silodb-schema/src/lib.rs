@@ -146,6 +146,31 @@ pub fn arrow_field(name: &str, dt: DataType) -> Field {
     Field::new(name, dt, true)
 }
 
+/// The Arrow schema a compacted bucket file has, derived from the hot
+/// table's columns. This is the one definition both paths share:
+/// `silodb-compact` writes files with it, and `silodb-vtab` uses it to
+/// declare columns when no file exists yet (empty catalog) — so the two
+/// can never drift.
+///
+/// The timestamp column (`ts_idx`) becomes a non-nullable
+/// [`timestamp_arrow_type`] — bucket range predicates exclude NULLs — and
+/// every other column maps through [`arrow_type_for`], nullable.
+pub fn bucket_arrow_schema(columns: &[(String, SqliteType)], ts_idx: usize) -> Schema {
+    Schema::new(
+        columns
+            .iter()
+            .enumerate()
+            .map(|(i, (name, ty))| {
+                if i == ts_idx {
+                    Field::new(name, timestamp_arrow_type(), false)
+                } else {
+                    arrow_field(name, arrow_type_for(*ty))
+                }
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

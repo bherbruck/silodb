@@ -42,9 +42,13 @@ scope at all. Symmetrically, `silodb-catalog` must never depend on
   each other.
 
 - **`silodb-vtab`** — `VTab`/`VTabCursor` implementation (Phases 1–2.5 of
-  the spec). Takes a directory (one per logical table); asks the catalog
+  the spec). Takes one base directory shared by all cold tables; the vtab's
+  own name (or `table=`) selects the logical table. Asks the catalog
   which files can overlap the query's timestamp bounds, then row-group
-  prunes within them (footers cached per `(path, mtime, size)`). Depends on
+  prunes within them (footers cached per `(path, mtime, size)`). Day zero
+  works: with no cold files yet, the declared schema is borrowed from the
+  hot table via `silodb_schema::bucket_arrow_schema` — the same function
+  compaction writes files with, so they can't drift. Depends on
   `rusqlite` (`vtab` feature), `parquet`, `silodb-schema`, and
   `silodb-catalog`. Does not know anything about compaction or the hot
   SQLite table's schema.

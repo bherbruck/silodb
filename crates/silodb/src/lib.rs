@@ -3,10 +3,19 @@
 //! ```no_run
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let conn = rusqlite::Connection::open("hot.db")?;
-//! silodb::catalog::ensure_catalog(&conn)?;
 //! silodb::load_module(&conn)?;
 //!
-//! // Age a closed bucket out of the hot table...
+//! // One base directory serves every cold table; the vtab's own name picks
+//! // the logical table. Works on day zero, before anything was compacted.
+//! conn.execute_batch(
+//!     "CREATE VIRTUAL TABLE readings_cold USING silodb('buckets/', table=readings);
+//!      CREATE VIEW all_readings AS
+//!        SELECT * FROM readings UNION ALL SELECT * FROM readings_cold;",
+//! )?;
+//!
+//! // Age a closed bucket out of the hot table. The file is named and
+//! // cataloged internally; re-runs, crash recovery, and late rows are all
+//! // handled — every call pattern is idempotent.
 //! silodb::compact_bucket(
 //!     &conn,
 //!     &silodb::BucketSpec {
@@ -16,14 +25,7 @@
 //!         bucket_start: 0,
 //!         bucket_end: 3_600_000_000,
 //!     },
-//!     std::path::Path::new("buckets/readings/bucket-0.parquet"),
-//! )?;
-//!
-//! // ...and query hot + cold through one connection.
-//! conn.execute_batch(
-//!     "CREATE VIRTUAL TABLE cold USING silodb('buckets/readings/');
-//!      CREATE VIEW all_readings AS
-//!        SELECT * FROM readings UNION ALL SELECT * FROM cold;",
+//!     std::path::Path::new("buckets/readings/"),
 //! )?;
 //! # Ok(()) }
 //! ```

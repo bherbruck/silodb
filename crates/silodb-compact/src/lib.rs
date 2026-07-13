@@ -4,15 +4,26 @@
 //!
 //! Sequence (specv2 Phase 3):
 //! 1. select hot rows in `[bucket_start, bucket_end)`, ordered by timestamp
-//! 2. write them to `<out_path>.tmp`
-//! 3. fsync the temp file, atomically rename to `out_path`, fsync the dir
+//! 2. write them to `<file>.tmp` inside `out_dir`
+//! 3. fsync the temp file, atomically rename into place, fsync the dir
 //! 4. **one transaction**: DELETE the hot rows AND INSERT the catalog row
 //!
-//! A crash between 3 and 4 leaves a Parquet file with no catalog row: the
-//! file is invisible to the vtab, the rows are still in the hot table, and
-//! re-running `compact_bucket` on the bucket rewrites the file and runs the
-//! transaction — same output, no duplication. A catalog row is the *only*
-//! thing that makes a file real.
+//! Files are named by this crate, not the caller:
+//! `bucket-<start>-<end>-<seq>.parquet`, where `seq` counts prior committed
+//! compactions of the exact same bucket. That makes every calling pattern
+//! idempotent with no error paths to handle:
+//!
+//! - **Re-run after success**: no hot rows left, an entry exists → no-op
+//!   (`AlreadyCompacted`).
+//! - **Re-run after a crash between rename and commit**: the file exists
+//!   but has no catalog row (so it's invisible to the vtab) and the rows
+//!   are still hot; the same seq is computed again, the file is rewritten
+//!   byte-identically, and the transaction commits. No duplication.
+//! - **Late rows landing in an already-compacted bucket**: next call gets
+//!   the next seq and writes an additional file for the same range. The
+//!   catalog handles overlapping ranges naturally.
+//!
+//! A catalog row is the *only* thing that makes a file real.
 //!
 //! Cost invariant: one call reads/writes one bucket's worth of hot rows.
 //! This crate never opens a previously written Parquet file and never scans
@@ -29,7 +40,6 @@ use arrow::array::{
     ArrayRef, BinaryBuilder, Float64Builder, Int64Builder, RecordBatch, StringBuilder,
     TimestampMicrosecondBuilder,
 };
-use arrow::datatypes::{Field, Schema};
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 use rusqlite::types::Value;
@@ -57,15 +67,16 @@ pub struct BucketSpec<'a> {
     pub bucket_end: i64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompactOutcome {
-    /// Rows written to `out_path`, deleted from the hot table, catalog row
+    /// Rows written to `path`, deleted from the hot table, catalog row
     /// committed.
-    Compacted { rows: usize },
-    /// The catalog already has this (logical_table, out_path) — a previous
-    /// run finished. Nothing was touched.
+    Compacted { rows: usize, path: std::path::PathBuf },
+    /// The bucket has no hot rows left and at least one committed file —
+    /// a previous run finished. Nothing was touched.
     AlreadyCompacted,
-    /// No hot rows in the bucket; no file written, no catalog row.
+    /// No hot rows in the bucket and it was never compacted; no file
+    /// written, no catalog row.
     EmptyBucket,
 }
 
@@ -81,10 +92,6 @@ pub enum CompactError {
     TypeMismatch { column: String, value: &'static str },
     /// `ts_column` is missing from the hot table or not INTEGER-declared.
     BadTimestampColumn { column: String },
-    /// The bucket was already compacted, but the hot table has rows in its
-    /// range again — writes arrived after compaction. Nothing was deleted;
-    /// the embedding application's safety margin needs fixing.
-    BucketChangedAfterCompaction { rows: usize },
     /// The catalog says this file exists but it's gone from disk.
     MissingCompactedFile { path: String },
 }
@@ -106,11 +113,6 @@ impl std::fmt::Display for CompactError {
             Self::BadTimestampColumn { column } => write!(
                 f,
                 "timestamp column '{column}' missing or not INTEGER-declared"
-            ),
-            Self::BucketChangedAfterCompaction { rows } => write!(
-                f,
-                "bucket already compacted but {rows} hot row(s) reappeared in its range; \
-                 refusing to touch anything (compaction safety margin violated?)"
             ),
             Self::MissingCompactedFile { path } => write!(
                 f,
@@ -251,42 +253,19 @@ fn value_kind(v: &Value) -> &'static str {
 }
 
 /// Compact `[spec.bucket_start, spec.bucket_end)` from the hot table into a
-/// new Parquet file at `out_path`, then — in one transaction — delete the
-/// hot rows and insert the catalog row. Idempotent; see module docs.
+/// new Parquet file inside `out_dir` (named `bucket-<start>-<end>-<seq>
+/// .parquet` by this function), then — in one transaction — delete the hot
+/// rows and insert the catalog row. Idempotent under every calling pattern;
+/// see module docs.
 pub fn compact_bucket(
     conn: &Connection,
     spec: &BucketSpec<'_>,
-    out_path: &Path,
+    out_dir: &Path,
 ) -> Result<CompactOutcome> {
     silodb_catalog::ensure_catalog(conn)?;
-    let out_str = out_path.display().to_string();
 
-    let count_in_bucket = |conn: &Connection| -> Result<usize> {
-        let n: i64 = conn.query_row(
-            &format!(
-                "SELECT count(*) FROM {} WHERE {} >= ?1 AND {} < ?2",
-                quote_ident(spec.hot_table),
-                quote_ident(spec.ts_column),
-                quote_ident(spec.ts_column),
-            ),
-            params![spec.bucket_start, spec.bucket_end],
-            |r| r.get(0),
-        )?;
-        Ok(n as usize)
-    };
-
-    // A committed catalog row means a previous run fully finished.
-    if silodb_catalog::entry_for_path(conn, spec.logical_table, &out_str)?.is_some() {
-        if !out_path.is_file() {
-            return Err(CompactError::MissingCompactedFile { path: out_str });
-        }
-        let leftover = count_in_bucket(conn)?;
-        if leftover > 0 {
-            return Err(CompactError::BucketChangedAfterCompaction { rows: leftover });
-        }
-        return Ok(CompactOutcome::AlreadyCompacted);
-    }
-
+    // Validate the hot table's shape before anything else — a bad
+    // ts_column must be an error, not a silently empty bucket.
     let columns = hot_columns(conn, spec.hot_table)?;
     let ts_idx = columns
         .iter()
@@ -296,19 +275,56 @@ pub fn compact_bucket(
             column: spec.ts_column.to_owned(),
         })?;
 
-    let arrow_schema = Arc::new(Schema::new(
-        columns
+    let rows_in_bucket: i64 = conn.query_row(
+        &format!(
+            "SELECT count(*) FROM {} WHERE {} >= ?1 AND {} < ?2",
+            quote_ident(spec.hot_table),
+            quote_ident(spec.ts_column),
+            quote_ident(spec.ts_column),
+        ),
+        params![spec.bucket_start, spec.bucket_end],
+        |r| r.get(0),
+    )?;
+
+    // Committed files for this exact bucket. Their count is the sequence
+    // number of the file this run would create — recomputed identically on
+    // a post-crash re-run, so the rewrite lands on the same name.
+    let committed = silodb_catalog::entries_for_bucket(
+        conn,
+        spec.logical_table,
+        spec.bucket_start,
+        spec.bucket_end,
+    )?;
+    for entry in &committed {
+        if !Path::new(&entry.path).is_file() {
+            return Err(CompactError::MissingCompactedFile {
+                path: entry.path.clone(),
+            });
+        }
+    }
+
+    if rows_in_bucket == 0 {
+        return Ok(if committed.is_empty() {
+            CompactOutcome::EmptyBucket
+        } else {
+            CompactOutcome::AlreadyCompacted
+        });
+    }
+
+    let out_path = out_dir.join(format!(
+        "bucket-{}-{}-{}.parquet",
+        spec.bucket_start,
+        spec.bucket_end,
+        committed.len(),
+    ));
+    let out_str = out_path.display().to_string();
+
+    let arrow_schema = Arc::new(silodb_schema::bucket_arrow_schema(
+        &columns
             .iter()
-            .enumerate()
-            .map(|(i, c)| {
-                if i == ts_idx {
-                    // Non-nullable: the bucket range predicate excludes NULLs.
-                    Field::new(&c.name, silodb_schema::timestamp_arrow_type(), false)
-                } else {
-                    silodb_schema::arrow_field(&c.name, silodb_schema::arrow_type_for(c.ty))
-                }
-            })
+            .map(|c| (c.name.clone(), c.ty))
             .collect::<Vec<_>>(),
+        ts_idx,
     ));
 
     let col_list = columns
@@ -399,10 +415,8 @@ pub fn compact_bucket(
     let file = writer.into_inner()?;
     file.sync_all()?;
     drop(file);
-    std::fs::rename(&tmp_path, out_path)?;
-    if let Some(dir) = out_path.parent() {
-        File::open(dir)?.sync_all()?;
-    }
+    std::fs::rename(&tmp_path, &out_path)?;
+    File::open(out_dir)?.sync_all()?;
 
     // The one transaction that makes it real: hot rows out, catalog row in.
     conn.execute_batch("BEGIN IMMEDIATE")?;
@@ -433,7 +447,10 @@ pub fn compact_bucket(
     match txn {
         Ok(()) => {
             conn.execute_batch("COMMIT")?;
-            Ok(CompactOutcome::Compacted { rows: total_rows })
+            Ok(CompactOutcome::Compacted {
+                rows: total_rows,
+                path: out_path,
+            })
         }
         Err(e) => {
             let _ = conn.execute_batch("ROLLBACK");

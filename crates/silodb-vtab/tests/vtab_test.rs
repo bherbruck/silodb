@@ -115,8 +115,8 @@ fn declared_column_affinities_match_schema_mapping() {
 }
 
 #[test]
-fn create_errors_without_catalog_or_entries() {
-    // No catalog table at all.
+fn create_errors_when_no_schema_source_exists() {
+    // No catalog, no cold files, and no hot table to borrow a schema from.
     let conn = Connection::open_in_memory().unwrap();
     silodb_vtab::load_module(&conn).unwrap();
     let dir = tempfile::tempdir().unwrap();
@@ -126,18 +126,33 @@ fn create_errors_without_catalog_or_entries() {
             dir.path().display()
         ))
         .unwrap_err();
-    assert!(err.to_string().contains("_silodb_catalog"), "{err}");
+    assert!(err.to_string().contains("no schema source"), "{err}");
+}
 
-    // Catalog exists but has no files for this table.
-    let env = cold_env();
-    let err = env
-        .conn
-        .execute_batch(&format!(
-            "CREATE VIRTUAL TABLE cold USING silodb('{}')",
-            env.table_dir.display()
-        ))
-        .unwrap_err();
-    assert!(err.to_string().contains("no files"), "{err}");
+#[test]
+fn day_zero_vtab_works_before_any_compaction() {
+    // Hot table exists, catalog doesn't even exist yet: CREATE VIRTUAL
+    // TABLE must work (schema borrowed from the hot table) and scans must
+    // be empty, not errors.
+    let conn = Connection::open_in_memory().unwrap();
+    silodb_vtab::load_module(&conn).unwrap();
+    conn.execute_batch("CREATE TABLE sensor (ts INTEGER NOT NULL, value REAL)")
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    conn.execute_batch(&format!(
+        "CREATE VIRTUAL TABLE cold USING silodb('{}', table=sensor, hot_table=sensor)",
+        dir.path().display()
+    ))
+    .unwrap();
+    let n: i64 = conn
+        .query_row("SELECT count(*) FROM cold", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 0);
+    // Constrained scans too (exercises filter's no-catalog path).
+    let n: i64 = conn
+        .query_row("SELECT count(*) FROM cold WHERE ts > 5", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 0);
 }
 
 #[test]
@@ -178,8 +193,8 @@ fn second_connection_reconnects_to_persisted_vtab() {
         )
         .unwrap();
         conn.execute_batch(&format!(
-            "CREATE VIRTUAL TABLE cold USING silodb('{}')",
-            table_dir.display()
+            "CREATE VIRTUAL TABLE cold USING silodb('{}', table=sensor)",
+            dir.path().display()
         ))
         .unwrap();
     }

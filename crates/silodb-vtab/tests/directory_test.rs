@@ -161,7 +161,7 @@ fn schema_mismatch_across_files_errors() {
 #[test]
 fn logical_table_and_ts_column_overrides() {
     let env = cold_env();
-    // Directory name ≠ logical table; timestamp column named differently.
+    // Vtab name ≠ logical table; overridden via table=.
     let path = env.table_dir.join("bucket-0.parquet");
     write_id_ts_file(&path, &[(1, 0), (2, 100)], 2);
     silodb_catalog::insert_entry(
@@ -180,8 +180,33 @@ fn logical_table_and_ts_column_overrides() {
     env.conn
         .execute_batch(&format!(
             "CREATE VIRTUAL TABLE cold USING silodb('{}', table=other_name, ts_column=ts)",
-            env.table_dir.display()
+            env.dir.path().display()
         ))
         .unwrap();
     assert_eq!(env.ids("SELECT id FROM cold"), vec![1, 2]);
+}
+
+#[test]
+fn vtab_name_is_the_default_logical_table() {
+    let env = cold_env();
+    let path = env.table_dir.join("bucket-0.parquet");
+    write_id_ts_file(&path, &[(1, 0), (2, 100)], 2);
+    env.register(&path, 0, 1000, 2);
+    // No table= argument: the vtab's own name selects the logical table —
+    // one base dir serves every cold table.
+    env.conn
+        .execute_batch(&format!(
+            "CREATE VIRTUAL TABLE sensor USING silodb('{}')",
+            env.dir.path().display()
+        ))
+        .unwrap();
+    let ids: Vec<i64> = env
+        .conn
+        .prepare("SELECT id FROM sensor")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(ids, vec![1, 2]);
 }
