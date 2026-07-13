@@ -406,11 +406,15 @@ unsafe impl<'vtab> VTab<'vtab> for SiloTab {
         Ok((Cow::Owned(CString::new(sql)?), vtab))
     }
 
-    /// Offer to consume EQ/GT/GE/LT/LE constraints on prunable columns.
-    /// The (column, op) list is encoded into `idx_str`; the constraint
+    /// Offer to consume EQ/GT/GE/LT/LE constraints on prunable columns,
+    /// and capture SQLite's column-usage mask so `filter` can project the
+    /// Parquet read down to the columns the statement actually touches
+    /// (decoding a dictionary-encoded TEXT column nobody asked for costs
+    /// more than the aggregation itself — measured in silodb-bench).
+    /// `idx_str` = `<colUsed hex>|<op><col>;<op><col>...`; constraint
     /// values arrive positionally in `filter`'s args.
     fn best_index(&self, info: &mut IndexInfo) -> Result<bool> {
-        let mut idx_str = String::new();
+        let mut idx_str = format!("{:x}|", info.col_used());
         let mut n_args = 0;
         for (constraint, mut usage) in info.constraints_and_usages() {
             if !constraint.is_usable() {
@@ -432,19 +436,15 @@ unsafe impl<'vtab> VTab<'vtab> for SiloTab {
             usage.set_argv_index(n_args);
             // omit stays false: SQLite re-tests the constraint on each row,
             // so pruning can't cause wrong results, only wasted I/O.
-            if !idx_str.is_empty() {
+            if !idx_str.ends_with('|') {
                 idx_str.push(';');
             }
             idx_str.push(op);
             idx_str.push_str(&col.to_string());
         }
 
-        if n_args > 0 {
-            info.set_idx_str(&idx_str);
-            info.set_estimated_cost(100_000.0);
-        } else {
-            info.set_estimated_cost(1_000_000.0);
-        }
+        info.set_idx_str(&idx_str);
+        info.set_estimated_cost(if n_args > 0 { 100_000.0 } else { 1_000_000.0 });
         Ok(true)
     }
 
@@ -457,6 +457,8 @@ unsafe impl<'vtab> VTab<'vtab> for SiloTab {
             batch: None,
             row_in_batch: 0,
             rowid: 0,
+            col_map: Vec::new(),
+            projection: Vec::new(),
             phantom: PhantomData,
         })
     }
@@ -501,9 +503,33 @@ enum PushedValue {
     Real(f64),
 }
 
-fn decode_pushed(idx_str: &str, args: &Filters<'_>) -> Result<Vec<Pushed>> {
+/// Split `idx_str` into (colUsed mask, constraint list).
+fn decode_idx_str(idx_str: &str) -> Result<(u64, &str)> {
+    let (mask_hex, constraints) = idx_str
+        .split_once('|')
+        .ok_or_else(|| module_err("corrupt idx_str: missing mask"))?;
+    let mask = u64::from_str_radix(mask_hex, 16)
+        .map_err(|_| module_err("corrupt idx_str mask"))?;
+    Ok((mask, constraints))
+}
+
+/// Which schema columns SQLite will actually request, per the xBestIndex
+/// colUsed mask. Bit 63 means "column 63 or beyond".
+fn used_columns(mask: u64, n_cols: usize) -> Vec<usize> {
+    (0..n_cols)
+        .filter(|&i| {
+            let bit = i.min(63);
+            mask & (1u64 << bit) != 0
+        })
+        .collect()
+}
+
+fn decode_pushed(constraints: &str, args: &Filters<'_>) -> Result<Vec<Pushed>> {
     let mut out = Vec::new();
-    for (spec, value) in idx_str.split(';').zip(args.iter()) {
+    if constraints.is_empty() {
+        return Ok(out);
+    }
+    for (spec, value) in constraints.split(';').zip(args.iter()) {
         let mut chars = spec.chars();
         let op = chars
             .next()
@@ -625,6 +651,12 @@ pub struct SiloCursor<'vtab> {
     batch: Option<RecordBatch>,
     row_in_batch: usize,
     rowid: i64,
+    /// Schema column index → position in the projected batch. `None` =
+    /// column not requested by this statement (xColumn answers NULL,
+    /// defensively — SQLite said it wouldn't ask).
+    col_map: Vec<Option<usize>>,
+    /// Schema indices to actually decode, from xBestIndex's colUsed mask.
+    projection: Vec<usize>,
     phantom: PhantomData<&'vtab SiloTab>,
 }
 
@@ -654,9 +686,14 @@ impl SiloCursor<'_> {
             };
             self.next_file += 1;
             let file = File::open(&next.path).map_err(module_err)?;
+            let mask = parquet::arrow::ProjectionMask::roots(
+                next.meta.metadata().file_metadata().schema_descr(),
+                self.projection.iter().copied(),
+            );
             let reader =
                 ParquetRecordBatchReaderBuilder::new_with_metadata(file, next.meta.clone())
                     .with_row_groups(next.row_groups.clone())
+                    .with_projection(mask)
                     .build()
                     .map_err(module_err)?;
             self.reader = Some(reader);
@@ -672,9 +709,22 @@ unsafe impl VTabCursor for SiloCursor<'_> {
         args: &Filters<'_>,
     ) -> Result<()> {
         let vtab = self.vtab();
-        let pushed = match idx_str {
-            Some(s) if !s.is_empty() => decode_pushed(s, args)?,
-            _ => Vec::new(),
+        let n_cols = vtab.schema.fields().len();
+        let (used, pushed) = match idx_str {
+            Some(s) if !s.is_empty() => {
+                let (mask, constraints) = decode_idx_str(s)?;
+                (used_columns(mask, n_cols), decode_pushed(constraints, args)?)
+            }
+            // No idx_str (shouldn't happen — best_index always sets one):
+            // read everything.
+            _ => ((0..n_cols).collect(), Vec::new()),
+        };
+        let col_map = {
+            let mut map = vec![None; n_cols];
+            for (proj_pos, &schema_idx) in used.iter().enumerate() {
+                map[schema_idx] = Some(proj_pos);
+            }
+            map
         };
 
         // Layer 1: catalog range query — whole-file pruning, and the point
@@ -757,6 +807,8 @@ unsafe impl VTabCursor for SiloCursor<'_> {
         }
         LAST_SCAN.with(|c| c.set(Some(stats)));
 
+        self.col_map = col_map;
+        self.projection = used;
         self.files = files;
         self.next_file = 0;
         self.reader = None;
@@ -783,7 +835,13 @@ unsafe impl VTabCursor for SiloCursor<'_> {
             .batch
             .as_ref()
             .ok_or_else(|| module_err("column() called at EOF"))?;
-        let array = batch.column(i as usize);
+        let Some(Some(proj_pos)) = self.col_map.get(i as usize) else {
+            // SQLite's colUsed said this column wouldn't be requested, so
+            // it wasn't decoded. Answer NULL rather than erroring if it
+            // asks anyway.
+            return ctx.set_result(&Null);
+        };
+        let array = batch.column(*proj_pos);
         set_result_from_array(ctx, array.as_ref(), self.row_in_batch)
     }
 

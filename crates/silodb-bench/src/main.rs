@@ -160,12 +160,12 @@ fn insert_rows(conn: &Connection, table: &str, days: i64) -> f64 {
                 .unwrap();
             for minute in 0..1440 {
                 let ts = day * BUCKET_US + minute * INTERVAL_US;
-                for d in 0..DEVICES as usize {
-                    for s in 0..SENSORS as usize {
+                for device in &devices {
+                    for sensor in &sensors {
                         stmt.execute(rusqlite::params![
                             ts,
-                            devices[d],
-                            sensors[s],
+                            device,
+                            sensor,
                             rng.next_f64() * 100.0,
                         ])
                         .unwrap();

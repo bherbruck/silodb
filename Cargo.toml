@@ -2,3 +2,6 @@
 resolver = "2"
 members = ["crates/*", "fixtures/gen"]
 exclude = ["fuzz"]
+
+[profile.release]
+debug = 1  # line tables for perf profiling; negligible runtime cost
