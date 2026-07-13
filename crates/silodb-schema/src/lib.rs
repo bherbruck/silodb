@@ -27,6 +27,25 @@ impl SqliteType {
             SqliteType::Blob => "BLOB",
         }
     }
+
+    /// Storage class for a column's declared type, per SQLite's affinity
+    /// rules (https://sqlite.org/datatype3.html#determination_of_column_affinity),
+    /// minus NUMERIC: a declared type we'd have to guess a storage class for
+    /// returns `None` and the caller should refuse, not guess.
+    pub fn from_decl(decl: &str) -> Option<Self> {
+        let d = decl.to_ascii_uppercase();
+        if d.contains("INT") {
+            Some(SqliteType::Integer)
+        } else if d.contains("CHAR") || d.contains("CLOB") || d.contains("TEXT") {
+            Some(SqliteType::Text)
+        } else if d.contains("BLOB") || d.is_empty() {
+            Some(SqliteType::Blob)
+        } else if d.contains("REAL") || d.contains("FLOA") || d.contains("DOUB") {
+            Some(SqliteType::Real)
+        } else {
+            None
+        }
+    }
 }
 
 /// Error for Arrow types silodb deliberately does not support.

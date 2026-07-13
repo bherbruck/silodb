@@ -1139,8 +1139,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "silodb-catalog"
+version = "0.1.0"
+dependencies = [
+ "rusqlite",
+]
+
+[[package]]
 name = "silodb-compact"
 version = "0.1.0"
+dependencies = [
+ "silodb-catalog",
+]
 
 [[package]]
 name = "silodb-fixture-gen"
@@ -1169,6 +1179,7 @@ dependencies = [
  "parquet",
  "proptest",
  "rusqlite",
+ "silodb-catalog",
  "silodb-schema",
  "tempfile",
 ]

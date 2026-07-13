@@ -1,29 +1,29 @@
-//! Phase 1 acceptance: full scan over `fixtures/basic.parquet` (10 rows,
-//! 3 row groups) returns exactly the rows the fixture generator wrote.
+//! Phase 1 acceptance (directory-mode): scanning `fixtures/basic.parquet`
+//! (10 rows, 3 row groups) through a catalog-registered bucket file returns
+//! exactly the rows the fixture generator wrote.
 
+mod common;
+
+use common::{cold_env, fixture_basic, ColdEnv};
 use rusqlite::types::Value;
 use rusqlite::Connection;
 
-fn fixture_path(name: &str) -> String {
-    format!("{}/../../fixtures/{name}", env!("CARGO_MANIFEST_DIR"))
-}
-
-fn conn_with_vtab(fixture: &str) -> Connection {
-    let conn = Connection::open_in_memory().unwrap();
-    silodb_vtab::load_module(&conn).unwrap();
-    conn.execute_batch(&format!(
-        "CREATE VIRTUAL TABLE cold USING silodb('{}')",
-        fixture_path(fixture)
-    ))
-    .unwrap();
-    conn
+/// Env with the basic fixture copied in as bucket `[1000, 10001)`.
+fn env_with_fixture() -> ColdEnv {
+    let env = cold_env();
+    let dest = env.table_dir.join("bucket-1000.parquet");
+    std::fs::copy(fixture_basic(), &dest).unwrap();
+    env.register(&dest, 1000, 10_001, 10);
+    env.create_vtab();
+    env
 }
 
 #[test]
 fn full_scan_returns_all_rows_in_order() {
-    let conn = conn_with_vtab("basic.parquet");
+    let env = env_with_fixture();
 
-    let rows: Vec<(i64, i64, Option<f64>, Option<String>, Option<Vec<u8>>, i64)> = conn
+    let rows: Vec<(i64, i64, Option<f64>, Option<String>, Option<Vec<u8>>, i64)> = env
+        .conn
         .prepare("SELECT id, ts, value, name, payload, flag FROM cold")
         .unwrap()
         .query_map([], |r| {
@@ -66,16 +66,16 @@ fn full_scan_returns_all_rows_in_order() {
 
 #[test]
 fn aggregates_and_filters_work_through_sqlite() {
-    let conn = conn_with_vtab("basic.parquet");
+    let env = env_with_fixture();
 
-    let count: i64 = conn
+    let count: i64 = env
+        .conn
         .query_row("SELECT count(*) FROM cold", [], |r| r.get(0))
         .unwrap();
     assert_eq!(count, 10);
 
-    // SQLite applies the WHERE itself in Phase 1 (no pushdown yet) — results
-    // must still be right.
-    let in_range: i64 = conn
+    let in_range: i64 = env
+        .conn
         .query_row(
             "SELECT count(*) FROM cold WHERE ts > 4500 AND ts < 9500",
             [],
@@ -84,7 +84,8 @@ fn aggregates_and_filters_work_through_sqlite() {
         .unwrap();
     assert_eq!(in_range, 5); // ts 5000..=9000
 
-    let null_values: i64 = conn
+    let null_values: i64 = env
+        .conn
         .query_row("SELECT count(*) FROM cold WHERE value IS NULL", [], |r| {
             r.get(0)
         })
@@ -94,9 +95,10 @@ fn aggregates_and_filters_work_through_sqlite() {
 
 #[test]
 fn declared_column_affinities_match_schema_mapping() {
-    let conn = conn_with_vtab("basic.parquet");
+    let env = env_with_fixture();
 
-    let mut stmt = conn
+    let mut stmt = env
+        .conn
         .prepare("SELECT id, ts, value, name, payload FROM cold LIMIT 1")
         .unwrap();
     let row: (Value, Value, Value, Value, Value) = stmt
@@ -112,29 +114,71 @@ fn declared_column_affinities_match_schema_mapping() {
 }
 
 #[test]
-fn missing_file_errors_cleanly() {
+fn create_errors_without_catalog_or_entries() {
+    // No catalog table at all.
     let conn = Connection::open_in_memory().unwrap();
     silodb_vtab::load_module(&conn).unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let err = conn
-        .execute_batch("CREATE VIRTUAL TABLE cold USING silodb('/no/such/file.parquet')")
+        .execute_batch(&format!(
+            "CREATE VIRTUAL TABLE cold USING silodb('{}')",
+            dir.path().display()
+        ))
         .unwrap_err();
-    assert!(err.to_string().contains("silodb"), "{err}");
+    assert!(err.to_string().contains("_silodb_catalog"), "{err}");
+
+    // Catalog exists but has no files for this table.
+    let env = cold_env();
+    let err = env
+        .conn
+        .execute_batch(&format!(
+            "CREATE VIRTUAL TABLE cold USING silodb('{}')",
+            env.table_dir.display()
+        ))
+        .unwrap_err();
+    assert!(err.to_string().contains("no files"), "{err}");
+}
+
+#[test]
+fn create_errors_on_missing_directory() {
+    let env = cold_env();
+    let err = env
+        .conn
+        .execute_batch("CREATE VIRTUAL TABLE cold USING silodb('/no/such/dir/')")
+        .unwrap_err();
+    assert!(err.to_string().contains("not a directory"), "{err}");
 }
 
 #[test]
 fn second_connection_reconnects_to_persisted_vtab() {
-    // xConnect path: table definition persisted in a db file, reopened.
-    let dir = std::env::temp_dir().join(format!("silodb-vtab-test-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let db_path = dir.join("reconnect.db");
-    let _ = std::fs::remove_file(&db_path);
+    // xConnect path: table definition + catalog persisted in a db file.
+    let dir = tempfile::tempdir().unwrap();
+    let table_dir = dir.path().join("sensor");
+    std::fs::create_dir(&table_dir).unwrap();
+    let dest = table_dir.join("bucket-1000.parquet");
+    std::fs::copy(fixture_basic(), &dest).unwrap();
+    let db_path = dir.path().join("hot.db");
 
     {
         let conn = Connection::open(&db_path).unwrap();
+        silodb_catalog::ensure_catalog(&conn).unwrap();
         silodb_vtab::load_module(&conn).unwrap();
+        silodb_catalog::insert_entry(
+            &conn,
+            &silodb_catalog::CatalogEntry {
+                logical_table: "sensor".into(),
+                path: dest.display().to_string(),
+                range_start: 1000,
+                range_end: 10_001,
+                row_count: Some(10),
+                created_at: 0,
+                status: "active".into(),
+            },
+        )
+        .unwrap();
         conn.execute_batch(&format!(
             "CREATE VIRTUAL TABLE cold USING silodb('{}')",
-            fixture_path("basic.parquet")
+            table_dir.display()
         ))
         .unwrap();
     }
@@ -146,5 +190,4 @@ fn second_connection_reconnects_to_persisted_vtab() {
             .unwrap();
         assert_eq!(count, 10);
     }
-    let _ = std::fs::remove_file(&db_path);
 }

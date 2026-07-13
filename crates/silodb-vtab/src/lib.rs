@@ -1,23 +1,40 @@
-//! `silodb` SQLite virtual table: read-only queries over a Parquet file.
+//! `silodb` SQLite virtual table: read-only queries over a directory of
+//! Parquet bucket files, driven by the `_silodb_catalog` table in the same
+//! (hot) database.
 //!
 //! ```sql
-//! CREATE VIRTUAL TABLE cold USING silodb('path/to/file.parquet');
+//! CREATE VIRTUAL TABLE cold USING silodb('buckets/sensor_a/');
+//! -- optional overrides:
+//! CREATE VIRTUAL TABLE cold USING silodb('buckets/a/', table=sensor_a, ts_column=ts);
 //! SELECT * FROM cold WHERE ts > ?1 AND ts < ?2;
 //! ```
 //!
-//! Rows stream out batch-by-batch — the file is never fully materialized.
-//! `xBestIndex` forwards range/equality constraints to the cursor, which
-//! skips row groups whose min/max statistics prove they can't match
-//! (Phase 2). SQLite still re-checks every constraint on returned rows
-//! (`omit` is left false), so pruning only ever has to be conservative,
-//! never exact.
+//! One directory per logical table, one immutable Parquet file per compacted
+//! bucket. The catalog — not a directory glob — decides which files exist:
+//! a Parquet file with no catalog row (e.g. a compaction that crashed before
+//! its commit) is invisible here, and its rows are still in the hot table.
+//!
+//! Pruning happens in two layers at `xFilter` time:
+//! 1. **File level**: an indexed range query against `_silodb_catalog`
+//!    drops whole files whose bucket range can't overlap the query's
+//!    timestamp constraints. New bucket files become visible to the very
+//!    next query — no DDL needed.
+//! 2. **Row-group level** (unchanged from Phase 2): footer min/max
+//!    statistics drop row groups within the surviving files. Footers are
+//!    parsed once and cached per `(path, mtime, size)` — files are
+//!    immutable, so a cache entry never goes stale.
+//!
+//! SQLite re-checks every constraint on returned rows (`omit` stays false),
+//! so both layers only ever need to be conservative, never exact.
 
 use std::borrow::Cow;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::ffi::{c_int, CStr, CString};
 use std::fs::File;
 use std::marker::PhantomData;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use arrow::array::{
     Array, BinaryArray, BooleanArray, Date32Array, Date64Array, FixedSizeBinaryArray,
@@ -41,6 +58,7 @@ use rusqlite::vtab::{
 use rusqlite::{Connection, Error, Result};
 
 const MODULE_NAME: &CStr = c"silodb";
+const DEFAULT_TS_COLUMN: &str = "ts";
 
 /// Register the `silodb` module on a connection.
 pub fn load_module(conn: &Connection) -> Result<()> {
@@ -49,16 +67,26 @@ pub fn load_module(conn: &Connection) -> Result<()> {
     conn.create_module(MODULE_NAME, &MODULE, aux)
 }
 
-/// Row-group pruning outcome of the most recent `xFilter` on this thread.
+/// Pruning outcome of the most recent `xFilter` on this thread.
 ///
-/// Diagnostic hook for tests and logging — Phase 2's acceptance criterion is
-/// "fewer row groups read", which needs a counter, not wall-clock timing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Diagnostic hook for tests and logging — the acceptance criteria for both
+/// pruning layers are "reads fewer files / row groups", which needs
+/// counters, not wall-clock timing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ScanStats {
-    /// Row groups in the file.
+    /// Active catalog entries for the logical table.
+    pub total_files: usize,
+    /// Files surviving the catalog range query.
+    pub candidate_files: usize,
+    /// Files actually opened for reading (≥ 1 row group survived).
+    pub scanned_files: usize,
+    /// Row groups across all candidate files.
     pub total_row_groups: usize,
-    /// Row groups actually handed to the Parquet reader.
+    /// Row groups handed to the Parquet readers.
     pub scanned_row_groups: usize,
+    /// Candidate files whose footer came from the `(path, mtime, size)`
+    /// cache instead of being re-parsed.
+    pub metadata_cache_hits: usize,
 }
 
 thread_local! {
@@ -74,32 +102,140 @@ fn module_err(e: impl std::fmt::Display) -> Error {
     Error::ModuleError(format!("silodb: {e}"))
 }
 
-/// An instance of the silodb virtual table: one Parquet file.
+#[derive(Clone)]
+struct CachedMeta {
+    mtime: SystemTime,
+    size: u64,
+    meta: ArrowReaderMetadata,
+}
+
+/// An instance of the silodb virtual table: one logical cold table.
 #[repr(C)]
 pub struct SiloTab {
     /// Base class. Must be first.
     base: ffi::sqlite3_vtab,
-    path: PathBuf,
+    /// Raw handle of the (hot) database this vtab lives in; used to query
+    /// `_silodb_catalog` from inside `filter`. Never closed through here.
+    db: *mut ffi::sqlite3,
+    dir: PathBuf,
+    logical_table: String,
+    /// Index of the timestamp column in `schema`, if it exists — drives
+    /// catalog file-level range pruning.
+    ts_col: Option<usize>,
     schema: SchemaRef,
-    /// Footer metadata (incl. row-group statistics), parsed once at connect.
-    reader_meta: ArrowReaderMetadata,
+    /// Footer metadata per file, keyed by path; entries validated against
+    /// `(mtime, size)` on every use.
+    meta_cache: RefCell<HashMap<PathBuf, CachedMeta>>,
 }
 
-/// The single positional argument arrives verbatim, quotes included:
-/// `USING silodb('file.parquet')` → `'file.parquet'`.
-fn parse_path_arg(arg: &[u8]) -> Result<PathBuf> {
+impl SiloTab {
+    /// Non-owning view of the hot database connection. The returned
+    /// `Connection` must be dropped before the enclosing callback returns
+    /// and must never be handed out beyond it.
+    fn hot_db(&self) -> Result<Connection> {
+        unsafe { Connection::from_handle(self.db) }
+    }
+
+    /// Footer metadata for one catalog file, from cache when `(mtime,
+    /// size)` still match. Returns `(meta, was_cache_hit)`.
+    fn file_meta(&self, path: &Path) -> Result<(ArrowReaderMetadata, bool)> {
+        let stat = std::fs::metadata(path).map_err(|e| {
+            module_err(format!(
+                "catalog lists '{}' but it cannot be read: {e} \
+                 (cold file missing or unreadable — possible data loss)",
+                path.display()
+            ))
+        })?;
+        let mtime = stat.modified().map_err(module_err)?;
+        let size = stat.len();
+
+        if let Some(hit) = self.meta_cache.borrow().get(path) {
+            if hit.mtime == mtime && hit.size == size {
+                return Ok((hit.meta.clone(), true));
+            }
+        }
+
+        let file = File::open(path).map_err(module_err)?;
+        let meta = ArrowReaderMetadata::load(&file, Default::default()).map_err(module_err)?;
+        self.meta_cache.borrow_mut().insert(
+            path.to_path_buf(),
+            CachedMeta {
+                mtime,
+                size,
+                meta: meta.clone(),
+            },
+        );
+        Ok((meta, false))
+    }
+}
+
+fn parse_str_arg(arg: &[u8]) -> Result<String> {
     let s = std::str::from_utf8(arg)
-        .map_err(|_| module_err("path argument is not UTF-8"))?
+        .map_err(|_| module_err("argument is not UTF-8"))?
         .trim();
     let s = s
         .strip_prefix('\'')
         .and_then(|s| s.strip_suffix('\''))
         .or_else(|| s.strip_prefix('"').and_then(|s| s.strip_suffix('"')))
         .unwrap_or(s);
-    if s.is_empty() {
-        return Err(module_err("empty Parquet file path"));
+    Ok(s.to_owned())
+}
+
+struct TabArgs {
+    dir: PathBuf,
+    logical_table: String,
+    ts_column: String,
+}
+
+/// First argument: directory (quoted). Optional `key=value` arguments:
+/// `table=<logical table>` (default: directory basename) and
+/// `ts_column=<name>` (default: `ts`).
+fn parse_args(args: &[&[u8]]) -> Result<TabArgs> {
+    let [dir_arg, rest @ ..] = args else {
+        return Err(module_err(
+            "expected a directory argument: USING silodb('buckets/my_table/')",
+        ));
+    };
+    let dir_str = parse_str_arg(dir_arg)?;
+    if dir_str.is_empty() {
+        return Err(module_err("empty directory path"));
     }
-    Ok(PathBuf::from(s))
+    let dir = PathBuf::from(&dir_str);
+
+    let mut logical_table = None;
+    let mut ts_column = None;
+    for arg in rest {
+        let s = parse_str_arg(arg)?;
+        let (key, value) = s
+            .split_once('=')
+            .ok_or_else(|| module_err(format!("unrecognized argument '{s}'")))?;
+        let value = value.trim().trim_matches('\'').trim_matches('"');
+        match key.trim() {
+            "table" => logical_table = Some(value.to_owned()),
+            "ts_column" => ts_column = Some(value.to_owned()),
+            other => return Err(module_err(format!("unrecognized parameter '{other}'"))),
+        }
+    }
+
+    let logical_table = match logical_table {
+        Some(t) => t,
+        None => dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                module_err(format!(
+                    "cannot derive a logical table name from '{dir_str}'; \
+                     pass table=<name> explicitly"
+                ))
+            })?,
+    };
+
+    Ok(TabArgs {
+        dir,
+        logical_table,
+        ts_column: ts_column.unwrap_or_else(|| DEFAULT_TS_COLUMN.to_owned()),
+    })
 }
 
 unsafe impl<'vtab> VTab<'vtab> for SiloTab {
@@ -114,27 +250,57 @@ unsafe impl<'vtab> VTab<'vtab> for SiloTab {
         _table_name: &[u8],
         args: &[&[u8]],
     ) -> Result<(Cow<'static, CStr>, Self)> {
-        let [arg] = args else {
-            return Err(module_err(
-                "expected exactly one argument: USING silodb('path/to/file.parquet')",
-            ));
-        };
-        let path = parse_path_arg(arg)?;
+        let parsed = parse_args(args)?;
+        if !parsed.dir.is_dir() {
+            return Err(module_err(format!(
+                "'{}' is not a directory",
+                parsed.dir.display()
+            )));
+        }
 
-        let file = File::open(&path)
-            .map_err(|e| module_err(format!("cannot open '{}': {e}", path.display())))?;
+        let handle = unsafe { db.handle() };
+
+        // Column declaration needs a schema, and the catalog is the source
+        // of truth for which files make up this table — so the table must
+        // have at least one compacted bucket before the vtab can connect.
+        // (Known limitation, flagged in the spec discussion: there is no
+        // schema source before the first compaction.)
+        let hot = unsafe { Connection::from_handle(handle) }?;
+        if !silodb_catalog::catalog_exists(&hot)? {
+            return Err(module_err(
+                "no _silodb_catalog table in this database; \
+                 run silodb_catalog::ensure_catalog / a first compaction before \
+                 creating silodb virtual tables",
+            ));
+        }
+        let entries = silodb_catalog::entries_for_table(&hot, &parsed.logical_table)?;
+        drop(hot);
+        let Some(first) = entries.first() else {
+            return Err(module_err(format!(
+                "catalog has no files for logical table '{}'; \
+                 compact at least one bucket first",
+                parsed.logical_table
+            )));
+        };
+
+        let file = File::open(&first.path)
+            .map_err(|e| module_err(format!("cannot open '{}': {e}", first.path)))?;
         let reader_meta =
             ArrowReaderMetadata::load(&file, Default::default()).map_err(module_err)?;
         let schema = reader_meta.schema().clone();
 
+        let ts_col = schema.index_of(&parsed.ts_column).ok();
         let sql = silodb_schema::create_table_sql(&schema).map_err(module_err)?;
         db.config(VTabConfig::DirectOnly)?;
 
         let vtab = Self {
             base: ffi::sqlite3_vtab::default(),
-            path,
+            db: handle,
+            dir: parsed.dir,
+            logical_table: parsed.logical_table,
+            ts_col,
             schema,
-            reader_meta,
+            meta_cache: RefCell::new(HashMap::new()),
         };
         Ok((Cow::Owned(CString::new(sql)?), vtab))
     }
@@ -164,7 +330,7 @@ unsafe impl<'vtab> VTab<'vtab> for SiloTab {
             n_args += 1;
             usage.set_argv_index(n_args);
             // omit stays false: SQLite re-tests the constraint on each row,
-            // so row-group pruning can't cause wrong results, only wasted I/O.
+            // so pruning can't cause wrong results, only wasted I/O.
             if !idx_str.is_empty() {
                 idx_str.push(';');
             }
@@ -184,6 +350,8 @@ unsafe impl<'vtab> VTab<'vtab> for SiloTab {
     fn open(&'vtab mut self) -> Result<SiloCursor<'vtab>> {
         Ok(SiloCursor {
             base: ffi::sqlite3_vtab_cursor::default(),
+            files: Vec::new(),
+            next_file: 0,
             reader: None,
             batch: None,
             row_in_batch: 0,
@@ -197,9 +365,9 @@ impl CreateVTab<'_> for SiloTab {
     const KIND: VTabKind = VTabKind::Default;
 }
 
-/// Column classes row-group pruning understands. Unsigned ints are left out:
-/// their Parquet statistics involve sign-reinterpretation subtleties that
-/// aren't worth handling for a filter pattern we don't have.
+/// Column classes pruning understands. Unsigned ints are left out: their
+/// Parquet statistics involve sign-reinterpretation subtleties that aren't
+/// worth handling for a filter pattern we don't have.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PruneClass {
     Int,
@@ -255,6 +423,33 @@ fn decode_pushed(idx_str: &str, args: &Filters<'_>) -> Result<Vec<Pushed>> {
     Ok(out)
 }
 
+/// Inclusive [lo, hi] bounds on the timestamp column implied by the pushed
+/// constraints, for the catalog's file-level range query. Bounds stay
+/// conservative: GT uses the value itself (not value+1), Real-typed values
+/// on the integer ts column contribute nothing.
+fn ts_bounds(pushed: &[Pushed], ts_col: usize) -> (i64, i64) {
+    let mut lo = i64::MIN;
+    let mut hi = i64::MAX;
+    for p in pushed {
+        if p.col != ts_col {
+            continue;
+        }
+        let PushedValue::Int(v) = p.value else {
+            continue;
+        };
+        match p.op {
+            'E' => {
+                lo = lo.max(v);
+                hi = hi.min(v);
+            }
+            'G' | 'g' => lo = lo.max(v),
+            'L' | 'l' => hi = hi.min(v),
+            _ => {}
+        }
+    }
+    (lo, hi)
+}
+
 /// Extract a row group's (min, max) for a column, in the i64 domain.
 fn int_min_max(rg: &RowGroupMetaData, col: usize) -> Option<(i64, i64)> {
     match rg.column(col).statistics()? {
@@ -289,11 +484,7 @@ fn range_may_match<T: PartialOrd>(min: T, max: T, op: char, v: T) -> bool {
 /// A row group survives unless some constraint provably excludes it.
 /// Missing statistics, unsupported stats layout, or a cross-domain
 /// comparison we can't do exactly → keep the group.
-fn row_group_may_match(
-    rg: &RowGroupMetaData,
-    schema: &SchemaRef,
-    pushed: &[Pushed],
-) -> bool {
+fn row_group_may_match(rg: &RowGroupMetaData, schema: &SchemaRef, pushed: &[Pushed]) -> bool {
     pushed.iter().all(|p| {
         let class = match prunable_class(schema.field(p.col).data_type()) {
             Some(c) => c,
@@ -313,11 +504,22 @@ fn row_group_may_match(
     })
 }
 
-/// Cursor over record batches. `batch == None` after `filter` means EOF.
+/// One file the cursor will read: pre-pruned row groups, footer already
+/// parsed.
+struct ScanFile {
+    path: PathBuf,
+    meta: ArrowReaderMetadata,
+    row_groups: Vec<usize>,
+}
+
+/// Cursor over the candidate files' record batches. `batch == None` with no
+/// files left means EOF.
 #[repr(C)]
 pub struct SiloCursor<'vtab> {
     /// Base class. Must be first.
     base: ffi::sqlite3_vtab_cursor,
+    files: Vec<ScanFile>,
+    next_file: usize,
     reader: Option<ParquetRecordBatchReader>,
     batch: Option<RecordBatch>,
     row_in_batch: usize,
@@ -330,21 +532,34 @@ impl SiloCursor<'_> {
         unsafe { &*(self.base.pVtab as *const SiloTab) }
     }
 
-    /// Pull batches until one has rows or the reader is exhausted.
+    /// Pull batches — moving through files as needed — until one has rows
+    /// or everything is exhausted.
     fn advance_batch(&mut self) -> Result<()> {
         self.batch = None;
         self.row_in_batch = 0;
-        let Some(reader) = self.reader.as_mut() else {
-            return Ok(());
-        };
-        for batch in reader {
-            let batch = batch.map_err(module_err)?;
-            if batch.num_rows() > 0 {
-                self.batch = Some(batch);
-                return Ok(());
+        loop {
+            if let Some(reader) = self.reader.as_mut() {
+                for batch in reader {
+                    let batch = batch.map_err(module_err)?;
+                    if batch.num_rows() > 0 {
+                        self.batch = Some(batch);
+                        return Ok(());
+                    }
+                }
+                self.reader = None;
             }
+            let Some(next) = self.files.get(self.next_file) else {
+                return Ok(());
+            };
+            self.next_file += 1;
+            let file = File::open(&next.path).map_err(module_err)?;
+            let reader =
+                ParquetRecordBatchReaderBuilder::new_with_metadata(file, next.meta.clone())
+                    .with_row_groups(next.row_groups.clone())
+                    .build()
+                    .map_err(module_err)?;
+            self.reader = Some(reader);
         }
-        Ok(())
     }
 }
 
@@ -356,33 +571,67 @@ unsafe impl VTabCursor for SiloCursor<'_> {
         args: &Filters<'_>,
     ) -> Result<()> {
         let vtab = self.vtab();
-        let meta = vtab.reader_meta.clone();
-        let total = meta.metadata().num_row_groups();
-
         let pushed = match idx_str {
             Some(s) if !s.is_empty() => decode_pushed(s, args)?,
             _ => Vec::new(),
         };
-        let keep: Vec<usize> = (0..total)
-            .filter(|&i| {
-                pushed.is_empty()
-                    || row_group_may_match(meta.metadata().row_group(i), &vtab.schema, &pushed)
-            })
-            .collect();
 
-        LAST_SCAN.with(|c| {
-            c.set(Some(ScanStats {
-                total_row_groups: total,
-                scanned_row_groups: keep.len(),
-            }))
-        });
+        // Layer 1: catalog range query — whole-file pruning, and the point
+        // where files compacted after CREATE VIRTUAL TABLE become visible.
+        let hot = vtab.hot_db()?;
+        let total_files =
+            silodb_catalog::entries_for_table(&hot, &vtab.logical_table)?.len();
+        let (lo, hi) = match vtab.ts_col {
+            Some(ts) => ts_bounds(&pushed, ts),
+            None => (i64::MIN, i64::MAX),
+        };
+        let candidates =
+            silodb_catalog::entries_overlapping(&hot, &vtab.logical_table, lo, hi)?;
+        drop(hot);
 
-        let file = File::open(&vtab.path).map_err(module_err)?;
-        let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(file, meta)
-            .with_row_groups(keep)
-            .build()
-            .map_err(module_err)?;
-        self.reader = Some(reader);
+        // Layer 2: row-group pruning within each candidate (Phase 2 logic).
+        let mut stats = ScanStats {
+            total_files,
+            candidate_files: candidates.len(),
+            ..Default::default()
+        };
+        let mut files = Vec::new();
+        for entry in &candidates {
+            let path = PathBuf::from(&entry.path);
+            let (meta, cache_hit) = vtab.file_meta(&path)?;
+            stats.metadata_cache_hits += usize::from(cache_hit);
+
+            if meta.schema() != &vtab.schema {
+                return Err(module_err(format!(
+                    "'{}' has a different schema than this table declared \
+                     (expected the schema of the table's first file)",
+                    entry.path
+                )));
+            }
+
+            let total = meta.metadata().num_row_groups();
+            stats.total_row_groups += total;
+            let keep: Vec<usize> = (0..total)
+                .filter(|&i| {
+                    pushed.is_empty()
+                        || row_group_may_match(meta.metadata().row_group(i), &vtab.schema, &pushed)
+                })
+                .collect();
+            stats.scanned_row_groups += keep.len();
+            if !keep.is_empty() {
+                stats.scanned_files += 1;
+                files.push(ScanFile {
+                    path,
+                    meta,
+                    row_groups: keep,
+                });
+            }
+        }
+        LAST_SCAN.with(|c| c.set(Some(stats)));
+
+        self.files = files;
+        self.next_file = 0;
+        self.reader = None;
         self.rowid = 0;
         self.advance_batch()
     }

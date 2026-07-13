@@ -1,45 +1,13 @@
 //! Property test (spec: "the test that actually catches 'pruning silently
-//! drops a row it shouldn't'"): random data + random range constraints;
-//! the pruned vtab scan must return exactly the rows a straight in-memory
-//! filter of the same data returns.
+//! drops a row it shouldn't'"): random data split across random bucket
+//! files + random range constraints; the doubly-pruned (catalog file level
+//! + row-group level) vtab scan must return exactly the rows a straight
+//! in-memory filter of the same data returns.
 
-use std::fs::File;
-use std::sync::Arc;
+mod common;
 
-use arrow::array::{ArrayRef, Int64Array, RecordBatch, TimestampMicrosecondArray};
-use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-use parquet::arrow::ArrowWriter;
-use parquet::file::properties::WriterProperties;
+use common::{cold_env, write_id_ts_file};
 use proptest::prelude::*;
-use rusqlite::Connection;
-
-/// Write (id, ts) rows to a Parquet file with small row groups so a typical
-/// case spans several groups.
-fn write_parquet(path: &std::path::Path, ts: &[i64], row_group_size: usize) {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, false),
-        Field::new(
-            "ts",
-            DataType::Timestamp(TimeUnit::Microsecond, None),
-            false,
-        ),
-    ]));
-    let ids: Vec<i64> = (0..ts.len() as i64).collect();
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(Int64Array::from(ids)) as ArrayRef,
-            Arc::new(TimestampMicrosecondArray::from(ts.to_vec())),
-        ],
-    )
-    .unwrap();
-    let props = WriterProperties::builder()
-        .set_max_row_group_row_count(Some(row_group_size))
-        .build();
-    let mut writer = ArrowWriter::try_new(File::create(path).unwrap(), schema, Some(props)).unwrap();
-    writer.write(&batch).unwrap();
-    writer.close().unwrap();
-}
 
 #[derive(Debug, Clone, Copy)]
 enum Op {
@@ -100,30 +68,39 @@ proptest! {
             ],
             1..200,
         ),
-        row_group_size in 1usize..16,
+        rows_per_file in 1usize..40,
+        row_group_size in 1usize..8,
         constraints in prop::collection::vec(
             (op_strategy(), -10_000i64..10_000),
             1..3,
         ),
     ) {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("prop.parquet");
-        write_parquet(&path, &ts, row_group_size);
+        let env = cold_env();
 
-        let conn = Connection::open_in_memory().unwrap();
-        silodb_vtab::load_module(&conn).unwrap();
-        conn.execute_batch(&format!(
-            "CREATE VIRTUAL TABLE cold USING silodb('{}')",
-            path.display()
-        ))
-        .unwrap();
+        // Split rows into bucket files. Catalog ranges are the true per-file
+        // min/max (end exclusive), mirroring what compaction records.
+        for (f, chunk) in ts.chunks(rows_per_file).enumerate() {
+            let base = (f * rows_per_file) as i64;
+            let rows: Vec<(i64, i64)> = chunk
+                .iter()
+                .enumerate()
+                .map(|(i, &t)| (base + i as i64, t))
+                .collect();
+            let path = env.table_dir.join(format!("bucket-{f}.parquet"));
+            write_id_ts_file(&path, &rows, row_group_size);
+            let min = *chunk.iter().min().unwrap();
+            let max = *chunk.iter().max().unwrap();
+            env.register(&path, min, max.saturating_add(1), rows.len() as i64);
+        }
+        env.create_vtab();
 
         let where_clause = constraints
             .iter()
             .map(|(op, v)| format!("ts {} {v}", op.sql()))
             .collect::<Vec<_>>()
             .join(" AND ");
-        let got: Vec<i64> = conn
+        let got: Vec<i64> = env
+            .conn
             .prepare(&format!(
                 "SELECT id FROM cold WHERE {where_clause} ORDER BY id"
             ))
