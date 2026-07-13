@@ -2,7 +2,7 @@
 //! into a brand-new, immutable Parquet file, and record it in
 //! `_silodb_catalog`.
 //!
-//! Sequence (specv2 Phase 3):
+//! Sequence (docs/spec.md, write path):
 //! 1. select hot rows in `[bucket_start, bucket_end)`, ordered by timestamp
 //! 2. write them to `<file>.tmp` inside `<base_dir>/<logical_table>/`
 //! 3. fsync the temp file, atomically rename into place, fsync the dir
@@ -30,7 +30,7 @@
 //! the hot table beyond the bucket's index range.
 //!
 //! Deciding *when* to call this is the embedding application's job — see
-//! the trigger-logic contract in `docs/specv2.md`.
+//! the trigger-logic contract in `docs/spec.md`.
 
 use std::fs::File;
 use std::path::Path;

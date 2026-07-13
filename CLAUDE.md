@@ -1,8 +1,8 @@
 # CLAUDE.md — silodb
 
-Working notes for Claude Code sessions in this repo. See `docs/spec.md` for
-the full phased implementation plan — this file is about how the code is
-organized, not what to build first.
+Working notes for Claude Code sessions in this repo. `docs/spec.md` is the
+canonical spec for the system as built (superseded drafts are in
+`docs/archive/`) — this file is about how the code is organized.
 
 ## Core rule: low coupling, high cohesion
 
@@ -34,7 +34,7 @@ scope at all. Symmetrically, `silodb-catalog` must never depend on
   one thing both the read and write paths need to agree on, so it's the
   single source of truth for that mapping, not duplicated in each.
 
-- **`silodb-catalog`** — the `_silodb_catalog` table (specv2 Phase 2.5):
+- **`silodb-catalog`** — the `_silodb_catalog` table (spec: catalog):
   schema, ensure/insert, and the indexed range-overlap query. Lives in the
   hot database, so a compaction is durable exactly when its transaction
   commits. Depends on `rusqlite` only — never on `parquet`/`arrow`. Like
@@ -58,7 +58,7 @@ scope at all. Symmetrically, `silodb-catalog` must never depend on
   Does not depend on `silodb-vtab` — it writes Parquet files, it doesn't
   need to read them back through the vtab to do its job. Owns the
   temp-file/fsync/atomic-rename sequencing and the single transaction that
-  deletes hot rows *and* inserts the catalog row (specv2), plus the
+  deletes hot rows *and* inserts the catalog row (spec), plus the
   idempotency guarantee. Trigger logic (schedule vs. manual) is
   intentionally **not** here — this crate exposes `compact_bucket()`;
   deciding *when* to call it is the embedding application's job, documented
@@ -112,7 +112,7 @@ silodb/
   highest-value test in the crate, per spec).
 - `silodb-compact`: integration tests including the simulated-crash case
   (file renamed, delete+catalog transaction never ran → re-run produces a
-  byte-identical file, no duplication) and the specv2 bounded-cost test
+  byte-identical file, no duplication) and the spec's bounded-cost test
   (per-run work flat across 100 accumulating buckets).
 - `silodb` (facade): the end-to-end hot→compact→`UNION ALL` view test —
   the only place the read and write paths meet.

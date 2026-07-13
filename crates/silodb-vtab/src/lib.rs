@@ -18,7 +18,7 @@
 //! catalog row (e.g. a compaction that crashed before its commit) is
 //! invisible here, and its rows are still in the hot table.
 //!
-//! `xConnect` does **zero file I/O** (specv3): columns come from the
+//! `xConnect` does **zero file I/O** (spec): columns come from the
 //! `schema=` argument when given, otherwise from the hot table (one PRAGMA
 //! against the same database — the authoritative schema, so nothing is
 //! restated or drifts). Both routes feed
@@ -376,7 +376,7 @@ unsafe impl<'vtab> VTab<'vtab> for SiloTab {
 
         let handle = unsafe { db.handle() };
 
-        // Column declaration — zero file I/O, by design (specv3). Either an
+        // Column declaration — zero file I/O, by design (see docs/spec.md). Either an
         // explicit schema= argument, or one PRAGMA against the hot table in
         // this same database (the authoritative schema, nothing restated).
         let schema = match &parsed.schema {
