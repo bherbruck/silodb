@@ -239,6 +239,91 @@ fn misaligned_tiers_are_rejected_at_init() {
 }
 
 #[test]
+fn retention_evicts_whole_expired_files() {
+    // Keep 14 days; tiers 1d,7d.
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("cold");
+    let conn = Connection::open_in_memory().unwrap();
+    silodb::load_module(&conn).unwrap();
+    silodb::init_table_tiered(
+        &conn,
+        "readings",
+        "ts TIMESTAMP, value REAL",
+        &base,
+        "1d,7d,retain=14d",
+    )
+    .unwrap();
+    let e = Env {
+        conn,
+        base,
+        _dir: dir,
+    };
+    e.fill_days(0, 22); // days 0..21
+    let now = 22 * DAY + MARGIN + 1;
+    let actions = e.maintain(now);
+
+    // Retention cutoff = day 8 (22d+margin-14d): week 0 (days 0-6) is
+    // entirely expired; day 7's file straddles nothing (1d file, ends day 8
+    // exactly => evicted too). Everything with range_end <= cutoff dies.
+    let evicted: Vec<(i64, i64)> = actions
+        .iter()
+        .filter_map(|a| match a {
+            MaintainAction::Evicted { window, .. } => Some((window.0 / DAY, window.1 / DAY)),
+            _ => None,
+        })
+        .collect();
+    assert!(!evicted.is_empty(), "{actions:?}");
+    // All evicted windows end at or before the cutoff day.
+    assert!(evicted.iter().all(|&(_, end)| end <= 8), "{evicted:?}");
+
+    // Data actually deleted: view lost exactly the evicted days.
+    let remaining = e.view_count();
+    let evicted_days: i64 = evicted.iter().map(|&(s, end)| end - s).sum();
+    assert_eq!(remaining, (22 - evicted_days) * 24);
+
+    // Files gone from disk, no evicted/superseded rows linger.
+    let statuses: i64 = e
+        .conn
+        .query_row(
+            "SELECT count(*) FROM _silodb_catalog WHERE status != 'active'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(statuses, 0, "GC swept everything in the same call");
+    let on_disk = std::fs::read_dir(e.base.join("readings")).unwrap().count();
+    assert_eq!(on_disk, e.active_files().len());
+
+    // Converged.
+    assert!(e.maintain(now).is_empty());
+
+    // A straddling file survives: the newest 7d file whose window crosses
+    // the cutoff is untouched (whole-file granularity).
+    let min_start = e
+        .active_files()
+        .iter()
+        .map(|f| f.0)
+        .min()
+        .unwrap();
+    assert!(min_start < now - 14 * DAY, "straddler kept until fully expired");
+}
+
+#[test]
+fn retention_shorter_than_largest_tier_is_rejected() {
+    let conn = Connection::open_in_memory().unwrap();
+    silodb::load_module(&conn).unwrap();
+    let err = silodb::init_table_tiered(
+        &conn,
+        "readings",
+        "ts TIMESTAMP, value REAL",
+        "cold/",
+        "1d,7d,28d,retain=14d",
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("retain"), "{err}");
+}
+
+#[test]
 fn maintain_without_policy_errors() {
     let conn = Connection::open_in_memory().unwrap();
     silodb::load_module(&conn).unwrap();

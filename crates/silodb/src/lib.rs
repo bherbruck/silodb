@@ -195,11 +195,17 @@ pub fn init_table(
 /// [`init_table`] plus an explicit compaction-tier policy, e.g.
 /// `"1d, 7d, 28d"`: hot rows compact into 1-day bucket files; once a
 /// 7-day window is fully in the past its daily files merge into one
-/// weekly file; likewise weekly → 28-day. Units: `s m h d w`. Each tier
-/// must be an exact multiple of the previous one (windows are
+/// weekly file; likewise weekly → 28-day. Units: `s m h d w y` (y = 365d).
+/// Each tier must be an exact multiple of the previous one (windows are
 /// epoch-aligned; `30d` after `7d` would strand straddling files — use
-/// `28d`). The policy persists in `_silodb_policy`; [`maintain`] executes
-/// it.
+/// `28d`).
+///
+/// An optional trailing `retain=<duration>` element sets the retention
+/// policy: cold files entirely older than `now - retain` are evicted
+/// (deleted) by [`maintain`], at whole-file granularity — a file
+/// straddling the cutoff stays until all of it has expired. Example:
+/// `"1d, 7d, 28d, retain=2y"`. Without it, history is kept forever.
+/// The policy persists in `_silodb_policy`; [`maintain`] executes it.
 pub fn init_table_tiered(
     conn: &Connection,
     table: &str,
@@ -207,43 +213,56 @@ pub fn init_table_tiered(
     base_dir: impl AsRef<Path>,
     tiers: &str,
 ) -> Result<(), InitError> {
-    let tiers_us = parse_tiers(tiers)?;
+    let (tiers_us, retain_us) = parse_tiers(tiers)?;
     catalog::set_policy(
         conn,
         &catalog::TablePolicy {
             logical_table: table.to_owned(),
             tiers_us,
             safety_margin_us: 2 * 3600 * 1_000_000, // 2h, per spec contract
+            retain_us,
         },
     )?;
     init_table_inner(conn, table, schema, base_dir)
 }
 
-/// Parse `"1d, 7d, 28d"` into ascending microsecond windows, validating
-/// that each tier is a multiple of the previous.
-fn parse_tiers(tiers: &str) -> Result<Vec<i64>, InitError> {
-    let bad = |m: String| InitError::BadSchema(m);
+fn parse_duration_us(part: &str, bad: impl Fn(String) -> InitError) -> Result<i64, InitError> {
+    let (num, unit) = part.split_at(part.len().saturating_sub(1));
+    let n: i64 = num
+        .trim()
+        .parse()
+        .map_err(|_| bad(format!("bad duration '{part}'")))?;
+    let secs = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86_400,
+        "w" => 7 * 86_400,
+        "y" => 365 * 86_400,
+        _ => return Err(bad(format!("bad unit in '{part}' (use s/m/h/d/w/y)"))),
+    };
+    n.checked_mul(secs)
+        .and_then(|s| s.checked_mul(1_000_000))
+        .filter(|&us| us > 0)
+        .ok_or_else(|| bad(format!("duration '{part}' out of range")))
+}
+
+/// Parse `"1d, 7d, 28d[, retain=2y]"` into ascending microsecond windows
+/// (each validated as a multiple of the previous) plus optional retention.
+fn parse_tiers(tiers: &str) -> Result<(Vec<i64>, Option<i64>), InitError> {
+    let bad = InitError::BadSchema;
     let mut out = Vec::new();
+    let mut retain = None;
     for part in tiers.split(',') {
         let part = part.trim();
-        let (num, unit) = part.split_at(part.len().saturating_sub(1));
-        let n: i64 = num
-            .trim()
-            .parse()
-            .map_err(|_| bad(format!("bad tier '{part}'")))?;
-        let secs = match unit {
-            "s" => 1,
-            "m" => 60,
-            "h" => 3600,
-            "d" => 86_400,
-            "w" => 7 * 86_400,
-            _ => return Err(bad(format!("bad tier unit in '{part}' (use s/m/h/d/w)"))),
-        };
-        let us = n
-            .checked_mul(secs)
-            .and_then(|s| s.checked_mul(1_000_000))
-            .filter(|&us| us > 0)
-            .ok_or_else(|| bad(format!("tier '{part}' out of range")))?;
+        if let Some(dur) = part.strip_prefix("retain=") {
+            if retain.is_some() {
+                return Err(bad("duplicate retain=".into()));
+            }
+            retain = Some(parse_duration_us(dur.trim(), bad)?);
+            continue;
+        }
+        let us = parse_duration_us(part, bad)?;
         if let Some(&prev) = out.last()
             && (us <= prev || us % prev != 0)
         {
@@ -258,7 +277,17 @@ fn parse_tiers(tiers: &str) -> Result<Vec<i64>, InitError> {
     if out.is_empty() {
         return Err(bad("no tiers".into()));
     }
-    Ok(out)
+    if let (Some(r), Some(&largest)) = (retain, out.last())
+        && r < largest
+    {
+        return Err(bad(
+            "retain= is shorter than the largest tier window — files merge \
+             into windows bigger than the retention period and could never \
+             be evicted whole; use retain >= the largest tier"
+                .into(),
+        ));
+    }
+    Ok((out, retain))
 }
 
 fn init_table_inner(
@@ -399,7 +428,11 @@ pub enum MaintainAction {
         rows: usize,
         path: std::path::PathBuf,
     },
-    /// A superseded file unlinked and its catalog row removed.
+    /// Retention: an active file entirely older than `now - retain`
+    /// flipped to `evicted` (its file is unlinked by the GC step of the
+    /// same call).
+    Evicted { window: (i64, i64), path: String },
+    /// A superseded/evicted file unlinked and its catalog row removed.
     Gc { path: String },
 }
 
@@ -506,6 +539,18 @@ pub fn maintain(
         }
     }
 
+    // --- retention: evict whole files past the retain window ---------
+    // Before promotions, so soon-to-die data isn't pointlessly merged.
+    if let Some(retain) = policy.retain_us {
+        let retain_cutoff = now_us.saturating_sub(retain);
+        for e in catalog::evict_older_than(conn, table, retain_cutoff)? {
+            actions.push(MaintainAction::Evicted {
+                window: (e.range_start, e.range_end),
+                path: e.path,
+            });
+        }
+    }
+
     // --- higher tiers: promote finer files into closed windows -------
     for &w in &policy.tiers_us[1..] {
         // Candidate windows = distinct epoch-aligned windows containing
@@ -540,8 +585,8 @@ pub fn maintain(
         }
     }
 
-    // --- GC superseded files ------------------------------------------
-    for entry in catalog::superseded_entries(conn, table)? {
+    // --- GC superseded + evicted files ---------------------------------
+    for entry in catalog::gc_entries(conn, table)? {
         match std::fs::remove_file(&entry.path) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}

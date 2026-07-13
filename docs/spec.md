@@ -245,6 +245,13 @@ silodb::maintain(&conn, "readings", "cold/", now_us)?;  // timer + boot
 - `merge_window` is the one write-path operation that reads Parquet — its
   own children only, never the hot table. `compact_bucket`'s
   never-reads-Parquet invariant is per-function and unchanged.
+- **Retention** is one more element of the same policy string:
+  `"1d,7d,28d,retain=2y"`. `maintain` flips active files entirely older
+  than `now − retain` to `status='evicted'` (whole-file granularity — a
+  straddling file survives until all of it has expired) and the same GC
+  step unlinks them. Retention shorter than the largest tier window is
+  rejected at init (files would merge into windows that could never be
+  evicted whole). No `retain=` → keep forever.
 - Contract: **one maintainer process at a time** (same as the compaction
   scheduling contract it subsumes).
 
@@ -334,9 +341,6 @@ Single source of truth for both directions; never depends on `rusqlite`.
   `xUpdate` for inserts, the hot∪cold union inside the cursor — subsuming
   `init_table`, the view, and the trigger. Sequenced after tiered
   compaction proved out.
-- **Retention/eviction** of old cold files after cloud sync — embedding
-  app's job, needs a documented contract eventually (likely
-  `status='evicted'` + file delete).
 - **Catalog rebuild / adopt** — recovering a database from bare parquet
   files (footer scan → catalog rows). Disaster-recovery tool, cheap to
   build when needed.

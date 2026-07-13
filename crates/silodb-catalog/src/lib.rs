@@ -208,11 +208,12 @@ pub fn supersede_entry(conn: &Connection, logical_table: &str, path: &str) -> Re
     Ok(())
 }
 
-/// Superseded rows for a table — GC work list.
-pub fn superseded_entries(conn: &Connection, logical_table: &str) -> Result<Vec<CatalogEntry>> {
+/// Rows awaiting file GC (merge children and retention-evicted files).
+pub fn gc_entries(conn: &Connection, logical_table: &str) -> Result<Vec<CatalogEntry>> {
     let mut stmt = conn.prepare(&format!(
         "SELECT {SELECT_COLS} FROM _silodb_catalog
-         WHERE logical_table = ?1 AND status = 'superseded' ORDER BY path"
+         WHERE logical_table = ?1 AND status IN ('superseded', 'evicted')
+         ORDER BY path"
     ))?;
     let rows = stmt.query_map([logical_table], entry_from_row)?;
     rows.collect()
@@ -237,17 +238,27 @@ pub struct TablePolicy {
     pub tiers_us: Vec<i64>,
     /// Don't touch data newer than now - margin.
     pub safety_margin_us: i64,
+    /// Retention: evict cold files entirely older than now - retain.
+    /// `None` = keep forever.
+    pub retain_us: Option<i64>,
 }
 
-/// Create the policy table if needed. Idempotent.
+/// Create the policy table if needed, migrating older layouts. Idempotent.
 pub fn ensure_policy_table(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS _silodb_policy (
             logical_table     TEXT PRIMARY KEY,
             tiers_us          TEXT NOT NULL,  -- comma-separated i64 µs
-            safety_margin_us  INTEGER NOT NULL
+            safety_margin_us  INTEGER NOT NULL,
+            retain_us         INTEGER         -- NULL = keep forever
         );",
-    )
+    )?;
+    // Migration for policy tables created before retain_us existed.
+    match conn.execute_batch("ALTER TABLE _silodb_policy ADD COLUMN retain_us INTEGER") {
+        Ok(()) => Ok(()),
+        Err(e) if e.to_string().contains("duplicate column") => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// Insert or replace a table's policy.
@@ -260,8 +271,13 @@ pub fn set_policy(conn: &Connection, policy: &TablePolicy) -> Result<()> {
         .collect::<Vec<_>>()
         .join(",");
     conn.execute(
-        "INSERT OR REPLACE INTO _silodb_policy VALUES (?1, ?2, ?3)",
-        params![policy.logical_table, tiers, policy.safety_margin_us],
+        "INSERT OR REPLACE INTO _silodb_policy VALUES (?1, ?2, ?3, ?4)",
+        params![
+            policy.logical_table,
+            tiers,
+            policy.safety_margin_us,
+            policy.retain_us
+        ],
     )?;
     Ok(())
 }
@@ -278,8 +294,9 @@ pub fn get_policy(conn: &Connection, logical_table: &str) -> Result<Option<Table
     if table_exists.is_none() {
         return Ok(None);
     }
+    ensure_policy_table(conn)?; // migrate before reading retain_us
     conn.query_row(
-        "SELECT logical_table, tiers_us, safety_margin_us FROM _silodb_policy
+        "SELECT logical_table, tiers_us, safety_margin_us, retain_us FROM _silodb_policy
          WHERE logical_table = ?1",
         [logical_table],
         |r| {
@@ -291,10 +308,38 @@ pub fn get_policy(conn: &Connection, logical_table: &str) -> Result<Option<Table
                     .filter_map(|t| t.parse().ok())
                     .collect(),
                 safety_margin_us: r.get(2)?,
+                retain_us: r.get(3)?,
             })
         },
     )
     .optional()
+}
+
+/// Flip every active file entirely older than `cutoff` to
+/// `status = 'evicted'` (retention). Whole-file granularity: a file
+/// straddling the cutoff is untouched until all of it has expired.
+/// Returns the flipped entries. Runs in the caller's ambient transaction.
+pub fn evict_older_than(
+    conn: &Connection,
+    logical_table: &str,
+    cutoff: i64,
+) -> Result<Vec<CatalogEntry>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {SELECT_COLS} FROM _silodb_catalog
+         WHERE logical_table = ?1 AND status = 'active' AND range_end <= ?2
+         ORDER BY range_start, path"
+    ))?;
+    let expired: Vec<CatalogEntry> = stmt
+        .query_map(params![logical_table, cutoff], entry_from_row)?
+        .collect::<Result<_>>()?;
+    for e in &expired {
+        conn.execute(
+            "UPDATE _silodb_catalog SET status = 'evicted'
+             WHERE logical_table = ?1 AND path = ?2",
+            params![logical_table, e.path],
+        )?;
+    }
+    Ok(expired)
 }
 
 #[cfg(test)]

@@ -387,7 +387,8 @@ fn main() {
         match a {
             silodb::MaintainAction::Merged { .. } => merges += 1,
             silodb::MaintainAction::Gc { .. } => gcs += 1,
-            silodb::MaintainAction::Compacted { .. } => {}
+            silodb::MaintainAction::Compacted { .. }
+            | silodb::MaintainAction::Evicted { .. } => {}
         }
     }
     let active = silodb::catalog::entries_for_table(&conn, "readings")
@@ -417,6 +418,98 @@ fn main() {
     println!("{tiered_md}");
 
     duckdb_native(&qs, &out, &base, days);
+    single_write_ingest(&out);
+}
+
+/// The device-realistic ingest shape: one reading, one INSERT, one
+/// transaction (autocommit). No batching anywhere. SQLite variants run
+/// WAL + synchronous=NORMAL (as configured everywhere else in this
+/// bench); DuckDB gets the same single-statement autocommit treatment.
+fn single_write_ingest(out: &Path) {
+    println!("\n## single-write ingest (autocommit — one txn per row, no batching)");
+    let scratch = out.join("single-write");
+    let _ = std::fs::remove_dir_all(&scratch);
+    std::fs::create_dir_all(&scratch).unwrap();
+    const N: i64 = 100_000;
+
+    // silodb: through the view + trigger, ts index maintained.
+    let conn = Connection::open(scratch.join("silo.db")).unwrap();
+    conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+    conn.pragma_update(None, "synchronous", "NORMAL").unwrap();
+    silodb::load_module(&conn).unwrap();
+    silodb::init_table_tiered(
+        &conn,
+        "readings",
+        "ts TIMESTAMP, device TEXT, sensor TEXT, value REAL",
+        scratch.join("cold"),
+        "1d,7d,28d",
+    )
+    .unwrap();
+    let mut rng = Lcg(9);
+    let t = Instant::now();
+    {
+        let mut stmt = conn
+            .prepare("INSERT INTO readings VALUES (?1, 'device-03', 'sensor-07', ?2)")
+            .unwrap();
+        for i in 0..N {
+            stmt.execute(rusqlite::params![i * INTERVAL_US, rng.next_f64() * 100.0])
+                .unwrap();
+        }
+    }
+    let el = t.elapsed().as_secs_f64();
+    println!("- silodb (view+trigger): {N} rows in {el:.1}s ({:.0} rows/s)", N as f64 / el);
+
+    // plain sqlite, indexed table.
+    let plain = Connection::open(scratch.join("plain.db")).unwrap();
+    plain.pragma_update(None, "journal_mode", "WAL").unwrap();
+    plain.pragma_update(None, "synchronous", "NORMAL").unwrap();
+    plain
+        .execute_batch(
+            "CREATE TABLE readings (ts INTEGER, device TEXT, sensor TEXT, value REAL);
+             CREATE INDEX idx_ts ON readings(ts);",
+        )
+        .unwrap();
+    let t = Instant::now();
+    {
+        let mut stmt = plain
+            .prepare("INSERT INTO readings VALUES (?1, 'device-03', 'sensor-07', ?2)")
+            .unwrap();
+        for i in 0..N {
+            stmt.execute(rusqlite::params![i * INTERVAL_US, rng.next_f64() * 100.0])
+                .unwrap();
+        }
+    }
+    let el = t.elapsed().as_secs_f64();
+    println!("- plain sqlite (+ts idx): {N} rows in {el:.1}s ({:.0} rows/s)", N as f64 / el);
+
+    // duckdb: same shape, smaller sample (it is much slower at this).
+    const N_DUCK: i64 = 10_000;
+    let mut ins = String::with_capacity(2 << 20);
+    ins.push_str("CREATE TABLE rw (ts TIMESTAMP, device VARCHAR, sensor VARCHAR, value DOUBLE);\n");
+    for i in 0..N_DUCK {
+        ins.push_str(&format!(
+            "INSERT INTO rw VALUES (make_timestamp({}), 'device-03', 'sensor-07', {});\n",
+            i * INTERVAL_US,
+            (rng.next_f64() * 1000.0).round() / 10.0
+        ));
+    }
+    let ins_path = scratch.join("duck_single.sql");
+    std::fs::write(&ins_path, &ins).unwrap();
+    let t = Instant::now();
+    let ok = std::process::Command::new("duckdb")
+        .arg("-batch")
+        .arg(scratch.join("duck.db"))
+        .stdin(std::fs::File::open(&ins_path).unwrap())
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if ok {
+        let el = t.elapsed().as_secs_f64();
+        println!(
+            "- duckdb native: {N_DUCK} rows in {el:.1}s ({:.0} rows/s)",
+            N_DUCK as f64 / el
+        );
+    }
 }
 
 /// DuckDB as a storage engine, not just a parquet reader: bulk ingest into

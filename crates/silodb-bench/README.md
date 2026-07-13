@@ -114,14 +114,29 @@ native db size:                         140 MB (parquet: 133 MB)
 | full year agg | **15** |
 
 Native DuckDB wins every query decisively and bulk-loads at ~10M rows/s —
-and is **~500× slower than SQLite at live row-at-a-time ingest** (863 vs
-430k rows/s), which is the workload an edge device actually generates.
-(Caveat: measured via single-row SQL statements through the CLI; the
-appender API narrows the gap, but DuckDB's own docs steer OLTP-shaped
-writes elsewhere — this measures why.) Single writer, no SQLite ecosystem.
-Bulk numbers only apply when the data already exists in bulk — which on a
-device, it never does. Hence the architecture: SQLite where data is born,
-parquet where it rests, DuckDB welcome to visit.
+and loses ingest at every realistic shape. (Caveat on its ingest numbers:
+measured via single-row SQL statements through the CLI; the appender API
+narrows the gap, but DuckDB's own docs steer OLTP-shaped writes elsewhere
+— this measures why.) Single writer, no SQLite ecosystem. Bulk numbers
+only apply when the data already exists in bulk — which on a device, it
+never does. Hence the architecture: SQLite where data is born, parquet
+where it rests, DuckDB welcome to visit.
+
+## Single-write ingest (autocommit — one row, one txn, no batching)
+
+The device reality: readings arrive one at a time. WAL +
+`synchronous=NORMAL` on the SQLite side; same statement shape everywhere.
+
+```
+silodb (view + trigger):  12,047 rows/s
+plain sqlite (+ts idx):   11,608 rows/s
+duckdb native:               214 rows/s   (56× slower)
+```
+
+Two findings: per-transaction cost dominates, so silodb's view/trigger
+overhead **disappears** at the realistic write shape (it's within noise of
+raw SQLite — the 2× gap only exists in giant batched transactions); and
+DuckDB's per-commit cost makes it a non-starter as the live sink.
 
 ## History
 

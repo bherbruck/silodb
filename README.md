@@ -13,7 +13,7 @@ let conn = rusqlite::Connection::open("hot.db")?;
 silodb::load_module(&conn)?;                       // every boot
 silodb::init_table_tiered(&conn, "readings",
     "ts TIMESTAMP, device TEXT, sensor TEXT, value REAL",
-    "cold/", "1d,7d,28d")?;                        // idempotent
+    "cold/", "1d,7d,28d,retain=2y")?;              // idempotent; retention optional
 
 // the app's whole world is one name:
 conn.execute("INSERT INTO readings VALUES (silodb_ts('2026-07-13T10:00:00Z'), 'boiler', 'temp', 21.5)", [])?;
@@ -44,7 +44,8 @@ DuckDB as a self-contained engine with its own native table.
 
 | | silodb | hot SQLite (+ts idx) | DuckDB on the parquet | DuckDB native table |
 |---|---|---|---|---|
-| **live ingest** (row-at-a-time) | **~430k rows/s** | ~890k rows/s | — | **863 rows/s** |
+| **single writes** (1 row = 1 txn, the device reality) | **12,047 rows/s** | 11,608 rows/s | — | **214 rows/s** |
+| batched ingest (rows/txn amortized) | ~430k rows/s | ~890k rows/s | — | 863 rows/s |
 | bulk load (from existing bulk data) | ~540k rows/s¹ | — | — | 9.9M rows/s |
 | on-disk | **133 MB** | 2,988 MB (22×) | (same files) | 140 MB |
 | "1h of one sensor" | **1.0 ms** | 0.4 ms | 126 ms | 2 ms |
@@ -62,10 +63,10 @@ Reading it honestly, each column has a story:
   with a 30 s index rebuild hanging over every maintenance window.
 - **DuckDB ad hoc**: reads silodb's files directly — free analytics tier,
   no export. Pays 100–250 ms per query re-planning/re-parsing footers.
-- **DuckDB native**: spectacular at queries and bulk loads — and **~500×
-  too slow at live row-at-a-time ingest** to be the system of record on a
-  device that's writing constantly. Single-writer, and you give up the
-  SQLite ecosystem (joins against app tables, tooling, clients).
+- **DuckDB native**: spectacular at queries and bulk loads — and **~56×
+  too slow at unbatched single writes** (the shape a device actually
+  produces) to be the system of record. Single-writer, and you give up
+  the SQLite ecosystem (joins against app tables, tooling, clients).
 
 That's the architecture in one table: **SQLite where data is born, parquet
 where it rests, DuckDB welcome to visit.** Methodology + full numbers:
