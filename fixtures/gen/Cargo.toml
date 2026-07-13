@@ -1,0 +1,9 @@
+[package]
+name = "silodb-fixture-gen"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+arrow = "59.1.0"
+parquet = "59.1.0"
+
