@@ -55,7 +55,10 @@ silodb::compact_table(&conn, "readings", start_us, end_us, "cold/")?;
 
 `init_table` creates (all `IF NOT EXISTS`, so boots after the first no-op):
 
-- `readings_hot` — real table; writes land here, compaction drains it
+- `readings_hot` — real table; writes land here, compaction drains it.
+  The bucket axis gets an index — compaction selects/counts/deletes by ts
+  range, and without it a compaction backlog goes quadratic (measured:
+  10× throughput collapse at 2M rows, see `crates/silodb-bench`)
 - `readings_cold` — silodb vtab; `schema=` is baked into its DDL so it
   reconnects with zero dependencies (works in a cold-only archive database
   where the hot table no longer exists)

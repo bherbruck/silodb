@@ -1,0 +1,8 @@
+[package]
+name = "silodb-bench"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rusqlite = { version = "0.40.1", features = ["bundled", "functions"] }
+silodb = { version = "0.1.0", path = "../silodb" }

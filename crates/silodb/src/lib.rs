@@ -245,8 +245,17 @@ pub fn init_table(
         .collect::<Vec<_>>()
         .join(", ");
 
+    let ts_name = {
+        let idx = silodb_schema::resolve_ts_index(&decls, None).expect("validated above");
+        decls[idx].name.clone()
+    };
     conn.execute_batch(&format!(
         "CREATE TABLE IF NOT EXISTS {hot_q} ({col_defs});
+         -- The bucket axis must be indexed: compaction selects, counts and
+         -- deletes by ts range, and without this every compact_bucket call
+         -- scans the whole hot table (quadratic over a backlog — measured
+         -- 10x throughput loss at 2M rows in silodb-bench).
+         CREATE INDEX IF NOT EXISTS {ts_idx_q} ON {hot_q} ({ts_q});
          CREATE VIRTUAL TABLE IF NOT EXISTS {cold_q} USING silodb('{base}',
              table={table}, schema='{schema_esc}');
          CREATE VIEW IF NOT EXISTS {table_q} AS
@@ -262,6 +271,8 @@ pub fn init_table(
         cold_q = quote_ident(&cold),
         table_q = quote_ident(table),
         trigger_q = quote_ident(&format!("{table}_insert")),
+        ts_idx_q = quote_ident(&format!("{table}_hot_ts")),
+        ts_q = quote_ident(&ts_name),
         base = base_dir.as_ref().display(),
         schema_esc = schema.replace('\'', "''"),
     ))?;
