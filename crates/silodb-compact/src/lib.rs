@@ -4,7 +4,7 @@
 //!
 //! Sequence (specv2 Phase 3):
 //! 1. select hot rows in `[bucket_start, bucket_end)`, ordered by timestamp
-//! 2. write them to `<file>.tmp` inside `out_dir`
+//! 2. write them to `<file>.tmp` inside `<base_dir>/<logical_table>/`
 //! 3. fsync the temp file, atomically rename into place, fsync the dir
 //! 4. **one transaction**: DELETE the hot rows AND INSERT the catalog row
 //!
@@ -183,7 +183,9 @@ enum ColBuf {
 impl ColBuf {
     fn new(ty: SqliteType, is_ts: bool) -> Self {
         if is_ts {
-            return Self::Ts(TimestampMicrosecondBuilder::new());
+            // Timezone must match silodb_schema::timestamp_arrow_type() or
+            // RecordBatch construction rejects the array.
+            return Self::Ts(TimestampMicrosecondBuilder::new().with_timezone("UTC"));
         }
         match ty {
             SqliteType::Integer => Self::Int(Int64Builder::new()),
@@ -253,14 +255,18 @@ fn value_kind(v: &Value) -> &'static str {
 }
 
 /// Compact `[spec.bucket_start, spec.bucket_end)` from the hot table into a
-/// new Parquet file inside `out_dir` (named `bucket-<start>-<end>-<seq>
-/// .parquet` by this function), then — in one transaction — delete the hot
-/// rows and insert the catalog row. Idempotent under every calling pattern;
-/// see module docs.
+/// new Parquet file under `base_dir` — the one directory the application
+/// configures, shared by every cold table. The per-table directory
+/// `<base_dir>/<logical_table>/` and the catalog itself are created lazily
+/// here, on the first compaction that actually writes; nothing else in the
+/// system ever creates them. The file is named
+/// `bucket-<start>-<end>-<seq>.parquet` internally. After the
+/// rename, one transaction deletes the hot rows and inserts the catalog
+/// row. Idempotent under every calling pattern; see module docs.
 pub fn compact_bucket(
     conn: &Connection,
     spec: &BucketSpec<'_>,
-    out_dir: &Path,
+    base_dir: &Path,
 ) -> Result<CompactOutcome> {
     silodb_catalog::ensure_catalog(conn)?;
 
@@ -311,7 +317,9 @@ pub fn compact_bucket(
         });
     }
 
-    let out_path = out_dir.join(format!(
+    let table_dir = base_dir.join(spec.logical_table);
+    std::fs::create_dir_all(&table_dir)?;
+    let out_path = table_dir.join(format!(
         "bucket-{}-{}-{}.parquet",
         spec.bucket_start,
         spec.bucket_end,
@@ -416,7 +424,7 @@ pub fn compact_bucket(
     file.sync_all()?;
     drop(file);
     std::fs::rename(&tmp_path, &out_path)?;
-    File::open(out_dir)?.sync_all()?;
+    File::open(&table_dir)?.sync_all()?;
 
     // The one transaction that makes it real: hot rows out, catalog row in.
     conn.execute_batch("BEGIN IMMEDIATE")?;

@@ -14,7 +14,7 @@ fn env_with_fixture() -> ColdEnv {
     let dest = env.table_dir.join("bucket-1000.parquet");
     std::fs::copy(fixture_basic(), &dest).unwrap();
     env.register(&dest, 1000, 10_001, 10);
-    env.create_vtab();
+    env.create_vtab(common::ColdEnv::FIXTURE_SCHEMA);
     env
 }
 
@@ -156,13 +156,20 @@ fn day_zero_vtab_works_before_any_compaction() {
 }
 
 #[test]
-fn create_errors_on_missing_directory() {
+fn missing_directory_is_fine_everything_is_lazy() {
+    // Nothing on disk is required to connect: the base dir is created by
+    // the first compaction that writes, not by the read side.
     let env = cold_env();
-    let err = env
+    env.conn
+        .execute_batch(
+            "CREATE VIRTUAL TABLE cold USING silodb('/no/such/dir/', schema='ts INTEGER')",
+        )
+        .unwrap();
+    let n: i64 = env
         .conn
-        .execute_batch("CREATE VIRTUAL TABLE cold USING silodb('/no/such/dir/')")
-        .unwrap_err();
-    assert!(err.to_string().contains("not a directory"), "{err}");
+        .query_row("SELECT count(*) FROM cold", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 0);
 }
 
 #[test]
@@ -192,9 +199,12 @@ fn second_connection_reconnects_to_persisted_vtab() {
             },
         )
         .unwrap();
+        // schema= baked into the DDL: reconnection must work with no hot
+        // table, no catalog access at connect, nothing but the arguments.
         conn.execute_batch(&format!(
-            "CREATE VIRTUAL TABLE cold USING silodb('{}', table=sensor)",
-            dir.path().display()
+            "CREATE VIRTUAL TABLE cold USING silodb('{}', table=sensor, schema='{}')",
+            dir.path().display(),
+            ColdEnv::FIXTURE_SCHEMA,
         ))
         .unwrap();
     }

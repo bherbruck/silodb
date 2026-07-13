@@ -97,16 +97,16 @@ fn round_trip_moves_exactly_the_bucket() {
     let (rows, path) = compacted(compact_bucket(&conn, &spec(1000, 2000), dir.path()).unwrap());
     assert_eq!(rows, 10);
     assert_eq!(
-        path.file_name().unwrap().to_str().unwrap(),
-        "bucket-1000-2000-0.parquet",
-        "range and sequence encoded for human debuggability"
+        path,
+        dir.path().join("readings").join("bucket-1000-2000-0.parquet"),
+        "per-table subdir created lazily; range and sequence in the name"
     );
 
     // Parquet holds exactly the bucket, ordered by ts.
     let ts = parquet_ts(&path);
     assert_eq!(ts, (0..10).map(|i| 1000 + i * 100).collect::<Vec<_>>());
     assert_eq!(
-        std::fs::read_dir(dir.path()).unwrap().count(),
+        std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
         1,
         "no temp file left behind"
     );
@@ -295,7 +295,7 @@ fn type_mismatch_aborts_without_side_effects() {
     let err = compact_bucket(&conn, &spec(1000, 2000), dir.path()).unwrap_err();
     assert!(matches!(err, CompactError::TypeMismatch { .. }), "{err}");
     assert_eq!(
-        std::fs::read_dir(dir.path()).unwrap().count(),
+        std::fs::read_dir(dir.path().join("readings")).unwrap().count(),
         0,
         "no file, no tmp"
     );

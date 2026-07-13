@@ -22,7 +22,7 @@ fn env_with_three_buckets() -> ColdEnv {
         write_id_ts_file(&path, &rows, 2);
         env.register(&path, start, start + 1000, 4);
     }
-    env.create_vtab();
+    env.create_vtab(common::ColdEnv::ID_TS_SCHEMA);
     env
 }
 
@@ -155,7 +155,7 @@ fn schema_mismatch_across_files_errors() {
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap_err();
-    assert!(err.to_string().contains("schema"), "{err}");
+    assert!(err.to_string().contains("different columns"), "{err}");
 }
 
 #[test]
@@ -179,7 +179,7 @@ fn logical_table_and_ts_column_overrides() {
     .unwrap();
     env.conn
         .execute_batch(&format!(
-            "CREATE VIRTUAL TABLE cold USING silodb('{}', table=other_name, ts_column=ts)",
+            "CREATE VIRTUAL TABLE cold USING silodb('{}', table=other_name, ts_column=ts, schema='id INTEGER, ts INTEGER')",
             env.dir.path().display()
         ))
         .unwrap();
@@ -196,7 +196,7 @@ fn vtab_name_is_the_default_logical_table() {
     // one base dir serves every cold table.
     env.conn
         .execute_batch(&format!(
-            "CREATE VIRTUAL TABLE sensor USING silodb('{}')",
+            "CREATE VIRTUAL TABLE sensor USING silodb('{}', schema='id INTEGER, ts INTEGER')",
             env.dir.path().display()
         ))
         .unwrap();

@@ -1138,6 +1138,7 @@ dependencies = [
  "rusqlite",
  "silodb-catalog",
  "silodb-compact",
+ "silodb-schema",
  "silodb-vtab",
  "tempfile",
 ]

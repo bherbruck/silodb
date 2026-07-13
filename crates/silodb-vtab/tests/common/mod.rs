@@ -39,17 +39,24 @@ pub fn cold_env() -> ColdEnv {
 }
 
 impl ColdEnv {
-    pub fn create_vtab(&self) {
-        // Base dir + explicit table= (the vtab's name, `cold`, differs from
-        // the logical table). The vtab-name-default path is covered in
-        // directory_test.
+    /// Create the vtab as `cold` with an explicit schema (these envs have
+    /// no hot table to borrow from). The vtab-name-default and hot-table
+    /// borrow paths are covered in directory_test/vtab_test.
+    pub fn create_vtab(&self, schema: &str) {
         self.conn
             .execute_batch(&format!(
-                "CREATE VIRTUAL TABLE cold USING silodb('{}', table=sensor)",
+                "CREATE VIRTUAL TABLE cold USING silodb('{}', table=sensor, schema='{schema}')",
                 self.dir.path().display()
             ))
             .unwrap();
     }
+
+    /// Schema string matching `write_id_ts_file`'s columns.
+    pub const ID_TS_SCHEMA: &'static str = "id INTEGER, ts INTEGER";
+
+    /// Schema string matching `fixtures/basic.parquet`'s columns.
+    pub const FIXTURE_SCHEMA: &'static str =
+        "id INTEGER, ts INTEGER, value REAL, name TEXT, payload BLOB, flag INTEGER";
 
     /// Register `path` in the catalog for logical table `sensor`.
     pub fn register(&self, path: &Path, range_start: i64, range_end: i64, rows: i64) {

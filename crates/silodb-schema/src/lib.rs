@@ -136,8 +136,15 @@ pub fn arrow_type_for(ty: SqliteType) -> DataType {
 /// Arrow type used for the compaction bucket's timestamp column. The hot
 /// table stores epoch **microseconds** as INTEGER; this is the one place
 /// that convention is encoded.
+///
+/// UTC-tagged on purpose: parquet files then carry a real, unambiguous
+/// TIMESTAMP logical type, so external tools (pandas, DuckDB, parquet
+/// viewers) render actual datetimes instead of bare integers — the cold
+/// files are directly exportable with no decoding step. Through the vtab
+/// the value still surfaces as the raw INTEGER microseconds, matching the
+/// hot table.
 pub fn timestamp_arrow_type() -> DataType {
-    DataType::Timestamp(TimeUnit::Microsecond, None)
+    DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
 }
 
 /// Convenience: build an Arrow field, always nullable — SQLite columns are

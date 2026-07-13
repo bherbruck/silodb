@@ -92,7 +92,7 @@ proptest! {
             let max = *chunk.iter().max().unwrap();
             env.register(&path, min, max.saturating_add(1), rows.len() as i64);
         }
-        env.create_vtab();
+        env.create_vtab(common::ColdEnv::ID_TS_SCHEMA);
 
         let where_clause = constraints
             .iter()

@@ -1,55 +1,35 @@
-//! End-to-end through the facade: hot writes → compaction → one connection
-//! querying hot + cold as a single view. This is the product story; if this
-//! passes, the read and write paths actually connect.
-//!
-//! Deliberately runs in the day-zero order: the vtab and view are created
-//! BEFORE anything is compacted (before the catalog even exists).
+//! End-to-end through the facade's single-name surface: the app only ever
+//! touches `readings` — inserts land hot, reads span hot + cold, compaction
+//! moves rows underneath without anything observable changing.
 
 use rusqlite::{params, Connection};
-use silodb::{compact_bucket, BucketSpec, CompactOutcome};
+use silodb::{compact_table, CompactOutcome, InitError};
 
-fn spec(start: i64, end: i64) -> BucketSpec<'static> {
-    BucketSpec {
-        hot_table: "readings",
-        logical_table: "readings",
-        ts_column: "ts",
-        bucket_start: start,
-        bucket_end: end,
-    }
+const SCHEMA: &str = "ts INTEGER, value REAL, name TEXT";
+
+fn boot(db: &std::path::Path, base: &std::path::Path) -> Connection {
+    let conn = Connection::open(db).unwrap();
+    silodb::load_module(&conn).unwrap();
+    silodb::init_table(&conn, "readings", SCHEMA, base).unwrap();
+    conn
 }
 
-fn view_count(conn: &Connection) -> i64 {
-    conn.query_row("SELECT count(*) FROM all_readings", [], |r| r.get(0))
-        .unwrap()
+fn count(conn: &Connection, sql: &str) -> i64 {
+    conn.query_row(sql, [], |r| r.get(0)).unwrap()
 }
 
 #[test]
-fn hot_and_cold_union_view_over_compacted_buckets() {
-    let base = tempfile::tempdir().unwrap();
-    let cold_dir = base.path().join("readings");
-    std::fs::create_dir(&cold_dir).unwrap();
+fn single_name_surface_hides_the_hot_cold_split() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("cold");
+    let db = dir.path().join("hot.db");
+    let conn = boot(&db, &base);
 
-    let conn = Connection::open_in_memory().unwrap();
-    silodb::load_module(&conn).unwrap();
-    conn.execute_batch(
-        "CREATE TABLE readings (ts INTEGER NOT NULL, value REAL, name TEXT)",
-    )
-    .unwrap();
+    // Day zero: one name, empty, no cold/ dir on disk yet.
+    assert_eq!(count(&conn, "SELECT count(*) FROM readings"), 0);
+    assert!(!base.exists(), "everything on disk is lazy");
 
-    // Day zero: vtab + view exist before any compaction, before the
-    // catalog exists. Schema comes from the hot table.
-    conn.execute_batch(&format!(
-        "CREATE VIRTUAL TABLE cold USING silodb('{}', table=readings);
-         CREATE VIEW all_readings AS
-           SELECT ts, value, name FROM readings
-           UNION ALL
-           SELECT ts, value, name FROM cold;",
-        base.path().display()
-    ))
-    .unwrap();
-    assert_eq!(view_count(&conn), 0);
-
-    // 3 buckets of history plus rows still hot.
+    // The app writes and reads ONE name.
     for i in 0..40i64 {
         conn.execute(
             "INSERT INTO readings VALUES (?1, ?2, ?3)",
@@ -57,28 +37,20 @@ fn hot_and_cold_union_view_over_compacted_buckets() {
         )
         .unwrap();
     }
-    assert_eq!(view_count(&conn), 40);
+    assert_eq!(count(&conn, "SELECT count(*) FROM readings"), 40);
 
-    // Compact the first three closed buckets ([0,1000), [1000,2000),
-    // [2000,3000)); ts 3000.. stays hot. The view total never changes.
+    // Compact three closed buckets; the app-visible table never changes.
     for b in 0..3i64 {
-        let start = b * 1000;
-        let outcome = compact_bucket(&conn, &spec(start, start + 1000), &cold_dir).unwrap();
-        assert!(
-            matches!(outcome, CompactOutcome::Compacted { rows: 10, .. }),
-            "{outcome:?}"
-        );
-        assert_eq!(view_count(&conn), 40, "moved, never duplicated or lost");
+        let outcome = compact_table(&conn, "readings", b * 1000, (b + 1) * 1000, &base).unwrap();
+        assert!(matches!(outcome, CompactOutcome::Compacted { rows: 10, .. }));
+        assert_eq!(count(&conn, "SELECT count(*) FROM readings"), 40);
     }
-    let hot: i64 = conn
-        .query_row("SELECT count(*) FROM readings", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(hot, 10, "only the unclosed bucket stays hot");
+    assert_eq!(count(&conn, "SELECT count(*) FROM readings_hot"), 10);
+    assert!(base.join("readings").is_dir(), "created by first compaction");
 
-    // A range query spanning the cold/hot boundary comes back whole and
-    // ordered, through the view.
+    // Range query spanning the cold/hot boundary, through the one name.
     let ts: Vec<i64> = conn
-        .prepare("SELECT ts FROM all_readings WHERE ts >= 2500 AND ts < 3500 ORDER BY ts")
+        .prepare("SELECT ts FROM readings WHERE ts >= 2500 AND ts < 3500 ORDER BY ts")
         .unwrap()
         .query_map([], |r| r.get(0))
         .unwrap()
@@ -86,34 +58,86 @@ fn hot_and_cold_union_view_over_compacted_buckets() {
         .unwrap();
     assert_eq!(ts, (25..35).map(|i| i * 100).collect::<Vec<_>>());
 
-    // The cold side pruned: only the file covering [2000,3000) was a
-    // candidate for ts >= 2500.
+    // File-level pruning happened under the hood.
     let stats = silodb::last_scan_stats().unwrap();
     assert_eq!(stats.total_files, 3);
     assert_eq!(stats.candidate_files, 1);
 
-    // A bucket compacted later shows up without DDL.
-    assert!(matches!(
-        compact_bucket(&conn, &spec(3000, 4000), &cold_dir).unwrap(),
-        CompactOutcome::Compacted { rows: 10, .. }
-    ));
-    assert_eq!(view_count(&conn), 40);
-    let hot: i64 = conn
-        .query_row("SELECT count(*) FROM readings", [], |r| r.get(0))
+    // Late row into an already-compacted bucket: insert through the one
+    // name, recompact, still seamless.
+    conn.execute("INSERT INTO readings VALUES (1500, 99.0, 'late')", [])
         .unwrap();
-    assert_eq!(hot, 0);
-
-    // Late rows into a compacted bucket: still invisible to the user —
-    // compact again, view stays consistent throughout.
-    conn.execute(
-        "INSERT INTO readings VALUES (1500, 99.0, 'late')",
-        [],
-    )
-    .unwrap();
-    assert_eq!(view_count(&conn), 41);
+    assert_eq!(count(&conn, "SELECT count(*) FROM readings"), 41);
     assert!(matches!(
-        compact_bucket(&conn, &spec(1000, 2000), &cold_dir).unwrap(),
+        compact_table(&conn, "readings", 1000, 2000, &base).unwrap(),
         CompactOutcome::Compacted { rows: 1, .. }
     ));
-    assert_eq!(view_count(&conn), 41);
+    assert_eq!(count(&conn, "SELECT count(*) FROM readings"), 41);
+}
+
+#[test]
+fn second_boot_is_a_noop_and_data_survives() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("cold");
+    let db = dir.path().join("hot.db");
+    {
+        let conn = boot(&db, &base);
+        conn.execute("INSERT INTO readings VALUES (100, 1.0, 'a')", [])
+            .unwrap();
+        compact_table(&conn, "readings", 0, 1000, &base).unwrap();
+        conn.execute("INSERT INTO readings VALUES (2000, 2.0, 'b')", [])
+            .unwrap();
+    }
+    // Fresh process: same two boot lines, everything already exists.
+    let conn = boot(&db, &base);
+    assert_eq!(count(&conn, "SELECT count(*) FROM readings"), 2);
+    assert_eq!(count(&conn, "SELECT count(*) FROM readings_hot"), 1);
+}
+
+#[test]
+fn cold_only_database_keeps_working_without_the_hot_table() {
+    // A retired table: history compacted, hot table dropped. The vtab's
+    // schema= is baked into its DDL, so reads keep working; the view needs
+    // its hot arm replaced (or the empty-hot-table placeholder kept — this
+    // test takes the drop path on purpose).
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("cold");
+    let db = dir.path().join("hot.db");
+    {
+        let conn = boot(&db, &base);
+        conn.execute("INSERT INTO readings VALUES (100, 1.0, 'a')", [])
+            .unwrap();
+        compact_table(&conn, "readings", 0, 1000, &base).unwrap();
+        conn.execute_batch(
+            "DROP TRIGGER readings_insert;
+             DROP VIEW readings;
+             DROP TABLE readings_hot;",
+        )
+        .unwrap();
+    }
+    let conn = Connection::open(&db).unwrap();
+    silodb::load_module(&conn).unwrap();
+    // No init, no hot table — the cold vtab alone still serves history.
+    assert_eq!(count(&conn, "SELECT count(*) FROM readings_cold"), 1);
+}
+
+#[test]
+fn init_table_detects_schema_drift() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("cold");
+    let db = dir.path().join("hot.db");
+    boot(&db, &base);
+
+    let conn = Connection::open(&db).unwrap();
+    silodb::load_module(&conn).unwrap();
+    let err = silodb::init_table(&conn, "readings", "ts INTEGER, other REAL", &base).unwrap_err();
+    assert!(matches!(err, InitError::SchemaDrift { .. }), "{err}");
+}
+
+#[test]
+fn init_table_requires_a_ts_column() {
+    let conn = Connection::open_in_memory().unwrap();
+    silodb::load_module(&conn).unwrap();
+    let err = silodb::init_table(&conn, "readings", "value REAL", "cold/").unwrap_err();
+    assert!(matches!(err, InitError::BadSchema(_)), "{err}");
 }

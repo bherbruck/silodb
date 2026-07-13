@@ -2,11 +2,14 @@
 //! files, driven by the `_silodb_catalog` table in the same (hot) database.
 //!
 //! ```sql
-//! -- one base directory for ALL cold tables; the vtab's own name is the
-//! -- logical table (its files conventionally live in buckets/sensor_a/):
-//! CREATE VIRTUAL TABLE sensor_a USING silodb('buckets/');
-//! -- optional overrides:
-//! CREATE VIRTUAL TABLE cold USING silodb('buckets/', table=sensor_a, ts_column=ts, hot_table=sensor_a);
+//! -- one base directory shared by ALL cold tables; the vtab's own name is
+//! -- the logical table (files live in cold/sensor_a/, managed entirely by
+//! -- compaction — this side never creates or requires directories):
+//! CREATE VIRTUAL TABLE sensor_a USING silodb('cold/');
+//! -- every part is overridable, incl. an explicit column list for
+//! -- databases that have no hot table to borrow the schema from:
+//! CREATE VIRTUAL TABLE cold USING silodb('cold/', table=sensor_a,
+//!     ts_column=ts, schema='ts INTEGER, value REAL, name TEXT');
 //! SELECT * FROM sensor_a WHERE ts > ?1 AND ts < ?2;
 //! ```
 //!
@@ -15,11 +18,13 @@
 //! catalog row (e.g. a compaction that crashed before its commit) is
 //! invisible here, and its rows are still in the hot table.
 //!
-//! Day-zero friendly: with no compacted files yet, the declared columns
-//! come from the hot table's schema (same mapping compaction writes with,
-//! via `silodb_schema::bucket_arrow_schema`), and scans are simply empty.
-//! No ordering requirement between `CREATE VIRTUAL TABLE` and the first
-//! compaction.
+//! `xConnect` does **zero file I/O** (specv3): columns come from the
+//! `schema=` argument when given, otherwise from the hot table (one PRAGMA
+//! against the same database — the authoritative schema, so nothing is
+//! restated or drifts). Both routes feed
+//! `silodb_schema::bucket_arrow_schema`, the same mapping compaction
+//! writes files with. Connect works identically whether the base directory
+//! has a thousand files, none, or doesn't exist yet.
 //!
 //! Pruning happens in two layers at `xFilter` time:
 //! 1. **File level**: an indexed range query against `_silodb_catalog`
@@ -196,17 +201,19 @@ struct TabArgs {
     logical_table: Option<String>,
     ts_column: String,
     hot_table: Option<String>,
+    schema: Option<String>,
 }
 
 /// First argument: the base directory shared by every cold table (quoted).
 /// Optional `key=value` arguments: `table=<logical table>` (default: the
-/// virtual table's own name), `ts_column=<name>` (default: `ts`), and
-/// `hot_table=<name>` (default: the logical table name; only consulted
-/// when the catalog has no files yet).
+/// virtual table's own name), `ts_column=<name>` (default: `ts`),
+/// `schema='name TYPE, ...'` (explicit column list; default: borrow the
+/// hot table's), and `hot_table=<name>` (which table to borrow from;
+/// default: the logical table name).
 fn parse_args(args: &[&[u8]]) -> Result<TabArgs> {
     let [dir_arg, rest @ ..] = args else {
         return Err(module_err(
-            "expected a base directory argument: USING silodb('buckets/')",
+            "expected a base directory argument: USING silodb('cold/')",
         ));
     };
     let dir_str = parse_str_arg(dir_arg)?;
@@ -217,6 +224,7 @@ fn parse_args(args: &[&[u8]]) -> Result<TabArgs> {
     let mut logical_table = None;
     let mut ts_column = None;
     let mut hot_table = None;
+    let mut schema = None;
     for arg in rest {
         let s = parse_str_arg(arg)?;
         let (key, value) = s
@@ -227,6 +235,7 @@ fn parse_args(args: &[&[u8]]) -> Result<TabArgs> {
             "table" => logical_table = Some(value.to_owned()),
             "ts_column" => ts_column = Some(value.to_owned()),
             "hot_table" => hot_table = Some(value.to_owned()),
+            "schema" => schema = Some(value.to_owned()),
             other => return Err(module_err(format!("unrecognized parameter '{other}'"))),
         }
     }
@@ -236,12 +245,57 @@ fn parse_args(args: &[&[u8]]) -> Result<TabArgs> {
         logical_table,
         ts_column: ts_column.unwrap_or_else(|| DEFAULT_TS_COLUMN.to_owned()),
         hot_table,
+        schema,
     })
 }
 
-/// Declared schema when the catalog has no files yet: derive it from the
-/// hot table exactly the way `compact_bucket` will when it writes the
-/// first file, so the vtab's columns can't drift from future cold files.
+/// Parse a `schema='name TYPE, ...'` argument into the shared bucket
+/// schema. The declared types go through the same [`SqliteType::from_decl`]
+/// affinity rules the hot-table route uses.
+fn schema_from_arg(arg: &str, ts_column: &str) -> Result<SchemaRef> {
+    let cols = arg
+        .split(',')
+        .map(|part| {
+            let part = part.trim();
+            let (name, decl) = part
+                .split_once(char::is_whitespace)
+                .unwrap_or((part, ""));
+            let name = name.trim_matches('"').trim_matches('`');
+            if name.is_empty() {
+                return Err(module_err(format!("bad schema column '{part}'")));
+            }
+            let ty = silodb_schema::SqliteType::from_decl(decl.trim()).ok_or_else(|| {
+                module_err(format!(
+                    "schema column '{name}' has unsupported declared type '{}'",
+                    decl.trim()
+                ))
+            })?;
+            Ok((name.to_owned(), ty))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let ts_idx = ts_index(&cols, ts_column, "schema argument")?;
+    Ok(std::sync::Arc::new(silodb_schema::bucket_arrow_schema(
+        &cols, ts_idx,
+    )))
+}
+
+fn ts_index(
+    cols: &[(String, silodb_schema::SqliteType)],
+    ts_column: &str,
+    source: &str,
+) -> Result<usize> {
+    cols.iter()
+        .position(|(name, ty)| name == ts_column && *ty == silodb_schema::SqliteType::Integer)
+        .ok_or_else(|| {
+            module_err(format!(
+                "{source} has no INTEGER column '{ts_column}' to use as the timestamp"
+            ))
+        })
+}
+
+/// Declared schema borrowed from the hot table — the authoritative source,
+/// mapped exactly the way `compact_bucket` maps it when writing files, so
+/// the vtab's columns can't drift from the cold files.
 fn schema_from_hot_table(
     hot: &Connection,
     hot_table: &str,
@@ -291,15 +345,7 @@ fn schema_from_hot_table(
             Ok((name, ty))
         })
         .collect::<Result<Vec<_>>>()?;
-    let ts_idx = mapped
-        .iter()
-        .position(|(name, ty)| name == ts_column && *ty == silodb_schema::SqliteType::Integer)
-        .ok_or_else(|| {
-            module_err(format!(
-                "hot table '{hot_table}' has no INTEGER column '{ts_column}' \
-                 to use as the timestamp"
-            ))
-        })?;
+    let ts_idx = ts_index(&mapped, ts_column, &format!("hot table '{hot_table}'"))?;
     Ok(Some(std::sync::Arc::new(
         silodb_schema::bucket_arrow_schema(&mapped, ts_idx),
     )))
@@ -318,12 +364,9 @@ unsafe impl<'vtab> VTab<'vtab> for SiloTab {
         args: &[&[u8]],
     ) -> Result<(Cow<'static, CStr>, Self)> {
         let parsed = parse_args(args)?;
-        if !parsed.base_dir.is_dir() {
-            return Err(module_err(format!(
-                "'{}' is not a directory",
-                parsed.base_dir.display()
-            )));
-        }
+        // No existence check on base_dir: nothing on disk is required (or
+        // even consulted) to connect. Compaction creates <dir>/<table>
+        // lazily on its first run for a table.
         let logical_table = match parsed.logical_table {
             Some(t) => t,
             None => std::str::from_utf8(table_name)
@@ -332,39 +375,24 @@ unsafe impl<'vtab> VTab<'vtab> for SiloTab {
         };
 
         let handle = unsafe { db.handle() };
-        let hot = unsafe { Connection::from_handle(handle) }?;
 
-        // Schema source, in order: the first committed cold file; else the
-        // hot table (so day zero — before any compaction, even before the
-        // catalog exists — just works and scans come back empty).
-        let first_file = if silodb_catalog::catalog_exists(&hot)? {
-            silodb_catalog::entries_for_table(&hot, &logical_table)?
-                .into_iter()
-                .next()
-        } else {
-            None
-        };
-        let schema = match first_file {
-            Some(first) => {
-                let file = File::open(&first.path)
-                    .map_err(|e| module_err(format!("cannot open '{}': {e}", first.path)))?;
-                ArrowReaderMetadata::load(&file, Default::default())
-                    .map_err(module_err)?
-                    .schema()
-                    .clone()
-            }
+        // Column declaration — zero file I/O, by design (specv3). Either an
+        // explicit schema= argument, or one PRAGMA against the hot table in
+        // this same database (the authoritative schema, nothing restated).
+        let schema = match &parsed.schema {
+            Some(arg) => schema_from_arg(arg, &parsed.ts_column)?,
             None => {
+                let hot = unsafe { Connection::from_handle(handle) }?;
                 let hot_table = parsed.hot_table.as_deref().unwrap_or(&logical_table);
                 schema_from_hot_table(&hot, hot_table, &parsed.ts_column)?.ok_or_else(|| {
                     module_err(format!(
-                        "no schema source for '{logical_table}': the catalog has no \
-                         files for it and there is no hot table named '{hot_table}' \
-                         (pass hot_table=<name> or compact a first bucket)"
+                        "no schema source for '{logical_table}': there is no real \
+                         table named '{hot_table}' to borrow columns from — pass \
+                         hot_table=<name> or an explicit schema='col TYPE, ...'"
                     ))
                 })?
             }
         };
-        drop(hot);
 
         let ts_col = schema.index_of(&parsed.ts_column).ok();
         let sql = silodb_schema::create_table_sql(&schema).map_err(module_err)?;
@@ -688,11 +716,32 @@ unsafe impl VTabCursor for SiloCursor<'_> {
             let (meta, cache_hit) = vtab.file_meta(&path)?;
             stats.metadata_cache_hits += usize::from(cache_hit);
 
-            if meta.schema() != &vtab.schema {
+            // Column names and order must line up with the declaration —
+            // xColumn maps by position. Arrow types may differ (hand-built
+            // files, older bucket layouts): cell conversion is driven by
+            // each file's own types, so that's fine.
+            let file_fields = meta.schema().fields();
+            let decl_fields = vtab.schema.fields();
+            if file_fields.len() != decl_fields.len()
+                || file_fields
+                    .iter()
+                    .zip(decl_fields.iter())
+                    .any(|(f, d)| f.name() != d.name())
+            {
                 return Err(module_err(format!(
-                    "'{}' has a different schema than this table declared \
-                     (expected the schema of the table's first file)",
-                    entry.path
+                    "'{}' has different columns than this table declares \
+                     (file: [{}], declared: [{}])",
+                    entry.path,
+                    file_fields
+                        .iter()
+                        .map(|f| f.name().as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    decl_fields
+                        .iter()
+                        .map(|f| f.name().as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
                 )));
             }
 

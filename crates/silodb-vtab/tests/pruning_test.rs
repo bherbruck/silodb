@@ -16,7 +16,7 @@ fn env_with_fixture() -> ColdEnv {
     let dest = env.table_dir.join("bucket-1000.parquet");
     std::fs::copy(fixture_basic(), &dest).unwrap();
     env.register(&dest, 1000, 10_001, 10);
-    env.create_vtab();
+    env.create_vtab(common::ColdEnv::FIXTURE_SCHEMA);
     env
 }
 
