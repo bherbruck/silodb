@@ -62,6 +62,28 @@ full-year scan opened everything (3,285 row groups).
   At 100 rows/minute of real device load, both are ~5 orders of magnitude
   above requirement.
 
+## Tiered maintenance (1d → 7d → 28d)
+
+Same year, after `maintain()` promotes everything due: **365 files → 14
+active files** (13×28d + stragglers), 65 merges rewriting the full 52.56M
+rows in 31.5 s, 416 files GC'd, size unchanged, view contents identical.
+
+| query, median ms | silodb 365 files | silodb 14 files | duckdb 365 | duckdb 14 |
+|---|---|---|---|---|
+| 1h, one series | 1.3 | 1.3 | 316 | **175** |
+| full year agg | 9,079* | 9,926* | 410 | **217** |
+
+*this run was on a loaded machine (plain SQLite's identical query also ran
+1.8× slower than the previous session) — compare within a run, not across.
+
+Honest read: tiering does **not** speed up silodb's own queries — the
+footer cache already made 365 files cheap, and per-row vtab costs
+dominate. What it buys: (a) bounded file count forever (~130/decade
+instead of 3,650), (b) ~2× for ad-hoc DuckDB/external readers of the same
+directory (fewer footers to parse), (c) narrow queries stay at 1.3 ms even
+though file-level pruning got coarser — row-group pruning inside the 28d
+files picks up the slack, which validates the two-layer design.
+
 ## History
 
 The first full-scale run (2M-row variant) exposed a real bug: compaction
