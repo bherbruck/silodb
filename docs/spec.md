@@ -124,8 +124,9 @@ CREATE INDEX idx_silodb_catalog_range
   query treats `range_end == lo` as a provable non-match.
 - Multiple rows may cover the same/overlapping range (late-arrival
   follow-up files); readers handle that natively.
-- Readers only see `status = 'active'` — the column is reserved for a
-  future merge/supersede flow (see Open questions).
+- Readers only see `status = 'active'`. `superseded` marks merge children
+  awaiting GC (see Tiered maintenance); a superseded row's file may be
+  gone or even name-shadowed — only active rows are ever checked or read.
 
 ## Read path (`silodb-vtab`)
 
@@ -181,8 +182,10 @@ batches (16k rows; memory bounded by one row group) → fsync file → atomic
 rename → fsync dir → **one transaction**: DELETE hot rows + INSERT catalog
 row.
 
-`seq` = count of committed files for that exact bucket. That makes every
-calling pattern idempotent with no caller-visible failure modes:
+`seq` = count of catalog rows (any status) for that exact range — counting
+only active rows would reuse a superseded file's name and let GC delete a
+live file. That makes every calling pattern idempotent with no
+caller-visible failure modes:
 
 | situation | outcome |
 |---|---|
@@ -204,9 +207,46 @@ test that runs 100 accumulating buckets and asserts per-run rows and
 SQLite change-counts stay exactly flat.
 
 Trigger policy (when to call) is the embedding application's contract, not
-the library's: scheduled (interval or hot-size threshold, whichever first)
-over closed buckets minus a 1–2h safety margin, plus a manual path calling
-the very same function. Bucket granularity is an open question (below).
+the library's — but with tiers (next section) it collapses to "call
+`maintain()` on a dumb timer and at boot".
+
+## Tiered maintenance (`maintain`)
+
+One year of hourly/daily buckets is hundreds of files; tiers keep the file
+count bounded without ever rewriting history in place.
+
+```rust
+silodb::init_table_tiered(&conn, "readings", schema, "cold/", "1d,7d,28d")?;
+silodb::maintain(&conn, "readings", "cold/", now_us)?;  // timer + boot
+```
+
+- **Policy** persists in `_silodb_policy` (tier windows + 2h safety
+  margin), written at init, read by `maintain`. Tiers must be ascending
+  and each an exact multiple of the previous — windows are epoch-aligned,
+  and a `7d` file would straddle `30d` boundaries forever (use `28d`);
+  violations are rejected at init.
+- **`maintain` is a convergence function, not a command.** From (policy,
+  catalog, hot table, `now_us`) it derives everything due: compacts every
+  closed tier-0 bucket out of hot; for each higher tier, merges all active
+  files lying fully inside any window that is fully behind `now − margin`
+  (`merge_window`: streaming child concatenation, memory bounded by one
+  batch, fsync/rename, then **one transaction** inserting the merged row
+  and flipping children to `status='superseded'`); then GCs superseded
+  files (unlink + row delete). Returns a report of actions; an empty
+  report costs a few indexed queries — call it as often as you like.
+- **No levels to choose, no force flags** — a manual trigger is the same
+  call, and `now_us` is the only knob (tests pass fake clocks). Late rows
+  self-heal at any tier: the straggler compacts into a small file, the
+  now-mixed window re-merges (children include the previous window-sized
+  file), converging back to one file per window.
+- **Crash idempotency is inherited**, not re-invented: a merged file with
+  no catalog row is invisible; a re-run recomputes the same children and
+  seq and rewrites it byte-identically before committing.
+- `merge_window` is the one write-path operation that reads Parquet — its
+  own children only, never the hot table. `compact_bucket`'s
+  never-reads-Parquet invariant is per-function and unchanged.
+- Contract: **one maintainer process at a time** (same as the compaction
+  scheduling contract it subsumes).
 
 ## Type & timestamp mapping (`silodb-schema`)
 
@@ -285,12 +325,15 @@ Single source of truth for both directions; never depends on `rusqlite`.
   process writing cold files directly, bypassing the hot tier. The
   architecture already has its socket — the contract would be: write a new
   file durably (tmp/fsync/rename), then insert one catalog row; the read
-  side picks it up on the next query with zero changes. Parquet physics
-  forces roll-a-file-per-threshold rather than true file append, which in
-  turn implies a small-file **merge/supersede** job someday — write merged
-  file, flip old rows to `status='superseded'` + insert new row in one
-  transaction. `status` exists for this. None of it is designed further
-  than this paragraph on purpose.
+  side picks it up on the next query with zero changes, and tiered
+  maintenance would merge its small files like anything else. Not designed
+  further than this paragraph on purpose.
+- **Writable vtab / shadow tables (next planned rework).** Make
+  `CREATE VIRTUAL TABLE readings USING silodb('cold/', schema=..., tiers=...)`
+  the *entire* definition — FTS5-style shadow table for the hot tier,
+  `xUpdate` for inserts, the hot∪cold union inside the cursor — subsuming
+  `init_table`, the view, and the trigger. Sequenced after tiered
+  compaction proved out.
 - **Retention/eviction** of old cold files after cloud sync — embedding
   app's job, needs a documented contract eventually (likely
   `status='evicted'` + file delete).
