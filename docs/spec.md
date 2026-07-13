@@ -265,6 +265,16 @@ Single source of truth for both directions; never depends on `rusqlite`.
 - No realistic domain-shaped data in crate suites — synthetic stresses
   edges better and doesn't bake in today's schema. Real field data belongs
   in a later end-to-end smoke test only.
+- **Hardening layer** beyond the acceptance tests: hostile-file robustness
+  (corrupt/truncated/garbage parquet behind catalog rows must error, never
+  panic across the FFI boundary); a whole-pipeline property (random rows,
+  all types + NULLs, random bucket splits → view ≡ inserted data); parser
+  properties (ts parse/format round-trips any i64, never panics on
+  arbitrary strings); a WAL two-connection test (reader's view count is
+  monotone and never double-counted while the writer compacts); and three
+  libFuzzer targets under `fuzz/` (see `fuzz/README.md`, including the
+  documented upstream arrow-rs OOM-on-hostile-footer limitation and why
+  it's accepted).
 
 ## Open questions (flag back, don't silently decide)
 

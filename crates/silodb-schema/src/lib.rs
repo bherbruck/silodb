@@ -342,11 +342,24 @@ pub fn parse_timestamp_micros(s: &str) -> Option<i64> {
         None => (s, None),
     };
 
+    // A leading '-' is a negative (BCE) year, not a field separator —
+    // format_timestamp_micros emits them for very negative µs values.
+    let (neg_year, date) = match date.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, date),
+    };
     let mut dp = date.split('-');
     let y: i64 = dp.next()?.parse().ok()?;
+    let y = if neg_year { -y } else { y };
     let mo: u32 = dp.next()?.parse().ok()?;
     let d: u32 = dp.next()?.parse().ok()?;
-    if dp.next().is_some() || !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
+    // i64 microseconds spans roughly ±292,000 years around 1970; anything
+    // beyond can't be represented (and would overflow the math below).
+    if dp.next().is_some()
+        || !(-300_000..=300_000).contains(&y)
+        || !(1..=12).contains(&mo)
+        || !(1..=31).contains(&d)
+    {
         return None;
     }
     // Reject day numbers the month doesn't have (round-trip check).
@@ -383,7 +396,50 @@ pub fn parse_timestamp_micros(s: &str) -> Option<i64> {
             us += sub;
         }
     }
-    Some(days * 86_400 * MICROS_PER_SEC + us)
+    // Checked: valid-looking dates near the ±292,000-year edges can still
+    // land just outside i64 microseconds.
+    days.checked_mul(86_400 * MICROS_PER_SEC)?.checked_add(us)
+}
+
+#[cfg(test)]
+mod prop_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 2048, ..ProptestConfig::default() })]
+
+        /// Any i64 formats and parses back exactly.
+        #[test]
+        fn format_parse_round_trips_any_micros(us in any::<i64>()) {
+            let text = format_timestamp_micros(us);
+            prop_assert_eq!(parse_timestamp_micros(&text), Some(us), "{}", text);
+        }
+
+        /// Arbitrary strings never panic the parser (and Some(_) implies
+        /// re-formatting also doesn't panic).
+        #[test]
+        fn parser_never_panics(s in "\\PC*") {
+            if let Some(us) = parse_timestamp_micros(&s) {
+                let _ = format_timestamp_micros(us);
+            }
+        }
+
+        /// ASCII-ish date-shaped garbage specifically (denser than \\PC*).
+        #[test]
+        fn parser_never_panics_on_date_shaped_input(
+            s in "[0-9TZ:. +-]{0,40}",
+        ) {
+            let _ = parse_timestamp_micros(&s);
+        }
+
+        /// from_decl / ColumnDecl::parse never panic on arbitrary decls.
+        #[test]
+        fn decl_parsing_never_panics(name in "\\PC{0,16}", decl in "\\PC{0,24}") {
+            let _ = SqliteType::from_decl(&decl);
+            let _ = ColumnDecl::parse(&name, &decl);
+        }
+    }
 }
 
 #[cfg(test)]

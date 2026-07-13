@@ -1137,6 +1137,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "parquet",
+ "proptest",
  "rusqlite",
  "silodb-catalog",
  "silodb-compact",
@@ -1181,6 +1182,7 @@ name = "silodb-schema"
 version = "0.1.0"
 dependencies = [
  "arrow-schema",
+ "proptest",
 ]
 
 [[package]]

@@ -1,0 +1,41 @@
+[package]
+name = "silodb-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Not a workspace member (root Cargo.toml excludes fuzz/): fuzz builds use
+# nightly + sanitizer flags that shouldn't infect the main workspace.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bytes = "1"
+parquet = "59.1.0"
+rusqlite = { version = "0.40.1", features = ["bundled", "functions", "vtab"] }
+silodb-schema = { path = "../crates/silodb-schema" }
+silodb = { path = "../crates/silodb" }
+
+[[bin]]
+name = "ts_parse"
+path = "fuzz_targets/ts_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parquet_footer"
+path = "fuzz_targets/parquet_footer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vtab_ddl"
+path = "fuzz_targets/vtab_ddl.rs"
+test = false
+doc = false
+bench = false

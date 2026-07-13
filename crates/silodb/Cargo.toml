@@ -13,6 +13,7 @@ silodb-vtab = { version = "0.1.0", path = "../silodb-vtab" }
 [dev-dependencies]
 arrow = "59.1.0"
 parquet = "59.1.0"
+proptest = "1.11.0"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 silodb-schema = { path = "../silodb-schema" }
 tempfile = "3.27.0"
