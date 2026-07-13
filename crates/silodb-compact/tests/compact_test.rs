@@ -36,7 +36,7 @@ fn spec(start: i64, end: i64) -> BucketSpec<'static> {
     BucketSpec {
         hot_table: "readings",
         logical_table: "readings",
-        ts_column: "ts",
+        ts_column: None,
         bucket_start: start,
         bucket_end: end,
     }
@@ -314,7 +314,7 @@ fn unsupported_declared_type_is_rejected() {
         &BucketSpec {
             hot_table: "weird",
             logical_table: "weird",
-            ts_column: "ts",
+            ts_column: None,
             bucket_start: 0,
             bucket_end: 2000,
         },
@@ -332,7 +332,7 @@ fn bad_timestamp_column_is_rejected() {
     let err = compact_bucket(
         &conn,
         &BucketSpec {
-            ts_column: "name", // TEXT column
+            ts_column: Some("name"), // TEXT column
             ..spec(1000, 2000)
         },
         dir.path(),

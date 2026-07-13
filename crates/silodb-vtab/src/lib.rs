@@ -70,7 +70,6 @@ use rusqlite::vtab::{
 use rusqlite::{Connection, Error, OptionalExtension, Result};
 
 const MODULE_NAME: &CStr = c"silodb";
-const DEFAULT_TS_COLUMN: &str = "ts";
 
 /// Register the `silodb` module on a connection.
 pub fn load_module(conn: &Connection) -> Result<()> {
@@ -199,14 +198,17 @@ fn parse_str_arg(arg: &[u8]) -> Result<String> {
 struct TabArgs {
     base_dir: PathBuf,
     logical_table: Option<String>,
-    ts_column: String,
+    /// Explicit bucket-axis override. `None` → type-driven discovery
+    /// (`silodb_schema::resolve_ts_index` precedence).
+    ts_column: Option<String>,
     hot_table: Option<String>,
     schema: Option<String>,
 }
 
 /// First argument: the base directory shared by every cold table (quoted).
 /// Optional `key=value` arguments: `table=<logical table>` (default: the
-/// virtual table's own name), `ts_column=<name>` (default: `ts`),
+/// virtual table's own name), `ts_column=<name>` (default: discover by
+/// TIMESTAMP/DATETIME declared type, else an INTEGER `ts`),
 /// `schema='name TYPE, ...'` (explicit column list; default: borrow the
 /// hot table's), and `hot_table=<name>` (which table to borrow from;
 /// default: the logical table name).
@@ -243,16 +245,18 @@ fn parse_args(args: &[&[u8]]) -> Result<TabArgs> {
     Ok(TabArgs {
         base_dir: PathBuf::from(dir_str),
         logical_table,
-        ts_column: ts_column.unwrap_or_else(|| DEFAULT_TS_COLUMN.to_owned()),
+        ts_column,
         hot_table,
         schema,
     })
 }
 
 /// Parse a `schema='name TYPE, ...'` argument into the shared bucket
-/// schema. The declared types go through the same [`SqliteType::from_decl`]
-/// affinity rules the hot-table route uses.
-fn schema_from_arg(arg: &str, ts_column: &str) -> Result<SchemaRef> {
+/// schema plus the resolved bucket-axis index. Declared types go through
+/// the same `silodb-schema` affinity rules the hot-table route uses;
+/// TIMESTAMP/DATETIME columns are discovered by type when `ts_column=`
+/// isn't given.
+fn schema_from_arg(arg: &str, ts_column: Option<&str>) -> Result<(SchemaRef, usize)> {
     let cols = arg
         .split(',')
         .map(|part| {
@@ -264,33 +268,20 @@ fn schema_from_arg(arg: &str, ts_column: &str) -> Result<SchemaRef> {
             if name.is_empty() {
                 return Err(module_err(format!("bad schema column '{part}'")));
             }
-            let ty = silodb_schema::SqliteType::from_decl(decl.trim()).ok_or_else(|| {
+            silodb_schema::ColumnDecl::parse(name, decl.trim()).ok_or_else(|| {
                 module_err(format!(
                     "schema column '{name}' has unsupported declared type '{}'",
                     decl.trim()
                 ))
-            })?;
-            Ok((name.to_owned(), ty))
+            })
         })
         .collect::<Result<Vec<_>>>()?;
-    let ts_idx = ts_index(&cols, ts_column, "schema argument")?;
-    Ok(std::sync::Arc::new(silodb_schema::bucket_arrow_schema(
-        &cols, ts_idx,
-    )))
-}
-
-fn ts_index(
-    cols: &[(String, silodb_schema::SqliteType)],
-    ts_column: &str,
-    source: &str,
-) -> Result<usize> {
-    cols.iter()
-        .position(|(name, ty)| name == ts_column && *ty == silodb_schema::SqliteType::Integer)
-        .ok_or_else(|| {
-            module_err(format!(
-                "{source} has no INTEGER column '{ts_column}' to use as the timestamp"
-            ))
-        })
+    let ts_idx = silodb_schema::resolve_ts_index(&cols, ts_column)
+        .map_err(|e| module_err(format!("schema argument: {e}")))?;
+    Ok((
+        std::sync::Arc::new(silodb_schema::bucket_arrow_schema(&cols, ts_idx)),
+        ts_idx,
+    ))
 }
 
 /// Declared schema borrowed from the hot table — the authoritative source,
@@ -299,8 +290,8 @@ fn ts_index(
 fn schema_from_hot_table(
     hot: &Connection,
     hot_table: &str,
-    ts_column: &str,
-) -> Result<Option<SchemaRef>> {
+    ts_column: Option<&str>,
+) -> Result<Option<(SchemaRef, usize)>> {
     // Only a real (non-virtual) table can be a schema source. This also
     // protects against recursion: with no table= argument the default
     // logical/hot table name is the vtab's own name, and running PRAGMA
@@ -336,18 +327,19 @@ fn schema_from_hot_table(
     let mapped = cols
         .into_iter()
         .map(|(name, decl)| {
-            let ty = silodb_schema::SqliteType::from_decl(&decl).ok_or_else(|| {
+            silodb_schema::ColumnDecl::parse(&name, &decl).ok_or_else(|| {
                 module_err(format!(
                     "hot table '{hot_table}' column '{name}' has unsupported \
                      declared type '{decl}'"
                 ))
-            })?;
-            Ok((name, ty))
+            })
         })
         .collect::<Result<Vec<_>>>()?;
-    let ts_idx = ts_index(&mapped, ts_column, &format!("hot table '{hot_table}'"))?;
-    Ok(Some(std::sync::Arc::new(
-        silodb_schema::bucket_arrow_schema(&mapped, ts_idx),
+    let ts_idx = silodb_schema::resolve_ts_index(&mapped, ts_column)
+        .map_err(|e| module_err(format!("hot table '{hot_table}': {e}")))?;
+    Ok(Some((
+        std::sync::Arc::new(silodb_schema::bucket_arrow_schema(&mapped, ts_idx)),
+        ts_idx,
     )))
 }
 
@@ -379,12 +371,13 @@ unsafe impl<'vtab> VTab<'vtab> for SiloTab {
         // Column declaration — zero file I/O, by design (see docs/spec.md). Either an
         // explicit schema= argument, or one PRAGMA against the hot table in
         // this same database (the authoritative schema, nothing restated).
-        let schema = match &parsed.schema {
-            Some(arg) => schema_from_arg(arg, &parsed.ts_column)?,
+        let ts_arg = parsed.ts_column.as_deref();
+        let (schema, ts_idx) = match &parsed.schema {
+            Some(arg) => schema_from_arg(arg, ts_arg)?,
             None => {
                 let hot = unsafe { Connection::from_handle(handle) }?;
                 let hot_table = parsed.hot_table.as_deref().unwrap_or(&logical_table);
-                schema_from_hot_table(&hot, hot_table, &parsed.ts_column)?.ok_or_else(|| {
+                schema_from_hot_table(&hot, hot_table, ts_arg)?.ok_or_else(|| {
                     module_err(format!(
                         "no schema source for '{logical_table}': there is no real \
                          table named '{hot_table}' to borrow columns from — pass \
@@ -393,8 +386,7 @@ unsafe impl<'vtab> VTab<'vtab> for SiloTab {
                 })?
             }
         };
-
-        let ts_col = schema.index_of(&parsed.ts_column).ok();
+        let ts_col = Some(ts_idx);
         let sql = silodb_schema::create_table_sql(&schema).map_err(module_err)?;
         // No VTabConfig trust flag on purpose. DirectOnly would forbid the
         // intended `hot UNION ALL cold` view pattern; Innocuous would

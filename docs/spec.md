@@ -214,14 +214,32 @@ Single source of truth for both directions; never depends on `rusqlite`.
   types are rejected explicitly (don't fit / out of scope).
 - Write (declared type → Arrow): SQLite affinity rules minus NUMERIC
   (refuse rather than guess); INTEGER→Int64, REAL→Float64, TEXT→Utf8,
-  BLOB→Binary.
-- **Timestamps: hot table stores epoch microseconds as INTEGER; Parquet
-  stores `TIMESTAMP(µs, UTC)` — a real logical type, so pandas/DuckDB/any
-  parquet viewer renders actual datetimes and the cold files are directly
-  exportable with no decoding step.** Through the vtab the value surfaces
-  as the same raw INTEGER µs as the hot table, so SQL comparisons work
-  identically across tiers. µs is deliberate: ns overflows i64 in 2262 and
-  buys nothing here.
+  BLOB→Binary. **One narrow, named exception to the NUMERIC refusal:**
+  declared types containing `TIMESTAMP` or `DATETIME` (which SQLite's own
+  affinity algorithm files under NUMERIC) map to INTEGER and carry the
+  timestamp marker. Nothing is guessed — two literal substrings get a
+  deliberate rule; every other NUMERIC-affinity decl stays refused.
+- **The TIMESTAMP declared type is the timestamp mechanism.** Declare
+  `stamped_at TIMESTAMP` in a hot table / `init_table` schema string and:
+  SQLite stores plain INTEGER epoch µs (NUMERIC affinity, zero overhead);
+  compaction writes it as Parquet `TIMESTAMP(µs, UTC)` — a real logical
+  type, so pandas/DuckDB/any viewer renders actual datetimes and cold
+  files are directly exportable with no decoding step; and the bucket axis
+  is discovered by type, not name. Secondary TIMESTAMP columns (metadata
+  stamps that aren't the bucket axis) also export as real Parquet
+  timestamps, nullable.
+- **Bucket-axis resolution is a total precedence order**
+  (`silodb_schema::resolve_ts_index`): (1) an explicit `ts_column=` always
+  wins — type discovery never runs when it's given; (2) else exactly one
+  TIMESTAMP/DATETIME column (zero or several → loud error, not a guess);
+  (3) else the legacy name convention, an INTEGER column named `ts`.
+- Through the vtab the value surfaces as the same raw INTEGER µs as the
+  hot table, so SQL comparisons work identically across tiers. µs is
+  deliberate: ns overflows i64 in 2262 and buys nothing here.
+- **SQL helpers** (registered by the facade's `load_module`, pure logic in
+  `silodb-schema`): `silodb_ts(x)` parses ISO 8601 text to epoch µs
+  (INTEGER passes through, so `WHERE ts > silodb_ts(?1)` takes either);
+  `silodb_datetime(µs)` formats back to ISO 8601 UTC text.
 
 ## Testing strategy
 

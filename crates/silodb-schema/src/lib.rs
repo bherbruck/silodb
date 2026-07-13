@@ -32,9 +32,18 @@ impl SqliteType {
     /// rules (https://sqlite.org/datatype3.html#determination_of_column_affinity),
     /// minus NUMERIC: a declared type we'd have to guess a storage class for
     /// returns `None` and the caller should refuse, not guess.
+    ///
+    /// One narrow, named exception to the NUMERIC refusal: declared types
+    /// containing `TIMESTAMP` or `DATETIME` (which SQLite's own algorithm
+    /// files under NUMERIC) map to INTEGER. Nothing is guessed — those two
+    /// substrings get a deliberate rule (epoch-microseconds columns, see
+    /// [`is_timestamp_decl`]); every other NUMERIC-affinity decl stays
+    /// refused exactly as before.
     pub fn from_decl(decl: &str) -> Option<Self> {
         let d = decl.to_ascii_uppercase();
-        if d.contains("INT") {
+        // is_timestamp_decl first: it's the NUMERIC carve-out and must not
+        // be shadowed by any later bucket.
+        if is_timestamp_decl(decl) || d.contains("INT") {
             Some(SqliteType::Integer)
         } else if d.contains("CHAR") || d.contains("CLOB") || d.contains("TEXT") {
             Some(SqliteType::Text)
@@ -45,6 +54,101 @@ impl SqliteType {
         } else {
             None
         }
+    }
+}
+
+/// True if a declared column type marks a silodb timestamp (epoch
+/// microseconds stored as INTEGER, surfaced as a real Parquet
+/// TIMESTAMP(µs, UTC)). Case-insensitive substring match, the same
+/// convention SQLite's affinity scanner uses for INT/CHAR/REAL.
+pub fn is_timestamp_decl(decl: &str) -> bool {
+    let d = decl.to_ascii_uppercase();
+    d.contains("TIMESTAMP") || d.contains("DATETIME")
+}
+
+/// One parsed hot-table / schema-argument column.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnDecl {
+    pub name: String,
+    pub ty: SqliteType,
+    /// Declared as TIMESTAMP/DATETIME — written to Parquet as a real
+    /// timestamp even when it isn't the bucket axis.
+    pub declared_timestamp: bool,
+}
+
+impl ColumnDecl {
+    /// Parse one `(name, declared type)` pair; `None` = unsupported decl.
+    pub fn parse(name: &str, decl: &str) -> Option<Self> {
+        Some(ColumnDecl {
+            name: name.to_owned(),
+            ty: SqliteType::from_decl(decl)?,
+            declared_timestamp: is_timestamp_decl(decl),
+        })
+    }
+}
+
+/// Why [`resolve_ts_index`] couldn't pick a timestamp column.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TsResolveError {
+    /// The explicit `ts_column=` name is missing or not INTEGER-class.
+    ExplicitNotUsable(String),
+    /// More than one TIMESTAMP/DATETIME column and no explicit choice —
+    /// refusing to guess which is the bucket axis.
+    MultipleTimestamps(Vec<String>),
+    /// No TIMESTAMP/DATETIME column and no INTEGER column named `ts`.
+    NoneFound,
+}
+
+impl std::fmt::Display for TsResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ExplicitNotUsable(name) => {
+                write!(f, "ts column '{name}' is missing or not INTEGER-class")
+            }
+            Self::MultipleTimestamps(names) => write!(
+                f,
+                "multiple TIMESTAMP/DATETIME columns ({}); pass ts_column= to pick the bucket axis",
+                names.join(", ")
+            ),
+            Self::NoneFound => write!(
+                f,
+                "no TIMESTAMP/DATETIME column and no INTEGER column named 'ts'"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TsResolveError {}
+
+/// Which column is the bucket/timestamp axis. Total precedence order:
+///
+/// 1. An explicit name (`ts_column=`) always wins — type-driven discovery
+///    never runs when it's given.
+/// 2. Otherwise exactly one TIMESTAMP/DATETIME-declared column; zero or
+///    several is not guessed at.
+/// 3. Otherwise the legacy name convention: an INTEGER column named `ts`.
+pub fn resolve_ts_index(
+    cols: &[ColumnDecl],
+    explicit: Option<&str>,
+) -> Result<usize, TsResolveError> {
+    if let Some(name) = explicit {
+        return cols
+            .iter()
+            .position(|c| c.name == name && c.ty == SqliteType::Integer)
+            .ok_or_else(|| TsResolveError::ExplicitNotUsable(name.to_owned()));
+    }
+    let stamped: Vec<usize> = (0..cols.len())
+        .filter(|&i| cols[i].declared_timestamp)
+        .collect();
+    match stamped.as_slice() {
+        [one] => Ok(*one),
+        [] => cols
+            .iter()
+            .position(|c| c.name == "ts" && c.ty == SqliteType::Integer)
+            .ok_or(TsResolveError::NoneFound),
+        many => Err(TsResolveError::MultipleTimestamps(
+            many.iter().map(|&i| cols[i].name.clone()).collect(),
+        )),
     }
 }
 
@@ -159,23 +263,127 @@ pub fn arrow_field(name: &str, dt: DataType) -> Field {
 /// declare columns when no file exists yet (empty catalog) — so the two
 /// can never drift.
 ///
-/// The timestamp column (`ts_idx`) becomes a non-nullable
-/// [`timestamp_arrow_type`] — bucket range predicates exclude NULLs — and
-/// every other column maps through [`arrow_type_for`], nullable.
-pub fn bucket_arrow_schema(columns: &[(String, SqliteType)], ts_idx: usize) -> Schema {
+/// The bucket axis (`ts_idx`) becomes a non-nullable
+/// [`timestamp_arrow_type`] — bucket range predicates exclude NULLs.
+/// Any *other* TIMESTAMP/DATETIME-declared column also becomes a real
+/// Parquet timestamp (nullable), so secondary datetime columns export as
+/// dates too. Everything else maps through [`arrow_type_for`], nullable.
+pub fn bucket_arrow_schema(columns: &[ColumnDecl], ts_idx: usize) -> Schema {
     Schema::new(
         columns
             .iter()
             .enumerate()
-            .map(|(i, (name, ty))| {
+            .map(|(i, col)| {
                 if i == ts_idx {
-                    Field::new(name, timestamp_arrow_type(), false)
+                    Field::new(&col.name, timestamp_arrow_type(), false)
+                } else if col.declared_timestamp {
+                    arrow_field(&col.name, timestamp_arrow_type())
                 } else {
-                    arrow_field(name, arrow_type_for(*ty))
+                    arrow_field(&col.name, arrow_type_for(col.ty))
                 }
             })
             .collect::<Vec<_>>(),
     )
+}
+
+// --- timestamp text ↔ epoch-microseconds, pure logic (no deps) ---------
+//
+// Backs the `silodb_ts()` / `silodb_datetime()` SQL helpers the facade
+// registers. Civil-date math is Howard Hinnant's days_from_civil /
+// civil_from_days; all times are UTC.
+
+const MICROS_PER_SEC: i64 = 1_000_000;
+
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let mp = (m as i64 + 9) % 12; // Mar=0..Feb=11
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146_097 + doe - 719_468
+}
+
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // [0, 399]
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    (if m <= 2 { yoe + era * 400 + 1 } else { yoe + era * 400 }, m, d)
+}
+
+/// Format epoch microseconds as ISO 8601 UTC:
+/// `YYYY-MM-DDTHH:MM:SSZ`, or `...SS.ffffffZ` when sub-second.
+pub fn format_timestamp_micros(us: i64) -> String {
+    let (secs, sub) = (us.div_euclid(MICROS_PER_SEC), us.rem_euclid(MICROS_PER_SEC));
+    let days = secs.div_euclid(86_400);
+    let tod = secs.rem_euclid(86_400);
+    let (y, mo, d) = civil_from_days(days);
+    let (h, mi, s) = (tod / 3600, (tod % 3600) / 60, tod % 60);
+    if sub == 0 {
+        format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
+    } else {
+        format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{sub:06}Z")
+    }
+}
+
+/// Parse an ISO-8601-ish UTC datetime to epoch microseconds. Accepted:
+/// `YYYY-MM-DD`, plus optional `[T or space]HH:MM[:SS[.fraction]]`, plus
+/// optional trailing `Z`. Naive inputs are taken as UTC. Fractions beyond
+/// microseconds truncate. Returns `None` on anything else — no guessing.
+pub fn parse_timestamp_micros(s: &str) -> Option<i64> {
+    let s = s.trim().strip_suffix('Z').unwrap_or_else(|| s.trim());
+    let (date, time) = match s.split_once(['T', ' ']) {
+        Some((d, t)) => (d, Some(t)),
+        None => (s, None),
+    };
+
+    let mut dp = date.split('-');
+    let y: i64 = dp.next()?.parse().ok()?;
+    let mo: u32 = dp.next()?.parse().ok()?;
+    let d: u32 = dp.next()?.parse().ok()?;
+    if dp.next().is_some() || !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
+        return None;
+    }
+    // Reject day numbers the month doesn't have (round-trip check).
+    let days = days_from_civil(y, mo, d);
+    if civil_from_days(days) != (y, mo, d) {
+        return None;
+    }
+
+    let mut us: i64 = 0;
+    if let Some(t) = time {
+        let (hms, frac) = match t.split_once('.') {
+            Some((hms, frac)) => (hms, Some(frac)),
+            None => (t, None),
+        };
+        let mut tp = hms.split(':');
+        let h: i64 = tp.next()?.parse().ok()?;
+        let mi: i64 = tp.next()?.parse().ok()?;
+        let sec: i64 = match tp.next() {
+            Some(x) => x.parse().ok()?,
+            None => 0,
+        };
+        if tp.next().is_some() || !(0..24).contains(&h) || !(0..60).contains(&mi) || !(0..60).contains(&sec)
+        {
+            return None;
+        }
+        us = (h * 3600 + mi * 60 + sec) * MICROS_PER_SEC;
+        if let Some(frac) = frac {
+            if frac.is_empty() || !frac.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let digits: String = frac.chars().take(6).collect();
+            let mut sub: i64 = digits.parse().ok()?;
+            sub *= 10_i64.pow(6 - digits.len() as u32);
+            us += sub;
+        }
+    }
+    Some(days * 86_400 * MICROS_PER_SEC + us)
 }
 
 #[cfg(test)]
@@ -263,6 +471,94 @@ mod tests {
         let schema = Schema::new(vec![arrow_field("u", DataType::UInt64)]);
         let err = create_table_sql(&schema).unwrap_err();
         assert_eq!(err.column, "u");
+    }
+
+    #[test]
+    fn timestamp_decls_are_a_narrow_numeric_exception() {
+        for decl in ["TIMESTAMP", "timestamp", "DATETIME", "SMALLDATETIME", "TIMESTAMPTZ"] {
+            assert!(is_timestamp_decl(decl), "{decl}");
+            assert_eq!(SqliteType::from_decl(decl), Some(SqliteType::Integer), "{decl}");
+        }
+        // Everything else in NUMERIC affinity stays refused.
+        for decl in ["NUMERIC", "DECIMAL(10,5)", "DATE", "BOOLEAN"] {
+            assert!(!is_timestamp_decl(decl), "{decl}");
+            assert_eq!(SqliteType::from_decl(decl), None, "{decl}");
+        }
+        assert!(!is_timestamp_decl("INTEGER"));
+    }
+
+    fn col(name: &str, decl: &str) -> ColumnDecl {
+        ColumnDecl::parse(name, decl).unwrap()
+    }
+
+    #[test]
+    fn ts_resolution_precedence_is_total() {
+        let two_stamps = [col("a", "TIMESTAMP"), col("b", "DATETIME"), col("ts", "INTEGER")];
+        // 1. explicit always wins, even over TIMESTAMP-typed columns.
+        assert_eq!(resolve_ts_index(&two_stamps, Some("ts")), Ok(2));
+        assert_eq!(resolve_ts_index(&two_stamps, Some("a")), Ok(0));
+        assert!(matches!(
+            resolve_ts_index(&two_stamps, Some("nope")),
+            Err(TsResolveError::ExplicitNotUsable(_))
+        ));
+        // 2. exactly one TIMESTAMP column → discovered by type, any name.
+        let one = [col("stamped_at", "TIMESTAMP"), col("value", "REAL")];
+        assert_eq!(resolve_ts_index(&one, None), Ok(0));
+        // ...but two without an explicit pick is refused, not guessed.
+        assert!(matches!(
+            resolve_ts_index(&two_stamps, None),
+            Err(TsResolveError::MultipleTimestamps(_))
+        ));
+        // 3. zero TIMESTAMP columns → legacy 'ts INTEGER' name convention.
+        let legacy = [col("ts", "INTEGER"), col("value", "REAL")];
+        assert_eq!(resolve_ts_index(&legacy, None), Ok(0));
+        assert!(matches!(
+            resolve_ts_index(&[col("value", "REAL")], None),
+            Err(TsResolveError::NoneFound)
+        ));
+    }
+
+    #[test]
+    fn secondary_timestamp_columns_export_as_parquet_timestamps() {
+        let cols = [
+            col("ts", "TIMESTAMP"),
+            col("created_at", "DATETIME"),
+            col("value", "REAL"),
+        ];
+        let schema = bucket_arrow_schema(&cols, 0);
+        assert_eq!(*schema.field(0).data_type(), timestamp_arrow_type());
+        assert!(!schema.field(0).is_nullable(), "bucket axis non-null");
+        assert_eq!(*schema.field(1).data_type(), timestamp_arrow_type());
+        assert!(schema.field(1).is_nullable(), "secondary stamp nullable");
+        assert_eq!(*schema.field(2).data_type(), DataType::Float64);
+    }
+
+    #[test]
+    fn timestamp_text_round_trips() {
+        for (text, us) in [
+            ("1970-01-01", 0i64),
+            ("1970-01-01T00:00:00Z", 0),
+            ("2026-07-13 10:42:00", 1_783_939_320_000_000),
+            ("2026-07-13T10:42:00.5Z", 1_783_939_320_500_000),
+            ("2026-07-13T10:42:00.123456789", 1_783_939_320_123_456), // truncates
+            ("1969-12-31T23:59:59Z", -1_000_000),
+            ("2000-02-29", 951_782_400_000_000), // leap day
+        ] {
+            assert_eq!(parse_timestamp_micros(text), Some(us), "{text}");
+        }
+        // format → parse is exact for any µs value.
+        for us in [0i64, 1, -1, 1_783_939_320_500_000, -62_167_219_200_000_000] {
+            let text = format_timestamp_micros(us);
+            assert_eq!(parse_timestamp_micros(&text), Some(us), "{text}");
+        }
+        assert_eq!(
+            format_timestamp_micros(1_783_939_320_000_000),
+            "2026-07-13T10:42:00Z"
+        );
+        // Garbage and impossible dates are refused, not guessed.
+        for bad in ["", "not a date", "2026-13-01", "2026-02-30", "2026-07-13T25:00:00", "2026-07-13T10:42:00.abc"] {
+            assert_eq!(parse_timestamp_micros(bad), None, "{bad}");
+        }
     }
 
     #[test]

@@ -4,12 +4,15 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-rusqlite = "0.40.1"
+rusqlite = { version = "0.40.1", features = ["functions"] }
 silodb-catalog = { version = "0.1.0", path = "../silodb-catalog" }
 silodb-compact = { version = "0.1.0", path = "../silodb-compact" }
 silodb-schema = { version = "0.1.0", path = "../silodb-schema" }
 silodb-vtab = { version = "0.1.0", path = "../silodb-vtab" }
 
 [dev-dependencies]
+arrow = "59.1.0"
+parquet = "59.1.0"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
+silodb-schema = { path = "../silodb-schema" }
 tempfile = "3.27.0"

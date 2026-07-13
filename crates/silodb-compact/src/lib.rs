@@ -59,8 +59,10 @@ pub struct BucketSpec<'a> {
     /// Catalog key; usually the cold directory's basename (must match the
     /// vtab's `table=` argument).
     pub logical_table: &'a str,
-    /// INTEGER column holding epoch microseconds (silodb convention).
-    pub ts_column: &'a str,
+    /// Bucket axis override. `None` → discovered by declared type
+    /// (`silodb_schema::resolve_ts_index` precedence: explicit name, else
+    /// exactly one TIMESTAMP/DATETIME column, else an INTEGER `ts`).
+    pub ts_column: Option<&'a str>,
     /// Bucket bounds: `[bucket_start, bucket_end)` — end exclusive, like
     /// the catalog's `range_end`.
     pub bucket_start: i64,
@@ -90,8 +92,10 @@ pub enum CompactError {
     UnsupportedDecl { column: String, decl: String },
     /// A value's runtime type doesn't match its column's storage class.
     TypeMismatch { column: String, value: &'static str },
-    /// `ts_column` is missing from the hot table or not INTEGER-declared.
-    BadTimestampColumn { column: String },
+    /// No usable bucket axis: the explicit `ts_column` is missing or not
+    /// INTEGER-class, or type-driven discovery found zero/multiple
+    /// TIMESTAMP columns.
+    BadTimestampColumn { reason: silodb_schema::TsResolveError },
     /// The catalog says this file exists but it's gone from disk.
     MissingCompactedFile { path: String },
 }
@@ -110,10 +114,9 @@ impl std::fmt::Display for CompactError {
                 f,
                 "column '{column}' holds a {value} value incompatible with its declared type"
             ),
-            Self::BadTimestampColumn { column } => write!(
-                f,
-                "timestamp column '{column}' missing or not INTEGER-declared"
-            ),
+            Self::BadTimestampColumn { reason } => {
+                write!(f, "no usable timestamp column: {reason}")
+            }
             Self::MissingCompactedFile { path } => write!(
                 f,
                 "catalog references '{path}' but the file is missing (possible data loss)"
@@ -146,13 +149,9 @@ fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
-struct HotColumn {
-    name: String,
-    ty: SqliteType,
-}
-
-/// Hot-table columns in declaration order, mapped to storage classes.
-fn hot_columns(conn: &Connection, table: &str) -> Result<Vec<HotColumn>> {
+/// Hot-table columns in declaration order, parsed (storage class +
+/// TIMESTAMP marker) through `silodb-schema`'s shared rules.
+fn hot_columns(conn: &Connection, table: &str) -> Result<Vec<silodb_schema::ColumnDecl>> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", quote_ident(table)))?;
     let cols = stmt
         .query_map([], |row| {
@@ -161,11 +160,10 @@ fn hot_columns(conn: &Connection, table: &str) -> Result<Vec<HotColumn>> {
         .collect::<std::result::Result<Vec<_>, _>>()?;
     cols.into_iter()
         .map(|(name, decl)| {
-            let ty = SqliteType::from_decl(&decl).ok_or(CompactError::UnsupportedDecl {
-                column: name.clone(),
+            silodb_schema::ColumnDecl::parse(&name, &decl).ok_or(CompactError::UnsupportedDecl {
+                column: name,
                 decl,
-            })?;
-            Ok(HotColumn { name, ty })
+            })
         })
         .collect()
 }
@@ -173,7 +171,13 @@ fn hot_columns(conn: &Connection, table: &str) -> Result<Vec<HotColumn>> {
 /// Column-major accumulator that keeps SQLite's dynamic typing honest on
 /// the way into strictly-typed Arrow arrays.
 enum ColBuf {
-    Ts(TimestampMicrosecondBuilder),
+    /// `allow_null` is false only for the bucket axis (its arrow field is
+    /// non-nullable; the WHERE range excludes NULLs anyway). Secondary
+    /// TIMESTAMP-declared columns are nullable like everything else.
+    Ts {
+        b: TimestampMicrosecondBuilder,
+        allow_null: bool,
+    },
     Int(Int64Builder),
     Real(Float64Builder),
     Text(StringBuilder),
@@ -181,13 +185,16 @@ enum ColBuf {
 }
 
 impl ColBuf {
-    fn new(ty: SqliteType, is_ts: bool) -> Self {
-        if is_ts {
+    fn new(col: &silodb_schema::ColumnDecl, is_axis: bool) -> Self {
+        if is_axis || col.declared_timestamp {
             // Timezone must match silodb_schema::timestamp_arrow_type() or
             // RecordBatch construction rejects the array.
-            return Self::Ts(TimestampMicrosecondBuilder::new().with_timezone("UTC"));
+            return Self::Ts {
+                b: TimestampMicrosecondBuilder::new().with_timezone("UTC"),
+                allow_null: !is_axis,
+            };
         }
-        match ty {
+        match col.ty {
             SqliteType::Integer => Self::Int(Int64Builder::new()),
             SqliteType::Real => Self::Real(Float64Builder::new()),
             SqliteType::Text => Self::Text(StringBuilder::new()),
@@ -201,10 +208,9 @@ impl ColBuf {
             value,
         };
         match self {
-            Self::Ts(b) => match v {
+            Self::Ts { b, allow_null } => match v {
                 Value::Integer(i) => b.append_value(i),
-                // NULL timestamps can't be bucketed; the WHERE range
-                // excludes them, so one here is a logic error.
+                Value::Null if *allow_null => b.append_null(),
                 _ => return Err(mismatch(value_kind(&v))),
             },
             Self::Int(b) => match v {
@@ -235,7 +241,7 @@ impl ColBuf {
 
     fn finish(&mut self) -> ArrayRef {
         match self {
-            Self::Ts(b) => Arc::new(b.finish()),
+            Self::Ts { b, .. } => Arc::new(b.finish()),
             Self::Int(b) => Arc::new(b.finish()),
             Self::Real(b) => Arc::new(b.finish()),
             Self::Text(b) => Arc::new(b.finish()),
@@ -273,20 +279,16 @@ pub fn compact_bucket(
     // Validate the hot table's shape before anything else — a bad
     // ts_column must be an error, not a silently empty bucket.
     let columns = hot_columns(conn, spec.hot_table)?;
-    let ts_idx = columns
-        .iter()
-        .position(|c| c.name == spec.ts_column)
-        .filter(|&i| columns[i].ty == SqliteType::Integer)
-        .ok_or_else(|| CompactError::BadTimestampColumn {
-            column: spec.ts_column.to_owned(),
-        })?;
+    let ts_idx = silodb_schema::resolve_ts_index(&columns, spec.ts_column)
+        .map_err(|reason| CompactError::BadTimestampColumn { reason })?;
+    let ts_name = columns[ts_idx].name.clone();
 
     let rows_in_bucket: i64 = conn.query_row(
         &format!(
             "SELECT count(*) FROM {} WHERE {} >= ?1 AND {} < ?2",
             quote_ident(spec.hot_table),
-            quote_ident(spec.ts_column),
-            quote_ident(spec.ts_column),
+            quote_ident(&ts_name),
+            quote_ident(&ts_name),
         ),
         params![spec.bucket_start, spec.bucket_end],
         |r| r.get(0),
@@ -327,13 +329,7 @@ pub fn compact_bucket(
     ));
     let out_str = out_path.display().to_string();
 
-    let arrow_schema = Arc::new(silodb_schema::bucket_arrow_schema(
-        &columns
-            .iter()
-            .map(|c| (c.name.clone(), c.ty))
-            .collect::<Vec<_>>(),
-        ts_idx,
-    ));
+    let arrow_schema = Arc::new(silodb_schema::bucket_arrow_schema(&columns, ts_idx));
 
     let col_list = columns
         .iter()
@@ -343,9 +339,9 @@ pub fn compact_bucket(
     let mut stmt = conn.prepare(&format!(
         "SELECT {col_list} FROM {} WHERE {} >= ?1 AND {} < ?2 ORDER BY {}",
         quote_ident(spec.hot_table),
-        quote_ident(spec.ts_column),
-        quote_ident(spec.ts_column),
-        quote_ident(spec.ts_column),
+        quote_ident(&ts_name),
+        quote_ident(&ts_name),
+        quote_ident(&ts_name),
     ))?;
 
     // Stream rows into the writer in row-group-sized batches so memory is
@@ -362,7 +358,7 @@ pub fn compact_bucket(
     let mut bufs: Vec<ColBuf> = columns
         .iter()
         .enumerate()
-        .map(|(i, c)| ColBuf::new(c.ty, i == ts_idx))
+        .map(|(i, c)| ColBuf::new(c, i == ts_idx))
         .collect();
     let mut buffered = 0usize;
     let mut total_rows = 0usize;
@@ -433,8 +429,8 @@ pub fn compact_bucket(
             &format!(
                 "DELETE FROM {} WHERE {} >= ?1 AND {} < ?2",
                 quote_ident(spec.hot_table),
-                quote_ident(spec.ts_column),
-                quote_ident(spec.ts_column),
+                quote_ident(&ts_name),
+                quote_ident(&ts_name),
             ),
             params![spec.bucket_start, spec.bucket_end],
         )?;

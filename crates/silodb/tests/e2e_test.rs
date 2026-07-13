@@ -135,9 +135,100 @@ fn init_table_detects_schema_drift() {
 }
 
 #[test]
-fn init_table_requires_a_ts_column() {
+fn init_table_requires_a_resolvable_ts_column() {
     let conn = Connection::open_in_memory().unwrap();
     silodb::load_module(&conn).unwrap();
+    // No TIMESTAMP column and nothing named ts.
     let err = silodb::init_table(&conn, "readings", "value REAL", "cold/").unwrap_err();
     assert!(matches!(err, InitError::BadSchema(_)), "{err}");
+    // Two TIMESTAMP columns: refuse to guess the bucket axis.
+    let err = silodb::init_table(
+        &conn,
+        "readings",
+        "a TIMESTAMP, b DATETIME, value REAL",
+        "cold/",
+    )
+    .unwrap_err();
+    assert!(matches!(err, InitError::BadSchema(_)), "{err}");
+}
+
+/// The TIMESTAMP declared type is the whole story: any column name, real
+/// dates in the exported parquet, helpers for humans — no ts_column
+/// argument anywhere.
+#[test]
+fn timestamp_typed_column_drives_everything_by_type() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("cold");
+    let conn = Connection::open_in_memory().unwrap();
+    silodb::load_module(&conn).unwrap();
+    silodb::init_table(
+        &conn,
+        "sensor",
+        "stamped_at TIMESTAMP, seq INTEGER, value REAL",
+        &base,
+    )
+    .unwrap();
+
+    // Insert via the helpers: silodb_ts parses ISO text.
+    conn.execute(
+        "INSERT INTO sensor VALUES (silodb_ts('2026-07-13T10:00:00Z'), 1, 21.5)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO sensor VALUES (silodb_ts('2026-07-13T11:30:00Z'), 2, 22.0)",
+        [],
+    )
+    .unwrap();
+
+    // Compact the 10:00 hour — bucket axis discovered by type, any name.
+    let hour = 3_600_000_000i64;
+    let start = silodb_schema_ts("2026-07-13T10:00:00Z");
+    let outcome = compact_table(&conn, "sensor", start, start + hour, &base).unwrap();
+    let CompactOutcome::Compacted { rows: 1, path } = outcome else {
+        panic!("{outcome:?}");
+    };
+
+    // The parquet file carries a real UTC timestamp type on stamped_at.
+    let file = std::fs::File::open(&path).unwrap();
+    let meta =
+        parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+    let field = meta.schema().field_with_name("stamped_at").unwrap();
+    assert_eq!(
+        *field.data_type(),
+        arrow::datatypes::DataType::Timestamp(
+            arrow::datatypes::TimeUnit::Microsecond,
+            Some("UTC".into())
+        )
+    );
+
+    // Query across hot+cold with helpers both directions.
+    let (n, rendered): (i64, String) = conn
+        .query_row(
+            "SELECT count(*), silodb_datetime(min(stamped_at)) FROM sensor
+             WHERE stamped_at >= silodb_ts('2026-07-13')",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(n, 2);
+    assert_eq!(rendered, "2026-07-13T10:00:00Z");
+}
+
+fn silodb_schema_ts(s: &str) -> i64 {
+    silodb_schema::parse_timestamp_micros(s).unwrap()
+}
+
+#[test]
+fn silodb_ts_helper_rejects_garbage_and_passes_integers() {
+    let conn = Connection::open_in_memory().unwrap();
+    silodb::load_module(&conn).unwrap();
+    let v: i64 = conn
+        .query_row("SELECT silodb_ts(12345)", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(v, 12345, "integers pass through");
+    let err = conn
+        .query_row("SELECT silodb_ts('not a date')", [], |r| r.get::<_, i64>(0))
+        .unwrap_err();
+    assert!(err.to_string().contains("unparseable"), "{err}");
 }
