@@ -2,6 +2,16 @@
 
 `cargo run -p silodb-bench --release -- [out_dir] [days]`
 
+The generated dataset is cached under `target/bench-cache/v<N>-<days>d/`
+(the expensive part: two 52M-row inserts + 365 compactions at year scale).
+First run builds it once; repeat runs stage the mutable silodb side from
+the cache in seconds and query the immutable 3 GB plain.db in place —
+a year-scale re-run is minutes of queries, not dataset construction.
+`SILODB_BENCH_REBUILD=1` forces a rebuild; bump `DATASET_VERSION` in
+main.rs when the generator or schema changes. (Detail: staging re-points
+`_silodb_catalog` paths at the copy — catalog paths are verbatim, and
+tiered GC would otherwise delete the cache's files.)
+
 Three contenders over the same deterministic synthetic telemetry — **one
 year at 1-minute interval from 10 devices × 10 sensors** (100 series,
 52.56M rows), daily buckets (365 parquet files, 144k rows each):

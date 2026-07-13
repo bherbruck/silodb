@@ -178,28 +178,27 @@ fn insert_rows(conn: &Connection, table: &str, days: i64) -> f64 {
     t.elapsed().as_secs_f64()
 }
 
-fn main() {
-    let mut args = std::env::args().skip(1);
-    let out: PathBuf = args
-        .next()
-        .map(Into::into)
-        .unwrap_or_else(|| PathBuf::from("target/bench"));
-    let days: i64 = args
-        .next()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_DAYS);
+/// Bump when the generator or schema changes — invalidates cached datasets.
+const DATASET_VERSION: u32 = 1;
+
+/// Build the (silodb daily-compacted + plain indexed) dataset into `cache`
+/// unless a completed one is already there. This is the expensive part —
+/// two 52M-row inserts and 365 compactions at year scale — and it's
+/// identical every time, so it happens once per (version, days).
+fn ensure_dataset(cache: &Path, days: i64) {
+    let done = cache.join(".complete");
+    if done.is_file() && std::env::var_os("SILODB_BENCH_REBUILD").is_none() {
+        println!("(dataset cache hit: {})", cache.display());
+        return;
+    }
+    println!("(building dataset cache: {} — one-time cost)", cache.display());
+    let _ = std::fs::remove_dir_all(cache);
+    std::fs::create_dir_all(cache).unwrap();
+    let base = cache.join("cold");
     let rows = days * ROWS_PER_DAY;
-    let _ = std::fs::remove_dir_all(&out);
-    std::fs::create_dir_all(&out).unwrap();
-    let base = out.join("cold");
 
-    println!(
-        "# silodb bench — {days} days x {DEVICES} devices x {SENSORS} sensors @ 1min = {rows} rows, daily buckets\n"
-    );
-
-    // ---------- silodb ----------
-    let silo_db = out.join("silo.db");
-    let conn = Connection::open(&silo_db).unwrap();
+    // silodb side: hot insert then daily compaction.
+    let conn = Connection::open(cache.join("silo.db")).unwrap();
     conn.pragma_update(None, "journal_mode", "WAL").unwrap();
     conn.pragma_update(None, "synchronous", "NORMAL").unwrap();
     silodb::load_module(&conn).unwrap();
@@ -211,10 +210,8 @@ fn main() {
         "1d,7d,28d",
     )
     .unwrap();
-
     let insert_s = insert_rows(&conn, "readings", days);
-    println!("hot insert: {:.1}s ({:.0} rows/s)", insert_s, rows as f64 / insert_s);
-
+    println!("  hot insert: {:.1}s ({:.0} rows/s)", insert_s, rows as f64 / insert_s);
     let t = Instant::now();
     let mut files = 0;
     for b in 0..days {
@@ -225,19 +222,17 @@ fn main() {
             files += 1;
         }
     }
-    let compact_s = t.elapsed().as_secs_f64();
     println!(
-        "compaction: {:.1}s ({:.0} rows/s) into {files} daily files",
-        compact_s,
-        rows as f64 / compact_s
+        "  compaction: {:.1}s ({:.0} rows/s) into {files} daily files",
+        t.elapsed().as_secs_f64(),
+        rows as f64 / t.elapsed().as_secs_f64()
     );
-    let t = Instant::now();
     conn.execute_batch("VACUUM").unwrap();
-    println!("silodb hot vacuum: {:.1}s", t.elapsed().as_secs_f64());
+    conn.pragma_update(None, "wal_checkpoint", "TRUNCATE").ok();
+    drop(conn);
 
-    // ---------- plain fully-hot indexed SQLite ----------
-    let plain_db = out.join("plain.db");
-    let plain = Connection::open(&plain_db).unwrap();
+    // plain side: one big indexed table.
+    let plain = Connection::open(cache.join("plain.db")).unwrap();
     plain.pragma_update(None, "journal_mode", "WAL").unwrap();
     plain.pragma_update(None, "synchronous", "NORMAL").unwrap();
     plain
@@ -250,17 +245,85 @@ fn main() {
     plain
         .execute_batch("CREATE INDEX idx_readings_ts ON readings(ts)")
         .unwrap();
-    let index_s = t.elapsed().as_secs_f64();
     println!(
-        "plain sqlite insert: {plain_insert_s:.1}s, ts index build: {index_s:.1}s"
+        "  plain sqlite insert: {plain_insert_s:.1}s, ts index build: {:.1}s",
+        t.elapsed().as_secs_f64()
+    );
+    plain.pragma_update(None, "wal_checkpoint", "TRUNCATE").ok();
+    drop(plain);
+
+    std::fs::write(done, b"ok").unwrap();
+}
+
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for e in std::fs::read_dir(from).unwrap().flatten() {
+        let dest = to.join(e.file_name());
+        if e.path().is_dir() {
+            copy_dir(&e.path(), &dest);
+        } else {
+            std::fs::copy(e.path(), &dest).unwrap();
+        }
+    }
+}
+
+fn main() {
+    let mut args = std::env::args().skip(1);
+    let out: PathBuf = args
+        .next()
+        .map(Into::into)
+        .unwrap_or_else(|| PathBuf::from("target/bench"));
+    let days: i64 = args
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_DAYS);
+    let rows = days * ROWS_PER_DAY;
+
+    println!(
+        "# silodb bench — {days} days x {DEVICES} devices x {SENSORS} sensors @ 1min = {rows} rows, daily buckets\n"
     );
 
+    let cache = PathBuf::from(format!("target/bench-cache/v{DATASET_VERSION}-{days}d"));
+    ensure_dataset(&cache, days);
+
+    // The silodb side gets mutated by tiered maintenance → work on a copy
+    // (small: hot.db is ~empty + the parquet dir). The plain 3 GB db is
+    // only ever queried → used straight from the cache.
+    let _ = std::fs::remove_dir_all(&out);
+    std::fs::create_dir_all(&out).unwrap();
+    let t = Instant::now();
+    let silo_db = out.join("silo.db");
+    let base = out.join("cold");
+    std::fs::copy(cache.join("silo.db"), &silo_db).unwrap();
+    copy_dir(&cache.join("cold"), &base);
+    println!("(dataset staged from cache in {:.1}s)", t.elapsed().as_secs_f64());
+
+    let conn = Connection::open(&silo_db).unwrap();
+    conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+    conn.pragma_update(None, "synchronous", "NORMAL").unwrap();
+    silodb::load_module(&conn).unwrap();
+    // Catalog paths are stored verbatim — re-point them at the copy, or
+    // this run's GC would delete the cache's files.
+    conn.execute(
+        "UPDATE _silodb_catalog SET path = replace(path, ?1, ?2)",
+        rusqlite::params![
+            cache.join("cold").display().to_string(),
+            base.display().to_string()
+        ],
+    )
+    .unwrap();
+
+    let plain = Connection::open(cache.join("plain.db")).unwrap();
+
     // ---------- sizes ----------
-    plain.pragma_update(None, "wal_checkpoint", "TRUNCATE").ok();
-    conn.pragma_update(None, "wal_checkpoint", "TRUNCATE").ok();
+    let files = silodb::catalog::entries_for_table(&conn, "readings")
+        .unwrap()
+        .len();
     let silo_hot = std::fs::metadata(&silo_db).map(|m| m.len()).unwrap_or(0);
     let silo_cold = dir_size(&base);
-    let plain_total = std::fs::metadata(&plain_db).map(|m| m.len()).unwrap_or(0);
+    let plain_total = std::fs::metadata(cache.join("plain.db"))
+        .map(|m| m.len())
+        .unwrap_or(0);
     println!("\n## on-disk size");
     println!(
         "- silodb: {:.1} MB  (hot.db {:.1} MB + parquet {:.1} MB, {files} files)",
