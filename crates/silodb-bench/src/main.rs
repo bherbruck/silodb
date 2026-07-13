@@ -147,10 +147,16 @@ fn count_query(conn: &Connection, sql: &str) -> i64 {
 }
 
 /// Insert `days` worth of telemetry in day-sized transactions.
+///
+/// Values are realistic, not adversarial: each series is a baseline + a
+/// daily sinusoid + a small bounded random walk, quantized to 0.1 like a
+/// real sensor would report. (Full-precision random doubles are
+/// incompressible by definition and benchmark nothing but entropy.)
 fn insert_rows(conn: &Connection, table: &str, days: i64) -> f64 {
     let devices: Vec<String> = (0..DEVICES).map(|d| format!("device-{d:02}")).collect();
     let sensors: Vec<String> = (0..SENSORS).map(|s| format!("sensor-{s:02}")).collect();
     let mut rng = Lcg(42);
+    let mut walks = vec![0.0f64; SERIES as usize];
     let t = Instant::now();
     for day in 0..days {
         conn.execute_batch("BEGIN").unwrap();
@@ -160,15 +166,16 @@ fn insert_rows(conn: &Connection, table: &str, days: i64) -> f64 {
                 .unwrap();
             for minute in 0..1440 {
                 let ts = day * BUCKET_US + minute * INTERVAL_US;
-                for device in &devices {
-                    for sensor in &sensors {
-                        stmt.execute(rusqlite::params![
-                            ts,
-                            device,
-                            sensor,
-                            rng.next_f64() * 100.0,
-                        ])
-                        .unwrap();
+                let phase = (minute as f64 / 1440.0) * std::f64::consts::TAU;
+                for (di, device) in devices.iter().enumerate() {
+                    for (si, sensor) in sensors.iter().enumerate() {
+                        let series = di * SENSORS as usize + si;
+                        let walk = &mut walks[series];
+                        *walk = (*walk + (rng.next_f64() - 0.5) * 0.2).clamp(-3.0, 3.0);
+                        let v = 20.0 + series as f64 + 5.0 * phase.sin() + *walk;
+                        let quantized = (v * 10.0).round() / 10.0;
+                        stmt.execute(rusqlite::params![ts, device, sensor, quantized])
+                            .unwrap();
                     }
                 }
             }
@@ -179,7 +186,7 @@ fn insert_rows(conn: &Connection, table: &str, days: i64) -> f64 {
 }
 
 /// Bump when the generator or schema changes — invalidates cached datasets.
-const DATASET_VERSION: u32 = 1;
+const DATASET_VERSION: u32 = 2;
 
 /// Build the (silodb daily-compacted + plain indexed) dataset into `cache`
 /// unless a completed one is already there. This is the expensive part —
