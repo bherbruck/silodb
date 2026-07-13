@@ -10,4 +10,6 @@ rusqlite = { version = "0.40.1", features = ["vtab"] }
 silodb-schema = { version = "0.1.0", path = "../silodb-schema" }
 
 [dev-dependencies]
+proptest = "1.11.0"
 rusqlite = { version = "0.40.1", features = ["vtab", "bundled"] }
+tempfile = "3.27.0"
