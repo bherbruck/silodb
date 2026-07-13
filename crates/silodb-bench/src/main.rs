@@ -415,6 +415,111 @@ fn main() {
         writeln!(tiered_md, "| {label} | {med:.1} ({min:.1}) | {duck} |").unwrap();
     }
     println!("{tiered_md}");
+
+    duckdb_native(&qs, &out, &base, days);
+}
+
+/// DuckDB as a storage engine, not just a parquet reader: bulk ingest into
+/// a native table (its best case), query it, and sample row-at-a-time SQL
+/// ingest (its documented weak spot — measured, not asserted).
+fn duckdb_native(qs: &QuerySet, out: &Path, base: &Path, days: i64) {
+    let db = out.join("duck.db");
+    let _ = std::fs::remove_file(&db);
+
+    // Bulk load from the (tiered) parquet + timed queries on the native table.
+    let mut script = String::from(".timer on\n");
+    script.push_str(&format!(
+        "CREATE TABLE readings AS SELECT ts, device, sensor, value \
+         FROM read_parquet('{}/readings/*.parquet');\n",
+        base.display()
+    ));
+    for (_, _, duck_sql) in &qs.queries {
+        let native = duck_sql.replace(
+            &format!("read_parquet('{}/readings/*.parquet')", base.display()),
+            "readings",
+        );
+        for _ in 0..13 {
+            script.push_str(&native);
+            script.push_str(";\n");
+        }
+    }
+    script.push_str("CHECKPOINT;\n");
+    let script_path = out.join("duck_native.sql");
+    std::fs::write(&script_path, &script).unwrap();
+    let output = std::process::Command::new("duckdb")
+        .arg("-batch")
+        .arg(&db)
+        .stdin(std::fs::File::open(&script_path).unwrap())
+        .output()
+        .ok();
+    let Some(output) = output.filter(|o| o.status.success()) else {
+        println!("\n(duckdb native phase skipped: CLI failed)");
+        return;
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let reals: Vec<f64> = text
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("Run Time (s): real"))
+        .filter_map(|rest| rest.split_whitespace().next()?.parse::<f64>().ok())
+        .map(|s| s * 1e3)
+        .collect();
+    let expected = 1 + qs.queries.len() * 13 + 1; // CTAS + queries + CHECKPOINT
+    if reals.len() != expected {
+        println!("\n(duckdb native phase skipped: expected {expected} timings, got {})", reals.len());
+        return;
+    }
+    let bulk_s = reals[0] / 1e3;
+    let rows = days * ROWS_PER_DAY;
+    let native_size = std::fs::metadata(&db).map(|m| m.len()).unwrap_or(0);
+    println!(
+        "\n## duckdb native table\nbulk ingest (parquet -> native, its best case): {bulk_s:.1}s ({:.0} rows/s); db size {:.1} MB",
+        rows as f64 / bulk_s,
+        mb(native_size),
+    );
+
+    let mut md = String::new();
+    writeln!(md, "\n| query | duckdb native table |\n|---|---|").unwrap();
+    for (i, (label, _, _)) in qs.queries.iter().enumerate() {
+        let (med, min) = median_min(reals[1 + i * 13 + 3..1 + (i + 1) * 13].to_vec());
+        writeln!(md, "| {label} | {med:.1} ({min:.1}) |").unwrap();
+    }
+    println!("{md}");
+
+    // Row-at-a-time SQL ingest sample: one day of rows (144k) as single-row
+    // INSERTs inside day-sized transactions, mirroring the sqlite loop.
+    let sample_rows = ROWS_PER_DAY;
+    let mut rng = Lcg(7);
+    let mut ins = String::with_capacity(20 << 20);
+    ins.push_str("CREATE TABLE rw (ts TIMESTAMP, device VARCHAR, sensor VARCHAR, value DOUBLE);\nBEGIN;\n");
+    for minute in 0..1440 {
+        for d in 0..DEVICES {
+            for s in 0..SENSORS {
+                let v = (rng.next_f64() * 1000.0).round() / 10.0;
+                ins.push_str(&format!(
+                    "INSERT INTO rw VALUES (make_timestamp({}), 'device-{d:02}', 'sensor-{s:02}', {v});\n",
+                    minute * INTERVAL_US
+                ));
+            }
+        }
+    }
+    ins.push_str("COMMIT;\n");
+    let ins_path = out.join("duck_rowwise.sql");
+    std::fs::write(&ins_path, &ins).unwrap();
+    let t = Instant::now();
+    let ok = std::process::Command::new("duckdb")
+        .arg("-batch")
+        .arg(out.join("duck_rw.db"))
+        .stdin(std::fs::File::open(&ins_path).unwrap())
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if ok {
+        let el = t.elapsed().as_secs_f64();
+        println!(
+            "row-at-a-time SQL ingest sample ({sample_rows} rows, one txn): {el:.1}s ({:.0} rows/s)",
+            sample_rows as f64 / el
+        );
+    }
 }
 
 /// Run each duckdb query 13 times (3 warmups) in one CLI session with

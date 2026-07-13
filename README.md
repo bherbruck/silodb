@@ -38,20 +38,38 @@ tables included, which no TSDB query DSL gives you.
 
 ## Numbers (1 year, 1-min interval, 10 devices × 10 sensors = 52.5M rows)
 
-| | silodb | plain SQLite (+ts index) | DuckDB on the same parquet |
-|---|---|---|---|
-| on-disk | **133 MB** | 2,988 MB (22×) | (same files) |
-| "1h of one sensor" | **1.0 ms** | 0.4 ms | ~120 ms |
-| "1 week of one sensor" | **63 ms** | 84 ms | ~120 ms |
-| full-year aggregate | 4.7 s | 2.9 s | **0.1 s** |
-| ingest (through the view) | ~430k rows/s | — | — |
-| compaction | ~540k rows/s | — | — |
+Four contenders, same data, same machine: silodb; everything kept hot in
+one indexed SQLite table; DuckDB querying silodb's parquet ad hoc; and
+DuckDB as a self-contained engine with its own native table.
 
-Selective time-range queries — the actual edge workload — stay in SQLite's
-league while using 4–5 % of its disk; the hot tier stays permanently tiny
-instead of growing forever. Full-table scans are the honest worst case:
-that's DuckDB's home turf, and it reads silodb's cold files directly when
-you want it. Methodology + more numbers: `crates/silodb-bench/`.
+| | silodb | hot SQLite (+ts idx) | DuckDB on the parquet | DuckDB native table |
+|---|---|---|---|---|
+| **live ingest** (row-at-a-time) | **~430k rows/s** | ~890k rows/s | — | **863 rows/s** |
+| bulk load (from existing bulk data) | ~540k rows/s¹ | — | — | 9.9M rows/s |
+| on-disk | **133 MB** | 2,988 MB (22×) | (same files) | 140 MB |
+| "1h of one sensor" | **1.0 ms** | 0.4 ms | 126 ms | 2 ms |
+| "1 week of one sensor" | **59 ms** | 83 ms | 132 ms | 2 ms |
+| full-year aggregate | 5.3 s | 2.8 s | 0.15 s | **15 ms** |
+
+¹ compaction throughput (hot → parquet, background, crash-safe)
+
+Reading it honestly, each column has a story:
+
+- **silodb**: near-SQLite latency on the actual edge workload (selective
+  time ranges), 4–5 % of its disk, hot tier permanently tiny, full ACID.
+  Worst case is full-table scans (row-at-a-time vtab protocol).
+- **hot SQLite**: fastest tiny lookups, but 22× the disk, growing forever,
+  with a 30 s index rebuild hanging over every maintenance window.
+- **DuckDB ad hoc**: reads silodb's files directly — free analytics tier,
+  no export. Pays 100–250 ms per query re-planning/re-parsing footers.
+- **DuckDB native**: spectacular at queries and bulk loads — and **~500×
+  too slow at live row-at-a-time ingest** to be the system of record on a
+  device that's writing constantly. Single-writer, and you give up the
+  SQLite ecosystem (joins against app tables, tooling, clients).
+
+That's the architecture in one table: **SQLite where data is born, parquet
+where it rests, DuckDB welcome to visit.** Methodology + full numbers:
+[`crates/silodb-bench/`](crates/silodb-bench/README.md).
 
 ## Guarantees
 

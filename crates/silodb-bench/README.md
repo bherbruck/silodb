@@ -96,6 +96,33 @@ footers to parse), (c) narrow queries stay at ~1 ms even though file-level
 pruning got coarser — row-group pruning inside the 28d files picks up the
 slack, which validates the two-layer design.
 
+## DuckDB as a self-contained engine (native table)
+
+Giving DuckDB its best showing: bulk load silodb's tiered parquet into a
+native table, query that, and sample realistic row-at-a-time ingest.
+
+```
+bulk ingest (parquet -> native):        5.3s  (9.9M rows/s)   — its ceiling
+row-at-a-time SQL ingest (144k sample): 167s  (863 rows/s)    — its floor
+native db size:                         140 MB (parquet: 133 MB)
+```
+
+| query, median ms | duckdb native |
+|---|---|
+| 1h, one series | 2 |
+| 1 week, one series | 2 |
+| full year agg | **15** |
+
+Native DuckDB wins every query decisively and bulk-loads at ~10M rows/s —
+and is **~500× slower than SQLite at live row-at-a-time ingest** (863 vs
+430k rows/s), which is the workload an edge device actually generates.
+(Caveat: measured via single-row SQL statements through the CLI; the
+appender API narrows the gap, but DuckDB's own docs steer OLTP-shaped
+writes elsewhere — this measures why.) Single writer, no SQLite ecosystem.
+Bulk numbers only apply when the data already exists in bulk — which on a
+device, it never does. Hence the architecture: SQLite where data is born,
+parquet where it rests, DuckDB welcome to visit.
+
 ## History
 
 The first full-scale run (2M-row variant) exposed a real bug: compaction
