@@ -1,14 +1,17 @@
-//! Benchmark: silodb (hot+cold view over hourly parquet buckets) vs a
+//! Benchmark: silodb (hot+cold view over daily parquet buckets) vs a
 //! plain fully-hot indexed SQLite table vs DuckDB reading the very same
 //! parquet files silodb wrote.
 //!
-//! Run: `cargo run -p silodb-bench --release [-- <out_dir> [rows]]`
+//! Scenario: one year of telemetry at 1-minute interval from 10 devices x
+//! 10 sensors = 100 series -> 52.56M rows, daily buckets (365 files,
+//! 144k rows each).
+//!
+//! Run: `cargo run -p silodb-bench --release [-- <out_dir> [days]]`
 //! DuckDB numbers require a `duckdb` CLI on PATH (skipped otherwise).
 //!
-//! Methodology: deterministic synthetic time series, 1 row/second, 16
-//! sensor names round-robin. Each query gets 3 warmups + 10 timed runs;
-//! median and min reported. Sizes measured after VACUUM so SQLite freelist
-//! pages don't flatter or punish anyone.
+//! Methodology: deterministic synthetic data; each query gets 3 warmups +
+//! 10 timed runs; median and min reported. Sizes measured after VACUUM +
+//! WAL truncation.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -16,10 +19,13 @@ use std::time::Instant;
 
 use rusqlite::Connection;
 
-const DEFAULT_ROWS: i64 = 2_000_000;
-const SENSORS: i64 = 16;
-const US_PER_SEC: i64 = 1_000_000;
-const BUCKET_US: i64 = 3600 * US_PER_SEC; // hourly buckets
+const DEFAULT_DAYS: i64 = 365;
+const DEVICES: i64 = 10;
+const SENSORS: i64 = 10;
+const SERIES: i64 = DEVICES * SENSORS;
+const INTERVAL_US: i64 = 60 * 1_000_000; // 1 minute
+const BUCKET_US: i64 = 86_400 * 1_000_000; // daily buckets
+const ROWS_PER_DAY: i64 = 1440 * SERIES;
 
 struct Lcg(u64);
 impl Lcg {
@@ -73,79 +79,102 @@ struct QuerySet {
     queries: Vec<(&'static str, String, String)>,
 }
 
-fn build_queries(rows: i64, table: &str, duck_src: &str) -> QuerySet {
-    // Range anchors: an hour and a day in the middle of the data.
-    let mid_hour = (rows / 2 / 3600) * BUCKET_US;
-    let day_start = mid_hour;
-    let day_end = day_start + 24 * BUCKET_US;
-    let hour_end = mid_hour + BUCKET_US;
+fn build_queries(days: i64, table: &str, duck_src: &str) -> QuerySet {
+    // Anchors in the middle of the year: a day boundary, noon of that day.
+    let day = (days / 2) * BUCKET_US;
+    let hour = day + 12 * 3600 * 1_000_000;
+    let hour_end = hour + 3600 * 1_000_000;
+    let day_end = day + BUCKET_US;
+    let week_end = day + 7 * BUCKET_US;
 
-    let q = |sqlite: String, duck: String| (sqlite, duck);
     let mut queries = Vec::new();
+    let mut push = |label, sqlite: String, duck: String| queries.push((label, sqlite, duck));
 
-    let (s, d) = q(
-        format!("SELECT count(*), avg(value) FROM {table} WHERE ts >= {mid_hour} AND ts < {hour_end}"),
-        format!("SELECT count(*), avg(value) FROM {duck_src} WHERE ts >= make_timestamp({mid_hour}) AND ts < make_timestamp({hour_end})"),
+    push(
+        "1h, one series (~0.0001%)",
+        format!(
+            "SELECT count(*), avg(value) FROM {table} WHERE ts >= {hour} AND ts < {hour_end} \
+             AND device = 'device-03' AND sensor = 'sensor-07'"
+        ),
+        format!(
+            "SELECT count(*), avg(value) FROM {duck_src} WHERE ts >= make_timestamp({hour}) \
+             AND ts < make_timestamp({hour_end}) AND device = 'device-03' AND sensor = 'sensor-07'"
+        ),
     );
-    queries.push(("1h range agg (~0.2%)", s, d));
-
-    let (s, d) = q(
-        format!("SELECT count(*), avg(value) FROM {table} WHERE ts >= {day_start} AND ts < {day_end}"),
-        format!("SELECT count(*), avg(value) FROM {duck_src} WHERE ts >= make_timestamp({day_start}) AND ts < make_timestamp({day_end})"),
+    push(
+        "1 day, all series (~0.27%)",
+        format!("SELECT count(*), avg(value) FROM {table} WHERE ts >= {day} AND ts < {day_end}"),
+        format!(
+            "SELECT count(*), avg(value) FROM {duck_src} WHERE ts >= make_timestamp({day}) \
+             AND ts < make_timestamp({day_end})"
+        ),
     );
-    queries.push(("24h range agg (~4%)", s, d));
-
-    let (s, d) = q(
+    push(
+        "1 week, one series (~0.02%)",
+        format!(
+            "SELECT count(*), avg(value), min(value), max(value) FROM {table} \
+             WHERE ts >= {day} AND ts < {week_end} \
+             AND device = 'device-03' AND sensor = 'sensor-07'"
+        ),
+        format!(
+            "SELECT count(*), avg(value), min(value), max(value) FROM {duck_src} \
+             WHERE ts >= make_timestamp({day}) AND ts < make_timestamp({week_end}) \
+             AND device = 'device-03' AND sensor = 'sensor-07'"
+        ),
+    );
+    push(
+        "1 week, all series (~2%)",
+        format!(
+            "SELECT count(*), avg(value) FROM {table} WHERE ts >= {day} AND ts < {week_end}"
+        ),
+        format!(
+            "SELECT count(*), avg(value) FROM {duck_src} WHERE ts >= make_timestamp({day}) \
+             AND ts < make_timestamp({week_end})"
+        ),
+    );
+    push(
+        "full year agg (100%)",
         format!("SELECT count(*), avg(value) FROM {table}"),
         format!("SELECT count(*), avg(value) FROM {duck_src}"),
     );
-    queries.push(("full-history agg (100%)", s, d));
-
-    let (s, d) = q(
-        format!(
-            "SELECT count(*) FROM {table} WHERE ts >= {day_start} AND ts < {day_end} AND name = 'sensor-7'"
-        ),
-        format!(
-            "SELECT count(*) FROM {duck_src} WHERE ts >= make_timestamp({day_start}) AND ts < make_timestamp({day_end}) AND name = 'sensor-7'"
-        ),
-    );
-    queries.push(("24h range + name filter", s, d));
-
-    let (s, d) = q(
-        format!("SELECT max(value) FROM (SELECT value FROM {table} WHERE ts >= {mid_hour} AND ts < {hour_end})"),
-        format!("SELECT max(value) FROM (SELECT value FROM {duck_src} WHERE ts >= make_timestamp({mid_hour}) AND ts < make_timestamp({hour_end})) t"),
-    );
-    queries.push(("1h raw rows materialized", s, d));
 
     QuerySet { queries }
 }
 
 fn count_query(conn: &Connection, sql: &str) -> i64 {
-    // Every benchmark query returns at least one aggregate row; sum the
-    // first column as an i64-ish sink so nothing is optimized away.
     conn.query_row(sql, [], |r| r.get::<_, f64>(0).or(Ok(0.0)))
         .unwrap() as i64
 }
 
-fn insert_rows(conn: &Connection, table: &str, rows: i64) -> f64 {
+/// Insert `days` worth of telemetry in day-sized transactions.
+fn insert_rows(conn: &Connection, table: &str, days: i64) -> f64 {
+    let devices: Vec<String> = (0..DEVICES).map(|d| format!("device-{d:02}")).collect();
+    let sensors: Vec<String> = (0..SENSORS).map(|s| format!("sensor-{s:02}")).collect();
     let mut rng = Lcg(42);
     let t = Instant::now();
-    conn.execute_batch("BEGIN").unwrap();
-    {
-        let mut stmt = conn
-            .prepare(&format!("INSERT INTO {table} VALUES (?1, ?2, ?3, ?4)"))
-            .unwrap();
-        for i in 0..rows {
-            stmt.execute(rusqlite::params![
-                i * US_PER_SEC,
-                i,
-                rng.next_f64() * 100.0,
-                format!("sensor-{}", i % SENSORS),
-            ])
-            .unwrap();
+    for day in 0..days {
+        conn.execute_batch("BEGIN").unwrap();
+        {
+            let mut stmt = conn
+                .prepare_cached(&format!("INSERT INTO {table} VALUES (?1, ?2, ?3, ?4)"))
+                .unwrap();
+            for minute in 0..1440 {
+                let ts = day * BUCKET_US + minute * INTERVAL_US;
+                for d in 0..DEVICES as usize {
+                    for s in 0..SENSORS as usize {
+                        stmt.execute(rusqlite::params![
+                            ts,
+                            devices[d],
+                            sensors[s],
+                            rng.next_f64() * 100.0,
+                        ])
+                        .unwrap();
+                    }
+                }
+            }
         }
+        conn.execute_batch("COMMIT").unwrap();
     }
-    conn.execute_batch("COMMIT").unwrap();
     t.elapsed().as_secs_f64()
 }
 
@@ -155,15 +184,18 @@ fn main() {
         .next()
         .map(Into::into)
         .unwrap_or_else(|| PathBuf::from("target/bench"));
-    let rows: i64 = args
+    let days: i64 = args
         .next()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_ROWS);
+        .unwrap_or(DEFAULT_DAYS);
+    let rows = days * ROWS_PER_DAY;
     let _ = std::fs::remove_dir_all(&out);
     std::fs::create_dir_all(&out).unwrap();
     let base = out.join("cold");
 
-    println!("# silodb bench — {rows} rows, hourly buckets, 1 row/s\n");
+    println!(
+        "# silodb bench — {days} days x {DEVICES} devices x {SENSORS} sensors @ 1min = {rows} rows, daily buckets\n"
+    );
 
     // ---------- silodb ----------
     let silo_db = out.join("silo.db");
@@ -174,18 +206,17 @@ fn main() {
     silodb::init_table(
         &conn,
         "readings",
-        "ts TIMESTAMP, seq INTEGER, value REAL, name TEXT",
+        "ts TIMESTAMP, device TEXT, sensor TEXT, value REAL",
         &base,
     )
     .unwrap();
 
-    let insert_s = insert_rows(&conn, "readings", rows);
-    println!("hot insert: {:.2}s ({:.0} rows/s)", insert_s, rows as f64 / insert_s);
+    let insert_s = insert_rows(&conn, "readings", days);
+    println!("hot insert: {:.1}s ({:.0} rows/s)", insert_s, rows as f64 / insert_s);
 
     let t = Instant::now();
-    let buckets = rows * US_PER_SEC / BUCKET_US + 1;
     let mut files = 0;
-    for b in 0..buckets {
+    for b in 0..days {
         if let silodb::CompactOutcome::Compacted { .. } =
             silodb::compact_table(&conn, "readings", b * BUCKET_US, (b + 1) * BUCKET_US, &base)
                 .unwrap()
@@ -195,11 +226,13 @@ fn main() {
     }
     let compact_s = t.elapsed().as_secs_f64();
     println!(
-        "compaction: {:.2}s ({:.0} rows/s) into {files} hourly files",
+        "compaction: {:.1}s ({:.0} rows/s) into {files} daily files",
         compact_s,
         rows as f64 / compact_s
     );
+    let t = Instant::now();
     conn.execute_batch("VACUUM").unwrap();
+    println!("silodb hot vacuum: {:.1}s", t.elapsed().as_secs_f64());
 
     // ---------- plain fully-hot indexed SQLite ----------
     let plain_db = out.join("plain.db");
@@ -208,38 +241,37 @@ fn main() {
     plain.pragma_update(None, "synchronous", "NORMAL").unwrap();
     plain
         .execute_batch(
-            "CREATE TABLE readings (ts INTEGER, seq INTEGER, value REAL, name TEXT);",
+            "CREATE TABLE readings (ts INTEGER, device TEXT, sensor TEXT, value REAL);",
         )
         .unwrap();
-    let plain_insert_s = insert_rows(&plain, "readings", rows);
+    let plain_insert_s = insert_rows(&plain, "readings", days);
     let t = Instant::now();
     plain
         .execute_batch("CREATE INDEX idx_readings_ts ON readings(ts)")
         .unwrap();
     let index_s = t.elapsed().as_secs_f64();
     println!(
-        "plain sqlite insert: {:.2}s, ts index build: {index_s:.2}s",
-        plain_insert_s
+        "plain sqlite insert: {plain_insert_s:.1}s, ts index build: {index_s:.1}s"
     );
-    plain.execute_batch("VACUUM").unwrap();
 
     // ---------- sizes ----------
     plain.pragma_update(None, "wal_checkpoint", "TRUNCATE").ok();
     conn.pragma_update(None, "wal_checkpoint", "TRUNCATE").ok();
-    let silo_total = std::fs::metadata(&silo_db).map(|m| m.len()).unwrap_or(0) + dir_size(&base);
+    let silo_hot = std::fs::metadata(&silo_db).map(|m| m.len()).unwrap_or(0);
+    let silo_cold = dir_size(&base);
     let plain_total = std::fs::metadata(&plain_db).map(|m| m.len()).unwrap_or(0);
     println!("\n## on-disk size");
     println!(
-        "- silodb: {:.1} MB  (hot.db {:.1} MB + parquet {:.1} MB)",
-        mb(silo_total),
-        mb(std::fs::metadata(&silo_db).map(|m| m.len()).unwrap_or(0)),
-        mb(dir_size(&base)),
+        "- silodb: {:.1} MB  (hot.db {:.1} MB + parquet {:.1} MB, {files} files)",
+        mb(silo_hot + silo_cold),
+        mb(silo_hot),
+        mb(silo_cold),
     );
     println!("- plain sqlite (+ts index): {:.1} MB", mb(plain_total));
 
     // ---------- queries ----------
     let duck_src = format!("read_parquet('{}/readings/*.parquet')", base.display());
-    let qs = build_queries(rows, "readings", &duck_src);
+    let qs = build_queries(days, "readings", &duck_src);
 
     let mut table_md = String::new();
     writeln!(table_md, "\n## query latency, median ms (min ms)\n").unwrap();
@@ -254,6 +286,7 @@ fn main() {
 
     for (i, (label, sqlite_sql, _)) in qs.queries.iter().enumerate() {
         let (silo_med, silo_min) = time_query(|| count_query(&conn, sqlite_sql));
+        let stats = silodb::last_scan_stats();
         let (plain_med, plain_min) = time_query(|| count_query(&plain, sqlite_sql));
         let duck = duck_times
             .as_ref()
@@ -264,12 +297,14 @@ fn main() {
             "| {label} | {silo_med:.1} ({silo_min:.1}) | {plain_med:.1} ({plain_min:.1}) | {duck} |"
         )
         .unwrap();
+        if let Some(s) = stats {
+            eprintln!(
+                "  [{label}] files {}/{} rg {}/{}",
+                s.scanned_files, s.total_files, s.scanned_row_groups, s.total_row_groups
+            );
+        }
     }
     println!("{table_md}");
-
-    if let Some(stats) = silodb::last_scan_stats() {
-        println!("(last silodb scan: {stats:?})");
-    }
 }
 
 /// Run each duckdb query 13 times (3 warmups) in one CLI session with
