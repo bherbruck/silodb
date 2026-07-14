@@ -315,8 +315,14 @@ SELECT * FROM readings WHERE ts > ...;          -- cursor serves hot ∪ cold
 `CREATE TABLE ... USING` is not SQLite grammar (verified: syntax error) and
 declared column types are inert text — no DDL hook exists short of the
 single-slot authorizer, which a library must not clobber. `VIRTUAL` is the
-entry fee for module-backed tables; `init_table` remains the zero-VIRTUAL
-front door for Rust hosts.
+entry fee for module-backed tables. Two zero-VIRTUAL front doors exist:
+`init_table` (Rust hosts) and the TimescaleDB-precedent SQL functions —
+`SELECT silodb_create_table(name, base, tiers)` converts a plain table in
+place (rename to `<name>_hot`, rows intact, policy validated before any
+DDL so failure never strands the table; idempotent on re-run) and
+`SELECT silodb_maintain(name, base, now_us)` runs the policy, returning
+the action count. Both registered `SQLITE_DIRECTONLY` — top-level SQL
+only, side effects can't hide in views or triggers.
 
 The FTS5 pattern: `tiers=` in the DDL turns the vtab into the whole
 system. `xCreate` creates the `<name>_data` shadow hot table (verbatim

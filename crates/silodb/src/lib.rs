@@ -125,6 +125,7 @@ pub fn load_module(conn: &Connection) -> rusqlite::Result<()> {
                 .ok_or_else(|| err("silodb_bucket: overflow or non-positive width".into()))
         })?;
     }
+    register_admin_functions(conn)?;
     Ok(())
 }
 
@@ -866,4 +867,109 @@ pub fn create_rollup_view(conn: &Connection, table: &str, grain: &str) -> Result
             .collect::<String>(),
     ))?;
     Ok(())
+}
+
+/// Register the Timescale-style admin functions (`create_hypertable`
+/// precedent) on a connection — the SQL-only front door:
+///
+/// ```sql
+/// CREATE TABLE readings (ts TIMESTAMP, device TEXT, value REAL);
+/// SELECT silodb_create_table('readings', 'cold/', '1d,7d,28d,retain=2y');
+/// SELECT silodb_maintain('readings', 'cold/', unixepoch()*1000000);
+/// ```
+///
+/// `silodb_create_table` converts a plain table **in place** — existing
+/// rows survive (they stay hot until maintenance ages them out), exactly
+/// like `create_hypertable`. Idempotent: converting an already-converted
+/// table just re-runs the idempotent init. `silodb_maintain` returns the
+/// number of actions taken.
+///
+/// Registered `SQLITE_DIRECTONLY`: callable only from top-level SQL,
+/// never from views/triggers — side effects don't hide.
+/// Called automatically by [`load_module`].
+fn register_admin_functions(conn: &Connection) -> rusqlite::Result<()> {
+    let flags = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DIRECTONLY;
+    conn.create_scalar_function("silodb_create_table", 3, flags, |ctx| {
+        let table: String = ctx.get(0)?;
+        let base: String = ctx.get(1)?;
+        let tiers: String = ctx.get(2)?;
+        let conn = unsafe { ctx.get_connection()? };
+        convert_table(&conn, &table, &base, &tiers)
+            .map_err(|e| rusqlite::Error::UserFunctionError(e.to_string().into()))?;
+        Ok(table)
+    })?;
+    conn.create_scalar_function("silodb_maintain", 3, flags, |ctx| {
+        let table: String = ctx.get(0)?;
+        let base: String = ctx.get(1)?;
+        let now: i64 = ctx.get(2)?;
+        let conn = unsafe { ctx.get_connection()? };
+        let actions = maintain(&conn, &table, &base, now)
+            .map_err(|e| rusqlite::Error::UserFunctionError(e.to_string().into()))?;
+        Ok(actions.len() as i64)
+    })?;
+    Ok(())
+}
+
+/// The `create_hypertable` move: turn a plain table into a silodb table
+/// in place. Renames `<table>` to `<table>_hot` (rows intact) and builds
+/// the standard surface around it.
+fn convert_table(
+    conn: &Connection,
+    table: &str,
+    base_dir: &str,
+    tiers: &str,
+) -> Result<(), InitError> {
+    // Validate the policy BEFORE any DDL — a bad tiers string must not
+    // leave the table stranded mid-rename.
+    catalog::parse_policy_string(table, tiers).map_err(InitError::BadSchema)?;
+    let kind: Option<String> = conn
+        .query_row(
+            "SELECT type FROM sqlite_master WHERE name = ?1 AND type IN ('table','view')",
+            [table],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let hot = format!("{table}_hot");
+    match kind.as_deref() {
+        // Plain table → rename to the hot slot, then init builds the rest.
+        Some("table") => {
+            let hot_exists: Option<i64> = conn
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE name = ?1",
+                    [&hot],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if hot_exists.is_some() {
+                return Err(InitError::BadSchema(format!(
+                    "both '{table}' and '{hot}' exist — ambiguous; move one aside"
+                )));
+            }
+            conn.execute_batch(&format!(
+                "ALTER TABLE {} RENAME TO {}",
+                quote_ident(table),
+                quote_ident(&hot)
+            ))?;
+        }
+        // Already converted (the single-name view) → idempotent re-init.
+        Some("view") => {}
+        Some(_) | None => {
+            return Err(InitError::BadSchema(format!(
+                "no table named '{table}' to convert"
+            )))
+        }
+    }
+    // Reconstruct the schema string from the hot table's verbatim decls.
+    let schema = conn
+        .prepare(&format!("PRAGMA table_info({})", quote_ident(&hot)))?
+        .query_map([], |r| {
+            Ok(format!(
+                "{} {}",
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+        .join(", ");
+    init_table_tiered(conn, table, &schema, base_dir, tiers)
 }
