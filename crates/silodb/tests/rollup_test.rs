@@ -271,6 +271,84 @@ fn tiered_rollup_recursion() {
 }
 
 #[test]
+fn two_grains_coexist_and_both_stay_exact() {
+    let e = env("1d,7d");
+    e.fill_days(0, 2);
+    e.maintain(2 * DAY + MARGIN + 1);
+    silodb::create_rollup(&e.conn, "readings", "1h").unwrap();
+    silodb::create_rollup(&e.conn, "readings", "4h").unwrap();
+    silodb::create_rollup_view(&e.conn, "readings", "1h").unwrap();
+    silodb::create_rollup_view(&e.conn, "readings", "4h").unwrap();
+
+    // More data through the forward path feeds BOTH accumulators.
+    e.fill_days(2, 1);
+    e.maintain(3 * DAY + MARGIN + 1);
+    e.assert_equivalent(0); // 1h view
+
+    // 4h view checked against raw at its own grain.
+    let (n_4h, sum_4h): (i64, f64) = e
+        .conn
+        .query_row(
+            "SELECT sum(value_count), sum(value_sum) FROM readings_4h",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    let (n_raw, sum_raw): (i64, f64) = e
+        .conn
+        .query_row("SELECT count(value), sum(value) FROM readings", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(n_4h, n_raw);
+    assert!((sum_4h - sum_raw).abs() <= 1e-9 * sum_raw.abs().max(1.0));
+}
+
+#[test]
+fn rollup_rows_follow_source_retention() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("cold");
+    let conn = Connection::open_in_memory().unwrap();
+    silodb::load_module(&conn).unwrap();
+    silodb::init_table_tiered(
+        &conn,
+        "readings",
+        "ts TIMESTAMP, device TEXT, value REAL",
+        &base,
+        "1d,7d,retain=7d",
+    )
+    .unwrap();
+    let e = Env {
+        conn,
+        base,
+        _dir: dir,
+    };
+    e.fill_days(0, 3);
+    e.maintain(3 * DAY + MARGIN + 1);
+    silodb::create_rollup(&e.conn, "readings", "1h").unwrap();
+    let before: i64 = e
+        .conn
+        .query_row("SELECT count(*) FROM readings_rollup_1h", [], |r| r.get(0))
+        .unwrap();
+    assert!(before > 0);
+
+    // Advance the clock past retention for days 0..2: raw files evict AND
+    // their rollup buckets are trimmed in the same maintain call.
+    let now = 10 * DAY + MARGIN + 1; // cutoff = day 3+: everything expires
+    e.maintain(now);
+    let after: i64 = e
+        .conn
+        .query_row("SELECT count(*) FROM readings_rollup_1h", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(after, 0, "rollup rows past retain trimmed with the raw data");
+    let raw: i64 = e
+        .conn
+        .query_row("SELECT count(*) FROM readings", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(raw, 0);
+}
+
+#[test]
 fn silodb_bucket_function_contract() {
     let conn = Connection::open_in_memory().unwrap();
     silodb::load_module(&conn).unwrap();
