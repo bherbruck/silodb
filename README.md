@@ -49,6 +49,7 @@ INSERT INTO readings VALUES (silodb_ts('2026-07-14T10:00:00Z'), 'boiler', 'temp'
 SELECT avg(value) FROM readings WHERE ts >= silodb_ts('2026-07-07') AND device = 'boiler';
 SELECT silodb_maintain('readings', unixepoch()*1000000);   -- on a timer
 SELECT silodb_set_default_dir('/mnt/sd/cold/');            -- db on flash, files on SD
+SELECT silodb_set_retention('readings', '2y');             -- add/change/clear anytime
 ```
 
 Or self-contained in one DDL statement (FTS5-style; the vtab owns a shadow

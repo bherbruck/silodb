@@ -1038,6 +1038,29 @@ fn register_admin_functions(conn: &Connection) -> rusqlite::Result<()> {
             .map_err(|e| rusqlite::Error::UserFunctionError(e.to_string().into()))?;
         Ok(actions.len() as i64)
     })?;
+    // silodb_set_retention(table, duration|NULL) — Timescale's
+    // add_retention_policy shape: separate from create, changeable
+    // anytime, NULL clears (keep forever).
+    conn.create_scalar_function("silodb_set_retention", 2, flags, |ctx| {
+        let table: String = ctx.get(0)?;
+        let retain: Option<String> = match ctx.get_raw(1) {
+            rusqlite::types::ValueRef::Null => None,
+            rusqlite::types::ValueRef::Text(t) => Some(
+                std::str::from_utf8(t)
+                    .map_err(|e| rusqlite::Error::UserFunctionError(e.into()))?
+                    .to_owned(),
+            ),
+            other => {
+                return Err(rusqlite::Error::UserFunctionError(
+                    format!("expected TEXT or NULL, got {}", other.data_type()).into(),
+                ))
+            }
+        };
+        let conn = unsafe { ctx.get_connection()? };
+        set_retention(&conn, &table, retain.as_deref())
+            .map_err(|e| rusqlite::Error::UserFunctionError(e.to_string().into()))?;
+        Ok(table)
+    })?;
     conn.create_scalar_function("silodb_set_default_dir", 1, flags, |ctx| {
         let dir: String = ctx.get(0)?;
         let conn = unsafe { ctx.get_connection()? };
@@ -1111,4 +1134,41 @@ fn convert_table(
         .collect::<Result<Vec<_>, _>>()?
         .join(", ");
     init_impl(conn, table, &schema, tiers, base_dir, ts_column)
+}
+
+/// Set (or clear, with `None`) a table's retention — the
+/// `add_retention_policy` precedent: retention is its own policy call,
+/// not part of table creation, and unlike origin/tiers it is safe to
+/// change at any time (it never affects window alignment). The next
+/// [`maintain`] applies it. `retain` must be at least the largest tier
+/// window (files merge into windows that must be evictable whole).
+///
+/// The `retain=` element of the create-time policy string keeps working;
+/// this call overrides it.
+pub fn set_retention(
+    conn: &Connection,
+    table: &str,
+    retain: Option<&str>,
+) -> Result<(), InitError> {
+    let bad = InitError::BadSchema;
+    let mut policy = catalog::get_policy(conn, table)?
+        .ok_or_else(|| bad(format!("no policy for '{table}' — init/create it first")))?;
+    policy.retain_us = match retain {
+        None => None,
+        Some(dur) => {
+            let us = silodb_schema::parse_duration_micros(dur)
+                .ok_or_else(|| bad(format!("bad retention duration '{dur}'")))?;
+            let largest = *policy.tiers_us.last().expect("validated at create");
+            if us < largest {
+                return Err(bad(format!(
+                    "retention '{dur}' is shorter than the largest tier window — \
+                     files merge into windows bigger than the retention period \
+                     and could never be evicted whole"
+                )));
+            }
+            Some(us)
+        }
+    };
+    catalog::set_policy(conn, &policy)?;
+    Ok(())
 }

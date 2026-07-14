@@ -256,7 +256,12 @@ silodb::maintain(&conn, "readings", "cold/", now_us)?;  // timer + boot
   The ts column follows `create_hypertable` precedent: slot #2 of
   `silodb_create_table(table[, ts[, tiers[, dir]]])`, NULL/omitted =
   inference (one TIMESTAMP column, else INTEGER `ts`).
-- **Retention** is one more element of the same policy string:
+- **Retention is its own policy call** (the `add_retention_policy`
+  precedent): `set_retention(conn, table, Some("2y"))` /
+  `SELECT silodb_set_retention('readings', '2y')` — changeable at any
+  time (it never affects window alignment; the next `maintain` applies
+  it), `None`/NULL clears. Must be ≥ the largest tier window. The
+  create-time string element below still works as compact shorthand:
   `"1d,7d,28d,retain=2y"`. `maintain` flips active files entirely older
   than `now − retain` to `status='evicted'` (whole-file granularity — a
   straddling file survives until all of it has expired) and the same GC

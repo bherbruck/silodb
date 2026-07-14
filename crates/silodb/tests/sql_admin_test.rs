@@ -184,3 +184,65 @@ fn default_dir_chain() {
         .to_string();
     assert!(err.contains("no base directory"), "{err}");
 }
+
+#[test]
+fn retention_is_a_separate_changeable_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("hot.db");
+    let conn = Connection::open(&db).unwrap();
+    silodb::load_module(&conn).unwrap();
+    conn.execute_batch("CREATE TABLE r (ts TIMESTAMP, v REAL)").unwrap();
+    conn.query_row("SELECT silodb_create_table('r', NULL, '1d,7d')", [], |r| {
+        r.get::<_, String>(0)
+    })
+    .unwrap();
+    // No retention at create.
+    assert_eq!(
+        silodb::catalog::get_policy(&conn, "r").unwrap().unwrap().retain_us,
+        None
+    );
+
+    // Two weeks of data, compacted.
+    for h in 0..14 * 24 {
+        conn.execute("INSERT INTO r VALUES (?1, 1.0)", params![h * HOUR])
+            .unwrap();
+    }
+    let now = 15 * DAY;
+    silodb::maintain(&conn, "r", now).unwrap();
+    let before: i64 = conn
+        .query_row("SELECT count(*) FROM r", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(before, 14 * 24);
+
+    // Retroactively add retention (Timescale add_retention_policy style):
+    // the very next maintain evicts the expired week.
+    conn.query_row("SELECT silodb_set_retention('r', '7d')", [], |r| {
+        r.get::<_, String>(0)
+    })
+    .unwrap();
+    silodb::maintain(&conn, "r", now).unwrap();
+    let after: i64 = conn
+        .query_row("SELECT count(*) FROM r", [], |r| r.get(0))
+        .unwrap();
+    assert!(after < before, "expired data evicted: {after} < {before}");
+
+    // Clear it (NULL = keep forever); nothing further evicts.
+    conn.query_row("SELECT silodb_set_retention('r', NULL)", [], |r| {
+        r.get::<_, String>(0)
+    })
+    .unwrap();
+    silodb::maintain(&conn, "r", now + 300 * DAY).unwrap();
+    let kept: i64 = conn
+        .query_row("SELECT count(*) FROM r", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(kept, after, "cleared retention keeps everything");
+
+    // Shorter than the largest tier is refused.
+    let err = conn
+        .query_row("SELECT silodb_set_retention('r', '3d')", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("largest tier"), "{err}");
+}
