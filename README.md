@@ -74,6 +74,22 @@ immutable (retention deletes data, DDL never does). These SQL forms are
 what the future loadable extension exposes to Python / Node / the
 `sqlite3` CLI with zero Rust.
 
+## Or: run it as a server
+
+A standalone HTTP layer (not part of the core — the engine stays an
+embeddable library) lives in [`crates/silodb-server`](crates/silodb-server):
+full SQL over `POST /sql`, InfluxDB line protocol with autoschema over
+`POST /write`, three bearer-token roles (readonly / readwrite / ddl)
+enforced inside SQLite itself, and background maintenance on a timer.
+
+```sh
+docker compose up   # tokens via .env; data in ./data
+curl -s 'localhost:8080/write?precision=s' -H "Authorization: Bearer $DDL" \
+  --data-binary 'weather,city=SF temp=21.5,humidity=40i 1752451200'
+curl -s localhost:8080/sql -H "Authorization: Bearer $RO" \
+  -d '{"sql": "SELECT city, avg(temp) FROM weather GROUP BY 1"}'
+```
+
 ## How the tiers work
 
 ![tiered compaction](docs/tiers.svg)

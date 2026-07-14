@@ -1,0 +1,7 @@
+target/
+fuzz/target/
+data/
+.git/
+*.db
+*.db-wal
+*.db-shm

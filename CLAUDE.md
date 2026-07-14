@@ -77,6 +77,13 @@ scope at all. Symmetrically, `silodb-catalog` must never depend on
   depend on directly — it should never need to reach into `silodb-vtab` or
   `silodb-compact` internals itself.
 
+- **`silodb-server`** — standalone HTTP layer (axum): `POST /sql`,
+  InfluxDB line protocol `POST /write` with autoschema, three bearer-token
+  roles enforced at the SQLite level (read-only connections / authorizer),
+  background maintain loop. **Not part of the core** — it depends on the
+  `silodb` facade only, and no engine crate may ever depend on it or know
+  it exists. The repo-root Dockerfile/compose.yml build this crate.
+
 ## Workspace layout
 
 ```
@@ -92,6 +99,7 @@ silodb/
     silodb-compact/
     silodb-loadable/
     silodb/
+    silodb-server/         # HTTP layer on top — never a dependency of core
   fixtures/
     *.parquet              # shared hand-built test files — regenerate with
                             # `cargo run --manifest-path fixtures/gen/Cargo.toml`,

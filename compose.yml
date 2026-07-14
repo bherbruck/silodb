@@ -1,0 +1,18 @@
+services:
+  silodb:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      # hot.db + its .silodb/ parquet directory live together here
+      - ./data:/data
+    environment:
+      # A role with no token is disabled; at least one must be set.
+      SILODB_READONLY_TOKEN: ${SILODB_READONLY_TOKEN:-}
+      SILODB_READWRITE_TOKEN: ${SILODB_READWRITE_TOKEN:-}
+      SILODB_DDL_TOKEN: ${SILODB_DDL_TOKEN:?set SILODB_DDL_TOKEN (e.g. in .env)}
+      # Policy for tables auto-created by line-protocol writes.
+      SILODB_DEFAULT_TIERS: ${SILODB_DEFAULT_TIERS:-1d}
+      # Background maintenance interval (seconds; 0 disables).
+      SILODB_MAINTAIN_SECS: ${SILODB_MAINTAIN_SECS:-60}
+    restart: unless-stopped
