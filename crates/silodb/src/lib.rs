@@ -388,6 +388,12 @@ fn init_impl(
         Some(dir) if !dir.is_empty() => dir.to_owned(),
         _ => resolve_base_dir(conn, explicit_dir)?,
     };
+    // Boot-time re-init must not clobber a retention set later via
+    // set_retention(): an explicit retain= in the string wins, an absent
+    // one preserves what's stored.
+    policy.retain_us = policy
+        .retain_us
+        .or(existing.as_ref().and_then(|e| e.retain_us));
     policy.ts_column = ts_column
         .map(str::to_owned)
         .or(existing.and_then(|e| e.ts_column));

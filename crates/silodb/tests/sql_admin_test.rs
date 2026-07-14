@@ -246,3 +246,38 @@ fn retention_is_a_separate_changeable_policy() {
         .to_string();
     assert!(err.contains("largest tier"), "{err}");
 }
+
+#[test]
+fn boot_reinit_preserves_function_set_retention() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("hot.db");
+    let boot = || {
+        let conn = Connection::open(&db).unwrap();
+        silodb::load_module(&conn).unwrap();
+        silodb::init_table_tiered(&conn, "r", "ts TIMESTAMP, v REAL", "1d,7d").unwrap();
+        conn
+    };
+    let conn = boot();
+    silodb::set_retention(&conn, "r", Some("2y")).unwrap();
+    drop(conn);
+
+    // Next boot re-runs the same init (its string has no retain=): the
+    // function-set retention must survive.
+    let conn = boot();
+    let p = silodb::catalog::get_policy(&conn, "r").unwrap().unwrap();
+    assert_eq!(
+        p.retain_us,
+        silodb_schema::parse_duration_micros("2y"),
+        "boot re-init preserved set_retention"
+    );
+    // And set_retention is idempotent: same call, same state, no error.
+    silodb::set_retention(&conn, "r", Some("2y")).unwrap();
+    silodb::set_retention(&conn, "r", Some("2y")).unwrap();
+    let p2 = silodb::catalog::get_policy(&conn, "r").unwrap().unwrap();
+    assert_eq!(p.retain_us, p2.retain_us);
+
+    // Explicit retain= in the string still wins over the stored value.
+    silodb::init_table_tiered(&conn, "r", "ts TIMESTAMP, v REAL", "1d,7d,retain=30d").unwrap();
+    let p3 = silodb::catalog::get_policy(&conn, "r").unwrap().unwrap();
+    assert_eq!(p3.retain_us, silodb_schema::parse_duration_micros("30d"));
+}
