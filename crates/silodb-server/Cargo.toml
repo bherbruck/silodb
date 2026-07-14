@@ -8,6 +8,7 @@ axum = "0.8.9"
 rusqlite = { version = "0.40.1", features = ["bundled", "hooks"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
+serde_urlencoded = "0.7.1"
 silodb = { version = "0.1.0", path = "../silodb" }
 tokio = { version = "1.52.3", features = ["full"] }
 

@@ -77,6 +77,32 @@ curl -s 'localhost:8080/write?precision=s' \
 - `?precision=ns|us|ms|s` (default `ns`); missing timestamp = server now
 - one request = one transaction: all lines land or none do
 
+## Grafana — no plugin, no Infinity: it *is* an InfluxDB (to Grafana)
+
+silodb-server emulates the InfluxDB 1.x query API (`/ping`, `/query`
+with the InfluxQL subset Grafana emits), so **stock Grafana's core
+InfluxDB datasource works as-is** — visual query builder, measurement/
+tag/field autocomplete, template variables, the lot:
+
+- Datasource type **InfluxDB**, query language **InfluxQL**, URL
+  `http://silodb:8080`, any username, **password = a silodb token**
+  (readonly is the right one for dashboards).
+- The builder's dropdowns come from `SHOW MEASUREMENTS` / `SHOW TAG
+  KEYS` / `SHOW FIELD KEYS` / `SHOW TAG VALUES`, answered from the
+  engine's policy table and hot-table schema (tags = TEXT columns,
+  fields = REAL/INTEGER — the same mapping `/write` autoschema uses,
+  reversed).
+- Panel queries translate to engine SQL — `GROUP BY time(30s)` becomes
+  `silodb_bucket(...)`, so bucketing agrees with rollups by construction.
+  Supported: `mean/sum/min/max/count/first/last/spread`, tag filters
+  (`=`, `!=`, and Grafana's multi-value `=~ /^(a|b)$/`), `fill(null|
+  none|0)`, `ORDER BY time DESC`, `LIMIT`, multi-statement `;`.
+- Anything outside that subset returns a clear inline error naming what
+  is supported (influx-style: HTTP 200, error in the result element).
+
+`docker compose --profile grafana up` starts Grafana on :3000 with the
+datasource already provisioned (see `grafana/provisioning/`).
+
 ## `GET /health`
 
 ```

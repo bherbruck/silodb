@@ -4,8 +4,12 @@ services:
     ports:
       - "8080:8080"
     volumes:
-      # hot.db + its .silodb/ parquet directory live together here
-      - ./data:/data
+      # hot.db + its .silodb/ parquet directory live together here.
+      # A named volume works with the image's non-root user out of the
+      # box; to keep the files visible on the host (e.g. to point DuckDB
+      # straight at the parquet), bind-mount instead:
+      #   - ./data:/data     (then: mkdir -p data && sudo chown 65532 data)
+      - silodb-data:/data
     environment:
       # A role with no token is disabled; at least one must be set.
       SILODB_READONLY_TOKEN: ${SILODB_READONLY_TOKEN:-}
@@ -16,3 +20,25 @@ services:
       # Background maintenance interval (seconds; 0 disables).
       SILODB_MAINTAIN_SECS: ${SILODB_MAINTAIN_SECS:-60}
     restart: unless-stopped
+
+  # Optional: Grafana with silodb pre-wired as an InfluxDB datasource
+  # (silodb-server emulates the InfluxDB 1.x query API — the core plugin,
+  # visual builder and autocomplete included, works out of the box).
+  # Start with: docker compose --profile grafana up
+  grafana:
+    image: grafana/grafana:latest
+    profiles: [grafana]
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    environment:
+      SILODB_READONLY_TOKEN: ${SILODB_READONLY_TOKEN:?the datasource needs the readonly token}
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+    depends_on:
+      - silodb
+    restart: unless-stopped
+
+volumes:
+  silodb-data:

@@ -34,27 +34,62 @@ impl Tokens {
         self.readonly.is_some() || self.readwrite.is_some() || self.ddl.is_some()
     }
 
-    /// Resolve the request's role from its `Authorization: Bearer` header.
+    /// Resolve the request's role from its `Authorization` header —
+    /// `Bearer <token>`, or `Basic` where the token rides in the password
+    /// slot (how Grafana's InfluxDB datasource sends credentials; the
+    /// username is ignored).
     pub fn role(&self, headers: &HeaderMap) -> Option<Role> {
-        let presented = headers
-            .get("authorization")?
-            .to_str()
-            .ok()?
-            .strip_prefix("Bearer ")?
-            .trim();
+        let auth = headers.get("authorization")?.to_str().ok()?;
+        if let Some(bearer) = auth.strip_prefix("Bearer ") {
+            return self.role_for_secret(bearer.trim());
+        }
+        if let Some(b64) = auth.strip_prefix("Basic ") {
+            let decoded = base64_decode(b64.trim())?;
+            let creds = String::from_utf8(decoded).ok()?;
+            let secret = creds.split_once(':').map(|(_, p)| p).unwrap_or(&creds);
+            return self.role_for_secret(secret);
+        }
+        None
+    }
+
+    /// Match a bare secret (query-param `p=`, basic-auth password) to a
+    /// role, highest privilege first.
+    pub fn role_for_secret(&self, secret: &str) -> Option<Role> {
         for (tok, role) in [
             (&self.ddl, Role::Ddl),
             (&self.readwrite, Role::ReadWrite),
             (&self.readonly, Role::ReadOnly),
         ] {
             if let Some(t) = tok
-                && ct_eq(t, presented)
+                && ct_eq(t, secret)
             {
                 return Some(role);
             }
         }
         None
     }
+}
+
+/// Minimal base64 (standard alphabet, `=` padding) — one header field
+/// isn't worth a dependency.
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    const ALPHA: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let mut acc: u32 = 0;
+    let mut bits = 0;
+    for c in s.bytes() {
+        if c == b'=' {
+            break;
+        }
+        let v = ALPHA.iter().position(|&a| a == c)? as u32;
+        acc = (acc << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
 }
 
 /// Constant-time comparison — token checks must not leak length-of-match

@@ -13,6 +13,8 @@
 
 pub mod auth;
 pub mod db;
+pub mod influx;
+pub mod influxql;
 pub mod lineproto;
 
 use auth::{Role, Tokens};
@@ -128,7 +130,79 @@ pub fn app(state: AppState) -> Router {
         .route("/sql", post(sql_handler))
         .route("/write", post(write_handler))
         .route("/health", get(health_handler))
+        // InfluxDB 1.x lookalike — stock Grafana's core InfluxDB
+        // datasource (InfluxQL) points here, builder autocomplete and all.
+        .route("/ping", get(influx_ping).head(influx_ping))
+        .route("/query", get(influx_query).post(influx_query))
         .with_state(state)
+}
+
+async fn influx_ping() -> impl IntoResponse {
+    (
+        StatusCode::NO_CONTENT,
+        [("X-Influxdb-Version", "1.8.10-silodb")],
+    )
+}
+
+/// InfluxDB 1.x `/query`: `q=` holds semicolon-separated InfluxQL,
+/// `epoch=` the output time unit. Read-only by construction — every
+/// statement runs on the reader pool regardless of role.
+async fn influx_query(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+    body: String,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut params: BTreeMap<String, String> = query
+        .as_deref()
+        .and_then(|q| serde_urlencoded::from_str(q).ok())
+        .unwrap_or_default();
+    // POST form body (Grafana uses it for long queries) — query-string
+    // params win on conflict.
+    if !body.is_empty()
+        && let Ok(form) = serde_urlencoded::from_str::<BTreeMap<String, String>>(&body)
+    {
+        for (k, v) in form {
+            params.entry(k).or_insert(v);
+        }
+    }
+    // Header auth (Bearer / Basic password), else influx-classic u/p.
+    let role = state
+        .tokens
+        .role(&headers)
+        .or_else(|| params.get("p").and_then(|p| state.tokens.role_for_secret(p)));
+    if role.is_none() {
+        return Err(ApiError(StatusCode::UNAUTHORIZED, "unauthorized".into()));
+    }
+    let q = params
+        .get("q")
+        .cloned()
+        .ok_or_else(|| bad_request("missing q parameter"))?;
+    let epoch = influx::Epoch::parse(params.get("epoch").map(String::as_str))
+        .ok_or_else(|| bad_request("bad epoch (ns|us|ms|s|rfc3339)"))?;
+    let now = now_micros();
+    let max_rows = state.max_rows;
+
+    state
+        .readers
+        .get()
+        .run(move |conn| {
+            let mut results = Vec::new();
+            for (i, stmt_text) in influxql::split_statements(&q).into_iter().enumerate() {
+                let outcome = influxql::parse(&stmt_text, now)
+                    .map_err(|e| e.to_string())
+                    .and_then(|stmt| influx::execute(conn, &stmt, epoch, max_rows));
+                results.push(match outcome {
+                    Ok(series) if series.as_array().is_some_and(|s| s.is_empty()) => {
+                        json!({ "statement_id": i })
+                    }
+                    Ok(series) => json!({ "statement_id": i, "series": series }),
+                    Err(e) => json!({ "statement_id": i, "error": e }),
+                });
+            }
+            Ok(Json(json!({ "results": results })))
+        })
+        .await
 }
 
 /// Background maintenance: every `secs`, run `maintain(now)` on every

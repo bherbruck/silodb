@@ -1,0 +1,19 @@
+# Provisioned datasource: stock Grafana's core InfluxDB (InfluxQL)
+# plugin, pointed at silodb-server's /query lookalike. The readonly
+# token rides in the password slot (Grafana sends it as basic auth).
+apiVersion: 1
+
+datasources:
+  - name: silodb
+    uid: silodb
+    type: influxdb
+    access: proxy
+    url: http://silodb:8080
+    isDefault: true
+    database: silodb
+    user: grafana
+    jsonData:
+      dbName: silodb
+      httpMode: GET
+    secureJsonData:
+      password: $SILODB_READONLY_TOKEN
