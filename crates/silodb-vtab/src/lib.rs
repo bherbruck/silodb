@@ -98,6 +98,10 @@ pub struct ScanStats {
     /// Candidate files whose footer came from the `(path, mtime, size)`
     /// cache instead of being re-parsed.
     pub metadata_cache_hits: usize,
+    /// Candidate files skipped because the per-file series statistics
+    /// prove they hold no rows for the queried series (EQ constraints on
+    /// series columns).
+    pub series_pruned_files: usize,
 }
 
 thread_local! {
@@ -421,7 +425,23 @@ unsafe impl<'vtab> VTab<'vtab> for SiloTab {
                 continue;
             }
             let col = constraint.column();
-            if col < 0 || prunable_class(self.schema.field(col as usize).data_type()).is_none() {
+            if col < 0 {
+                continue;
+            }
+            let dt = self.schema.field(col as usize).data_type();
+            let is_eq = matches!(
+                constraint.operator(),
+                IndexConstraintOp::SQLITE_INDEX_CONSTRAINT_EQ
+            );
+            // Numeric/timestamp columns take every range op (stats
+            // pruning); TEXT columns take EQ only, feeding per-file
+            // series pruning.
+            let text_eq = is_eq
+                && matches!(
+                    dt,
+                    DataType::Utf8 | DataType::LargeUtf8
+                );
+            if prunable_class(dt).is_none() && !text_eq {
                 continue;
             }
             let op = match constraint.operator() {
@@ -501,6 +521,7 @@ struct Pushed {
 enum PushedValue {
     Int(i64),
     Real(f64),
+    Text(String),
 }
 
 /// Split `idx_str` into (colUsed mask, constraint list).
@@ -543,11 +564,75 @@ fn decode_pushed(constraints: &str, args: &Filters<'_>) -> Result<Vec<Pushed>> {
         let value = match value {
             ValueRef::Integer(i) => PushedValue::Int(i),
             ValueRef::Real(f) => PushedValue::Real(f),
+            ValueRef::Text(t) => match std::str::from_utf8(t) {
+                Ok(s) => PushedValue::Text(s.to_owned()),
+                Err(_) => continue,
+            },
             _ => continue,
         };
         out.push(Pushed { col, op, value });
     }
     Ok(out)
+}
+
+/// Paths that HAVE stats rows but NONE matching every EQ constraint —
+/// provably empty for the queried series. Errors and missing tables
+/// degrade to "prune nothing".
+fn series_pruned_paths(
+    hot: &Connection,
+    logical_table: &str,
+    eqs: &[(&str, &PushedValue)],
+) -> Result<std::collections::HashSet<String>> {
+    let stats_table = format!("{logical_table}_stats");
+    let exists: i64 = hot
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [&stats_table],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if exists == 0 {
+        return Ok(Default::default());
+    }
+    // Only constraints on columns the stats table actually has (series
+    // columns) participate; unknown columns would be SQL errors.
+    let stat_cols: std::collections::HashSet<String> = hot
+        .prepare("SELECT name FROM pragma_table_info(?1)")?
+        .query_map([&stats_table], |r| r.get::<_, String>(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+    let usable: Vec<&(&str, &PushedValue)> =
+        eqs.iter().filter(|(n, _)| stat_cols.contains(*n)).collect();
+    if usable.is_empty() {
+        return Ok(Default::default());
+    }
+
+    let quote = |n: &str| format!("\"{}\"", n.replace('"', "\"\""));
+    let preds = usable
+        .iter()
+        .enumerate()
+        .map(|(i, (n, _))| format!("{} = ?{}", quote(n), i + 1))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let params: Vec<rusqlite::types::Value> = usable
+        .iter()
+        .map(|(_, v)| match v {
+            PushedValue::Int(i) => rusqlite::types::Value::Integer(*i),
+            PushedValue::Text(s) => rusqlite::types::Value::Text(s.clone()),
+            PushedValue::Real(f) => rusqlite::types::Value::Real(*f),
+        })
+        .collect();
+
+    // Files with stats minus files with a matching series row.
+    let mut stmt = hot.prepare(&format!(
+        "SELECT DISTINCT path FROM {st}
+         WHERE path NOT IN (SELECT path FROM {st} WHERE {preds})",
+        st = quote(&stats_table),
+    ))?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params), |r| {
+        r.get::<_, String>(0)
+    })?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
 }
 
 /// Inclusive [lo, hi] bounds on the timestamp column implied by the pushed
@@ -627,6 +712,9 @@ fn row_group_may_match(rg: &RowGroupMetaData, schema: &SchemaRef, pushed: &[Push
             // Real-valued constraint against an INTEGER column: i64→f64 is
             // lossy above 2^53 (e.g. nanosecond timestamps), so don't prune.
             (PruneClass::Int, PushedValue::Real(_)) => true,
+            // Text constraints don't participate in row-group stats pruning
+            // (they exist for file-level series pruning).
+            (_, PushedValue::Text(_)) => true,
         }
     })
 }
@@ -746,6 +834,26 @@ unsafe impl VTabCursor for SiloCursor<'_> {
         };
         drop(hot);
 
+        // Layer 1.5: per-file series statistics. EQ constraints on series
+        // columns skip whole files that provably hold no rows for that
+        // series — before any footer work. Conservative: a file with no
+        // stats rows at all (pre-upgrade data, not yet healed by
+        // maintain()) is kept.
+        let series_skip: std::collections::HashSet<String> = {
+            let eqs: Vec<(&str, &PushedValue)> = pushed
+                .iter()
+                .filter(|p| p.op == 'E' && Some(p.col) != vtab.ts_col)
+                .filter(|p| matches!(p.value, PushedValue::Text(_) | PushedValue::Int(_)))
+                .map(|p| (vtab.schema.field(p.col).name().as_str(), &p.value))
+                .collect();
+            if eqs.is_empty() || candidates.is_empty() {
+                Default::default()
+            } else {
+                series_pruned_paths(&vtab.hot_db()?, &vtab.logical_table, &eqs)
+                    .unwrap_or_default()
+            }
+        };
+
         // Layer 2: row-group pruning within each candidate (Phase 2 logic).
         let mut stats = ScanStats {
             total_files,
@@ -754,6 +862,10 @@ unsafe impl VTabCursor for SiloCursor<'_> {
         };
         let mut files = Vec::new();
         for entry in &candidates {
+            if series_skip.contains(&entry.path) {
+                stats.series_pruned_files += 1;
+                continue;
+            }
             let path = PathBuf::from(&entry.path);
             let (meta, cache_hit) = vtab.file_meta(&path)?;
             stats.metadata_cache_hits += usize::from(cache_hit);

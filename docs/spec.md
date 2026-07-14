@@ -300,6 +300,30 @@ silodb::create_rollup_view(&conn, "readings", "1h")?;  // real-time view reading
   namespace; integer-µs semantics). Admin stays Rust-API; a SQL admin
   surface waits for the loadable extension.
 
+## Per-(file, series) statistics (always-on)
+
+Every compaction and merge also writes one row per (cold file, series)
+into `<table>_stats` — `count/sum/sumsq/min/max` per REAL column — from
+the stream it's already making, committed in the same transaction. Rows
+die with their file (merge supersede, retention evict). This is a
+series-aware zone map (à la Iceberg per-file column stats), and it buys:
+
+- **Series-aware file pruning**: EQ constraints on series columns (TEXT
+  or INTEGER) are pushed into `xBestIndex` and, before any footer work,
+  files whose stats prove they hold no rows for the queried series are
+  skipped (`ScanStats::series_pruned_files`). For sparse series this beats
+  time pruning outright. Conservative on missing stats: a file with no
+  stats rows (pre-upgrade data) is kept, and `maintain()` self-heals by
+  backfilling stats for such files once.
+- **Free whole-chunk aggregates**: an aggregate fully covering a file is
+  one stats-row read — query `<table>_stats` (joinable with the catalog
+  for ranges); only range-edge files need real reads. Like rollups, this
+  is an explicit surface — SQLite does not auto-rewrite aggregates.
+
+Cost is bounded by *active file count* × series (~1.4k rows/year after
+tiering) — effectively free forever, which is why it's always-on rather
+than opt-in, unlike grain rollups.
+
 ## Type & timestamp mapping (`silodb-schema`)
 
 Single source of truth for both directions; never depends on `rusqlite`.

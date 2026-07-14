@@ -607,7 +607,10 @@ pub fn maintain(
     // Before promotions, so soon-to-die data isn't pointlessly merged.
     if let Some(retain) = policy.retain_us {
         let retain_cutoff = now_us.saturating_sub(retain);
-        for e in catalog::evict_older_than(conn, table, retain_cutoff)? {
+        let evicted = catalog::evict_older_than(conn, table, retain_cutoff)?;
+        let evicted_paths: Vec<String> = evicted.iter().map(|e| e.path.clone()).collect();
+        silodb_compact::delete_stats_for_paths(conn, table, &evicted_paths)?;
+        for e in evicted {
             actions.push(MaintainAction::Evicted {
                 window: (e.range_start, e.range_end),
                 path: e.path,
@@ -661,6 +664,12 @@ pub fn maintain(
                 silodb_compact::MergeOutcome::NothingToMerge => {}
             }
         }
+    }
+
+    // --- self-heal: per-file series stats for files that predate them ---
+    // (upgrade path; bounded by the active file count, once per file ever.)
+    if hot_exists.is_some() {
+        let _ = silodb_compact::stats_backfill_missing(conn, table, &hot);
     }
 
     // --- GC superseded + evicted files ---------------------------------

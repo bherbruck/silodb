@@ -374,9 +374,12 @@ pub fn compact_bucket(
     let mut total_rows = 0usize;
 
     // Registered continuous aggregates get their deltas computed from this
-    // same stream and committed in this compaction's transaction.
+    // same stream and committed in this compaction's transaction; per-file
+    // series statistics are always-on.
     let plans = rollup_plans(conn, spec.logical_table, &columns, ts_idx)?;
     let mut accs: Vec<RollupAcc<'_>> = plans.iter().map(RollupAcc::new).collect();
+    let stats_plan = FileStatsPlan::new(spec.logical_table, &columns, ts_idx);
+    let mut stats_acc = FileStatsAcc::new(&stats_plan);
     let mut row_vals: Vec<Value> = Vec::with_capacity(columns.len());
 
     let write_result: Result<usize> = (|| {
@@ -384,23 +387,18 @@ pub fn compact_bucket(
         loop {
             let row = rows.next()?;
             if let Some(row) = row {
-                if accs.is_empty() {
-                    for (i, (buf, col)) in bufs.iter_mut().zip(&columns).enumerate() {
-                        buf.push(&col.name, row.get::<_, Value>(i)?)?;
-                    }
-                } else {
-                    row_vals.clear();
-                    for i in 0..columns.len() {
-                        row_vals.push(row.get::<_, Value>(i)?);
-                    }
-                    for acc in &mut accs {
-                        acc.add_row(&row_vals)?;
-                    }
-                    for (buf, (col, v)) in
-                        bufs.iter_mut().zip(columns.iter().zip(row_vals.drain(..)))
-                    {
-                        buf.push(&col.name, v)?;
-                    }
+                row_vals.clear();
+                for i in 0..columns.len() {
+                    row_vals.push(row.get::<_, Value>(i)?);
+                }
+                stats_acc.add_row(&row_vals);
+                for acc in &mut accs {
+                    acc.add_row(&row_vals)?;
+                }
+                for (buf, (col, v)) in
+                    bufs.iter_mut().zip(columns.iter().zip(row_vals.drain(..)))
+                {
+                    buf.push(&col.name, v)?;
                 }
                 buffered += 1;
                 total_rows += 1;
@@ -477,11 +475,13 @@ pub fn compact_bucket(
                 status: "active".into(),
             },
         )?;
-        // Rollup deltas commit with the migration: exact by construction,
-        // no invalidation machinery — every row enters cold exactly once.
+        // Rollup deltas + file stats commit with the migration: exact by
+        // construction, no invalidation machinery — every row enters cold
+        // exactly once.
         for acc in accs {
             acc.flush(conn)?;
         }
+        stats_acc.flush(conn, &out_str)?;
         Ok(())
     })();
     match txn {
@@ -566,6 +566,17 @@ pub fn merge_window(
         std::path::PathBuf::from(p)
     };
 
+    // Stats plan from the first child's footer (all children share the
+    // writer's schema; mismatches error below anyway).
+    let stats_plan = {
+        use parquet::arrow::arrow_reader::ArrowReaderMetadata;
+        let f = File::open(&children[0].path)?;
+        let meta = ArrowReaderMetadata::load(&f, Default::default())?;
+        let (decls, ts) = decls_from_arrow(meta.schema());
+        FileStatsPlan::new(logical_table, &decls, ts)
+    };
+    let mut stats_acc = FileStatsAcc::new(&stats_plan);
+
     let write_result: Result<usize> = (|| {
         use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
         let mut writer: Option<ArrowWriter<File>> = None;
@@ -604,6 +615,7 @@ pub fn merge_window(
                     }
                 };
                 total_rows += batch.num_rows();
+                stats_acc.add_batch(&batch);
                 w.write(&batch)?;
             }
         }
@@ -649,6 +661,10 @@ pub fn merge_window(
         for c in &children {
             silodb_catalog::supersede_entry(conn, logical_table, &c.path)?;
         }
+        // The merged file's stats replace its children's, atomically.
+        let child_paths: Vec<String> = children.iter().map(|c| c.path.clone()).collect();
+        delete_stats_for_paths(conn, logical_table, &child_paths)?;
+        stats_acc.flush(conn, &out_path.display().to_string())?;
         Ok(())
     })();
     match txn {
@@ -973,4 +989,317 @@ pub fn rollup_backfill(
         }
     }
     acc.flush(conn)
+}
+
+// --- per-(file, series) statistics -----------------------------------------
+
+/// Always-on file statistics: one row per (cold file, series) in
+/// `<logical_table>_stats`, holding count/sum/sumsq/min/max for every REAL
+/// column. Computed for free from the compaction/merge streams, committed
+/// in their transactions, and deleted when the file leaves `active`.
+///
+/// Two things they buy: series-aware file pruning in the vtab (a query
+/// filtering on a series column skips files with no rows for it), and
+/// free whole-file aggregates — an aggregate that fully covers a chunk is
+/// one stats-row read, no parquet.
+pub struct FileStatsPlan {
+    pub stats_table: String,
+    group_idxs: Vec<usize>,
+    agg_idxs: Vec<usize>,
+    ddl: String,
+    insert_sql: String,
+}
+
+/// Name of the stats table for a logical table.
+pub fn stats_table_name(logical_table: &str) -> String {
+    format!("{logical_table}_stats")
+}
+
+/// Reconstruct the column classification from an Arrow schema of a file we
+/// wrote: the bucket axis is the (unique) **non-nullable** Timestamp field
+/// (`bucket_arrow_schema` guarantees that), Float64 fields aggregate,
+/// everything else is series identity.
+fn decls_from_arrow(
+    schema: &arrow::datatypes::Schema,
+) -> (Vec<silodb_schema::ColumnDecl>, usize) {
+    let mut ts_idx = 0;
+    let decls: Vec<silodb_schema::ColumnDecl> = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            let is_axis = matches!(f.data_type(), arrow::datatypes::DataType::Timestamp(_, _))
+                && !f.is_nullable();
+            if is_axis {
+                ts_idx = i;
+            }
+            let ty = silodb_schema::sqlite_type_for(f.data_type())
+                .unwrap_or(silodb_schema::SqliteType::Blob);
+            silodb_schema::ColumnDecl {
+                name: f.name().clone(),
+                ty,
+                declared_timestamp: is_axis,
+            }
+        })
+        .collect();
+    (decls, ts_idx)
+}
+
+impl FileStatsPlan {
+    pub fn new(
+        logical_table: &str,
+        columns: &[silodb_schema::ColumnDecl],
+        ts_idx: usize,
+    ) -> Self {
+        let stats_table = stats_table_name(logical_table);
+        let mut group_idxs = Vec::new();
+        let mut agg_idxs = Vec::new();
+        let mut cols = vec!["path TEXT NOT NULL".to_owned()];
+        for (i, c) in columns.iter().enumerate() {
+            if i == ts_idx {
+                continue;
+            } else if c.ty == SqliteType::Real {
+                agg_idxs.push(i);
+            } else {
+                group_idxs.push(i);
+                cols.push(format!("{} {}", quote_ident(&c.name), c.ty.decl()));
+            }
+        }
+        for &i in &agg_idxs {
+            let n = &columns[i].name;
+            for (suffix, ty) in [
+                ("count", "INTEGER"),
+                ("sum", "REAL"),
+                ("sumsq", "REAL"),
+                ("min", "REAL"),
+                ("max", "REAL"),
+            ] {
+                cols.push(format!("{} {ty}", quote_ident(&format!("{n}_{suffix}"))));
+            }
+        }
+        let ddl = format!(
+            "CREATE TABLE IF NOT EXISTS {} ({});
+             CREATE INDEX IF NOT EXISTS {} ON {} (path);",
+            quote_ident(&stats_table),
+            cols.join(", "),
+            quote_ident(&format!("{stats_table}_path")),
+            quote_ident(&stats_table),
+        );
+        let n_params = 1 + group_idxs.len() + agg_idxs.len() * 5;
+        let placeholders = (1..=n_params)
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let insert_sql = format!(
+            "INSERT INTO {} VALUES ({placeholders})",
+            quote_ident(&stats_table)
+        );
+        FileStatsPlan {
+            stats_table,
+            group_idxs,
+            agg_idxs,
+            ddl,
+            insert_sql,
+        }
+    }
+}
+
+/// Accumulator for one file's stats (compaction: sqlite rows; merge and
+/// backfill: arrow batches).
+pub struct FileStatsAcc<'a> {
+    plan: &'a FileStatsPlan,
+    cells: std::collections::HashMap<Vec<KeyVal>, Vec<Aggs>>,
+}
+
+impl<'a> FileStatsAcc<'a> {
+    pub fn new(plan: &'a FileStatsPlan) -> Self {
+        FileStatsAcc {
+            plan,
+            cells: std::collections::HashMap::new(),
+        }
+    }
+
+    pub fn add_row(&mut self, values: &[Value]) {
+        let key: Vec<KeyVal> = self
+            .plan
+            .group_idxs
+            .iter()
+            .map(|&i| match &values[i] {
+                Value::Null => KeyVal::Null,
+                Value::Integer(v) => KeyVal::Int(*v),
+                Value::Text(s) => KeyVal::Text(s.clone()),
+                Value::Blob(b) => KeyVal::Blob(b.clone()),
+                Value::Real(f) => KeyVal::Int(f.to_bits() as i64), // unreachable
+            })
+            .collect();
+        let aggs = self
+            .cells
+            .entry(key)
+            .or_insert_with(|| vec![Aggs::new(); self.plan.agg_idxs.len()]);
+        for (slot, &i) in self.plan.agg_idxs.iter().enumerate() {
+            match values[i] {
+                Value::Real(v) => aggs[slot].add(v),
+                Value::Integer(v) => aggs[slot].add(v as f64),
+                _ => {}
+            }
+        }
+    }
+
+    pub fn add_batch(&mut self, batch: &arrow::array::RecordBatch) {
+        use arrow::array::{Array, AsArray};
+        use arrow::datatypes::{Float64Type, Int64Type, TimestampMicrosecondType};
+        for row in 0..batch.num_rows() {
+            let key: Vec<KeyVal> = self
+                .plan
+                .group_idxs
+                .iter()
+                .map(|&i| {
+                    let col = batch.column(i);
+                    if col.is_null(row) {
+                        return KeyVal::Null;
+                    }
+                    match col.data_type() {
+                        arrow::datatypes::DataType::Int64 => {
+                            KeyVal::Int(col.as_primitive::<Int64Type>().value(row))
+                        }
+                        arrow::datatypes::DataType::Timestamp(_, _) => KeyVal::Int(
+                            col.as_primitive::<TimestampMicrosecondType>().value(row),
+                        ),
+                        arrow::datatypes::DataType::Utf8 => {
+                            KeyVal::Text(col.as_string::<i32>().value(row).to_owned())
+                        }
+                        arrow::datatypes::DataType::Binary => {
+                            KeyVal::Blob(col.as_binary::<i32>().value(row).to_vec())
+                        }
+                        _ => KeyVal::Null,
+                    }
+                })
+                .collect();
+            let aggs = self
+                .cells
+                .entry(key)
+                .or_insert_with(|| vec![Aggs::new(); self.plan.agg_idxs.len()]);
+            for (slot, &i) in self.plan.agg_idxs.iter().enumerate() {
+                let col = batch.column(i).as_primitive::<Float64Type>();
+                if !col.is_null(row) {
+                    aggs[slot].add(col.value(row));
+                }
+            }
+        }
+    }
+
+    /// Ensure the stats table exists, clear any prior rows for `path`
+    /// (idempotent re-runs), and insert. Caller's ambient transaction.
+    pub fn flush(self, conn: &Connection, path: &str) -> Result<usize> {
+        conn.execute_batch(&self.plan.ddl)?;
+        conn.execute(
+            &format!(
+                "DELETE FROM {} WHERE path = ?1",
+                quote_ident(&self.plan.stats_table)
+            ),
+            [path],
+        )?;
+        let mut stmt = conn.prepare(&self.plan.insert_sql)?;
+        let n = self.cells.len();
+        for (key, aggs) in self.cells {
+            let mut params: Vec<Value> = Vec::with_capacity(1 + key.len() + aggs.len() * 5);
+            params.push(Value::Text(path.to_owned()));
+            for k in key {
+                params.push(match k {
+                    KeyVal::Null => Value::Null,
+                    KeyVal::Int(v) => Value::Integer(v),
+                    KeyVal::Text(s) => Value::Text(s),
+                    KeyVal::Blob(b) => Value::Blob(b),
+                });
+            }
+            for a in aggs {
+                params.push(Value::Integer(a.count));
+                params.push(Value::Real(a.sum));
+                params.push(Value::Real(a.sumsq));
+                if a.count == 0 {
+                    params.push(Value::Null);
+                    params.push(Value::Null);
+                } else {
+                    params.push(Value::Real(a.min));
+                    params.push(Value::Real(a.max));
+                }
+            }
+            stmt.execute(rusqlite::params_from_iter(params))?;
+        }
+        Ok(n)
+    }
+}
+
+/// Delete stats rows for files that are no longer active. Safe if the
+/// stats table doesn't exist yet.
+pub fn delete_stats_for_paths(
+    conn: &Connection,
+    logical_table: &str,
+    paths: &[String],
+) -> Result<()> {
+    let table = stats_table_name(logical_table);
+    let exists: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name = ?1",
+        [&table],
+        |r| r.get(0),
+    )?;
+    if exists == 0 {
+        return Ok(());
+    }
+    let mut stmt = conn.prepare(&format!(
+        "DELETE FROM {} WHERE path = ?1",
+        quote_ident(&table)
+    ))?;
+    for p in paths {
+        stmt.execute([p])?;
+    }
+    Ok(())
+}
+
+/// Compute + store stats for existing files that predate the stats table
+/// (upgrade path / self-heal). Returns how many files were backfilled.
+pub fn stats_backfill_missing(
+    conn: &Connection,
+    logical_table: &str,
+    hot_table: &str,
+) -> Result<usize> {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    let columns = hot_columns(conn, hot_table)?;
+    let ts_idx = silodb_schema::resolve_ts_index(&columns, None)
+        .map_err(|reason| CompactError::BadTimestampColumn { reason })?;
+    let plan = FileStatsPlan::new(logical_table, &columns, ts_idx);
+    conn.execute_batch(&plan.ddl)?;
+
+    let mut done = 0;
+    for e in silodb_catalog::entries_for_table(conn, logical_table)? {
+        let has: i64 = conn.query_row(
+            &format!(
+                "SELECT count(*) FROM {} WHERE path = ?1",
+                quote_ident(&plan.stats_table)
+            ),
+            [&e.path],
+            |r| r.get(0),
+        )?;
+        if has > 0 {
+            continue;
+        }
+        let file = File::open(&e.path).map_err(|_| CompactError::MissingCompactedFile {
+            path: e.path.clone(),
+        })?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
+        let mut acc = FileStatsAcc::new(&plan);
+        for batch in reader {
+            acc.add_batch(&batch?);
+        }
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        match acc.flush(conn, &e.path) {
+            Ok(_) => conn.execute_batch("COMMIT")?,
+            Err(err) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(err);
+            }
+        }
+        done += 1;
+    }
+    Ok(done)
 }
