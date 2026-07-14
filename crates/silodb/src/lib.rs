@@ -434,7 +434,14 @@ fn init_table_inner(
                 })
             })
             .collect::<Result<_, _>>()?;
-        if existing_mapped != decls {
+        // Exact match, or the requested schema is a proper prefix of what
+        // exists — that's a boot re-init running with the pre-ALTER schema
+        // string after alter_table_add_column widened the table. Every
+        // statement below is IF NOT EXISTS, so nothing gets narrowed; the
+        // wide view/vtab/trigger stay as the ALTER left them.
+        let requested_is_prefix = decls.len() < existing_mapped.len()
+            && existing_mapped[..decls.len()] == decls[..];
+        if existing_mapped != decls && !requested_is_prefix {
             return Err(InitError::SchemaDrift {
                 table: table.to_owned(),
                 existing: existing
@@ -1067,6 +1074,16 @@ fn register_admin_functions(conn: &Connection) -> rusqlite::Result<()> {
             .map_err(|e| rusqlite::Error::UserFunctionError(e.to_string().into()))?;
         Ok(table)
     })?;
+    // silodb_add_column(table, 'col TYPE') — the one supported schema
+    // evolution; see alter_table_add_column.
+    conn.create_scalar_function("silodb_add_column", 2, flags, |ctx| {
+        let table: String = ctx.get(0)?;
+        let coldef: String = ctx.get(1)?;
+        let conn = unsafe { ctx.get_connection()? };
+        alter_table_add_column(&conn, &table, &coldef)
+            .map_err(|e| rusqlite::Error::UserFunctionError(e.to_string().into()))?;
+        Ok(table)
+    })?;
     conn.create_scalar_function("silodb_set_default_dir", 1, flags, |ctx| {
         let dir: String = ctx.get(0)?;
         let conn = unsafe { ctx.get_connection()? };
@@ -1176,5 +1193,216 @@ pub fn set_retention(
         }
     };
     catalog::set_policy(conn, &policy)?;
+    Ok(())
+}
+
+/// ADD COLUMN schema evolution: widen a silodb table in place. The only
+/// supported evolution — DROP COLUMN, RENAME and type changes would
+/// rewrite immutable history and are refused by omission.
+///
+/// `coldef` is one `name TYPE` pair (`"humidity REAL"`). The hot table is
+/// ALTERed; the view/trigger/cold-vtab (init-style) or the managed vtab
+/// are regenerated around the wider schema; registered rollups, their
+/// views, and the stats table gain the new column's slots. Existing cold
+/// files stay untouched: rows written before the ALTER read back as NULL
+/// in the new column, exactly like plain SQLite's ADD COLUMN, and merges
+/// NULL-pad old files up to the newest schema as tiers converge.
+///
+/// If the bucket axis was being discovered by type, it is frozen into the
+/// policy first — adding a second TIMESTAMP column must not change which
+/// column buckets.
+pub fn alter_table_add_column(
+    conn: &Connection,
+    table: &str,
+    coldef: &str,
+) -> Result<(), InitError> {
+    let bad = InitError::BadSchema;
+    if coldef.contains(',') {
+        return Err(bad(format!(
+            "one column at a time: '{coldef}' — call again for the next"
+        )));
+    }
+    let (new_decl, verbatim) = parse_schema(coldef)?.into_iter().next().expect("non-empty");
+    if verbatim.is_empty() {
+        return Err(bad(format!("column '{}' needs a declared type", new_decl.name)));
+    }
+
+    let mut policy = catalog::get_policy(conn, table)?.ok_or_else(|| {
+        bad(format!("no policy for '{table}' — not a silodb table"))
+    })?;
+    let hot = resolve_hot_table(conn, table)?
+        .ok_or_else(|| bad(format!("no hot table for '{table}'")))?;
+    let existing = hot_decls(conn, &hot)?;
+    if existing.iter().any(|c| c.name == new_decl.name) {
+        return Err(bad(format!(
+            "column '{}' already exists on '{table}'",
+            new_decl.name
+        )));
+    }
+    // Validate everything that could refuse BEFORE the first ALTER — a
+    // half-widened table is worse than an error.
+    let rollup_specs = catalog::rollups_for_table(conn, table)?;
+    for spec in &rollup_specs {
+        let kind: Option<String> = conn
+            .query_row(
+                "SELECT type FROM sqlite_master WHERE name = ?1",
+                [&spec.rollup_table],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let is_vtab: bool = conn
+            .query_row(
+                "SELECT sql LIKE 'CREATE VIRTUAL%' OR type = 'view' \
+                 FROM sqlite_master WHERE name = ?1",
+                [&spec.rollup_table],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if kind.is_none() || is_vtab {
+            return Err(bad(format!(
+                "rollup target '{}' is not a plain table — altering a table \
+                 with a tiered rollup target isn't supported yet",
+                spec.rollup_table
+            )));
+        }
+    }
+
+    // Freeze the bucket axis: discovery-by-type must keep resolving to the
+    // same column after the schema widens.
+    if policy.ts_column.is_none() {
+        let idx = silodb_schema::resolve_ts_index(&existing, None)
+            .map_err(|e| bad(format!("hot table: {e}")))?;
+        policy.ts_column = Some(existing[idx].name.clone());
+        catalog::set_policy(conn, &policy)?;
+    }
+
+    conn.execute_batch(&format!(
+        "ALTER TABLE {} ADD COLUMN {} {verbatim}",
+        quote_ident(&hot),
+        quote_ident(&new_decl.name),
+    ))?;
+
+    // Reconstruct the widened schema string from the hot table's verbatim
+    // decls (same move as convert_table).
+    let new_schema = conn
+        .prepare(&format!("PRAGMA table_info({})", quote_ident(&hot)))?
+        .query_map([], |r| {
+            Ok(format!(
+                "{} {}",
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+        .join(", ");
+
+    if hot == format!("{table}_hot") {
+        // init-style surface: view + trigger + cold vtab carry the column
+        // list; drop and rebuild them around the wider hot table. The
+        // vtab's destroy() deletes nothing.
+        conn.execute_batch(&format!(
+            "DROP TRIGGER IF EXISTS {trig};
+             DROP VIEW IF EXISTS {t};
+             DROP TABLE IF EXISTS {cold};",
+            trig = quote_ident(&format!("{table}_insert")),
+            t = quote_ident(table),
+            cold = quote_ident(&format!("{table}_cold")),
+        ))?;
+        init_table_inner(conn, table, &new_schema, &policy.base_dir, policy.ts_column.as_deref())?;
+    } else {
+        // Managed vtab: DROP detaches the name (shadow already ALTERed
+        // above survives untouched), CREATE reattaches it with the wider
+        // schema. Policy string reconstructed from what's stored; retain
+        // survives via create()'s preserve-on-absent rule.
+        let mut tiers = policy
+            .tiers_us
+            .iter()
+            .map(|&t| silodb_schema::format_duration_micros(t))
+            .collect::<Vec<_>>()
+            .join(",");
+        if policy.origin_us != 0 {
+            tiers.push_str(&format!(",origin={}", policy.origin_us));
+        }
+        conn.execute_batch(&format!("DROP TABLE {}", quote_ident(table)))?;
+        conn.execute_batch(&format!(
+            "CREATE VIRTUAL TABLE {t} USING silodb('{base}', schema='{schema_esc}', \
+             tiers='{tiers}'{ts_arg})",
+            t = quote_ident(table),
+            base = policy.base_dir,
+            schema_esc = new_schema.replace('\'', "''"),
+            ts_arg = policy
+                .ts_column
+                .as_deref()
+                .map(|t| format!(", ts_column={t}"))
+                .unwrap_or_default(),
+        ))?;
+    }
+
+    // Rollup tables + stats table gain the new column's slots; existing
+    // rows keep NULL there (no history to attribute). Their INSERTs are
+    // by name, so append-at-end ordering is fine.
+    let stat_adds: Vec<String> = if new_decl.ty == silodb_schema::SqliteType::Real {
+        [
+            ("count", "INTEGER"),
+            ("sum", "REAL"),
+            ("sumsq", "REAL"),
+            ("min", "REAL"),
+            ("max", "REAL"),
+        ]
+        .iter()
+        .map(|(suffix, ty)| {
+            format!(
+                "{} {ty}",
+                quote_ident(&format!("{}_{suffix}", new_decl.name))
+            )
+        })
+        .collect()
+    } else {
+        vec![format!(
+            "{} {}",
+            quote_ident(&new_decl.name),
+            new_decl.ty.decl()
+        )]
+    };
+    for spec in &rollup_specs {
+        for add in &stat_adds {
+            conn.execute_batch(&format!(
+                "ALTER TABLE {} ADD COLUMN {add}",
+                quote_ident(&spec.rollup_table)
+            ))?;
+        }
+        // The convenience view names every column — regenerate it if it
+        // exists (create_rollup_view is the single source of its shape).
+        let grain = silodb_schema::format_duration_micros(spec.grain_us);
+        let view = format!("{table}_{grain}");
+        let has_view: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='view' AND name=?1",
+                [&view],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if has_view.is_some() {
+            conn.execute_batch(&format!("DROP VIEW {}", quote_ident(&view)))?;
+            create_rollup_view(conn, table, &grain)?;
+        }
+    }
+    let stats_table = silodb_compact::stats_table_name(table);
+    let has_stats: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+            [&stats_table],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if has_stats.is_some() {
+        for add in &stat_adds {
+            conn.execute_batch(&format!(
+                "ALTER TABLE {} ADD COLUMN {add}",
+                quote_ident(&stats_table)
+            ))?;
+        }
+    }
     Ok(())
 }

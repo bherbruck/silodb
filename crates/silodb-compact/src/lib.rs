@@ -566,13 +566,46 @@ pub fn merge_window(
         std::path::PathBuf::from(p)
     };
 
-    // Stats plan from the first child's footer (all children share the
-    // writer's schema; mismatches error below anyway).
-    let stats_plan = {
+    // Children written before an ADD COLUMN are a name-prefix of children
+    // written after it. The widest child schema is the merge target;
+    // narrower children get NULL-padded up to it, so the merged file
+    // carries the newest schema and history reads back as NULL.
+    let widest = {
         use parquet::arrow::arrow_reader::ArrowReaderMetadata;
-        let f = File::open(&children[0].path)?;
-        let meta = ArrowReaderMetadata::load(&f, Default::default())?;
-        let (decls, ts) = decls_from_arrow(meta.schema());
+        let mut schemas = Vec::with_capacity(children.len());
+        for child in &children {
+            let f = File::open(&child.path)?;
+            let meta = ArrowReaderMetadata::load(&f, Default::default())?;
+            schemas.push(meta.schema().clone());
+        }
+        let widest = schemas
+            .iter()
+            .max_by_key(|s| s.fields().len())
+            .expect("children is non-empty")
+            .clone();
+        for (child, s) in children.iter().zip(&schemas) {
+            let is_prefix = s
+                .fields()
+                .iter()
+                .zip(widest.fields())
+                .all(|(a, b)| a.name() == b.name());
+            if !is_prefix {
+                return Err(CompactError::Parquet(
+                    parquet::errors::ParquetError::General(format!(
+                        "merge child '{}' has columns incompatible with the window's \
+                         newest schema (files must be a prefix — only ADD COLUMN \
+                         evolution is supported)",
+                        child.path
+                    )),
+                ));
+            }
+        }
+        widest
+    };
+
+    // Stats plan from the widest schema — the merged file's schema.
+    let stats_plan = {
+        let (decls, ts) = decls_from_arrow(&widest);
         FileStatsPlan::new(logical_table, &decls, ts)
     };
     let mut stats_acc = FileStatsAcc::new(&stats_plan);
@@ -580,7 +613,6 @@ pub fn merge_window(
     let write_result: Result<usize> = (|| {
         use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
         let mut writer: Option<ArrowWriter<File>> = None;
-        let mut schema: Option<std::sync::Arc<arrow::datatypes::Schema>> = None;
         let mut total_rows = 0usize;
         // Children are ordered by (range_start, path); non-overlapping
         // ranges concatenate in time order. Overlapping late-arrival
@@ -591,15 +623,25 @@ pub fn merge_window(
             let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
             for batch in reader {
                 let batch = batch?;
-                let schema = schema.get_or_insert_with(|| batch.schema());
-                if batch.schema() != *schema {
-                    return Err(CompactError::Parquet(
-                        parquet::errors::ParquetError::General(format!(
-                            "merge children disagree on schema at '{}'",
-                            child.path
-                        )),
-                    ));
+                let n = batch.num_rows();
+                let mut cols = batch.columns().to_vec();
+                for f in widest.fields().iter().skip(cols.len()) {
+                    cols.push(arrow::array::new_null_array(f.data_type(), n));
                 }
+                // Rebinding to the widest schema also enforces the
+                // prefix rule: a child whose column names or types
+                // diverge (anything but ADD COLUMN) fails here.
+                let batch = arrow::array::RecordBatch::try_new(widest.clone(), cols)
+                    .map_err(|e| {
+                        CompactError::Parquet(parquet::errors::ParquetError::General(
+                            format!(
+                                "merge child '{}' has columns incompatible with the \
+                                 window's newest schema (files must be a prefix — only \
+                                 ADD COLUMN evolution is supported): {e}",
+                                child.path
+                            ),
+                        ))
+                    })?;
                 let w = match writer.as_mut() {
                     Some(w) => w,
                     None => {
@@ -608,13 +650,13 @@ pub fn merge_window(
                             .build();
                         writer = Some(ArrowWriter::try_new(
                             File::create(&tmp_path)?,
-                            schema.clone(),
+                            widest.clone(),
                             Some(props),
                         )?);
                         writer.as_mut().unwrap()
                     }
                 };
-                total_rows += batch.num_rows();
+                total_rows += n;
                 stats_acc.add_batch(&batch);
                 w.write(&batch)?;
             }
@@ -759,14 +801,26 @@ impl RollupPlan {
                 group_idxs.push(i);
             }
         }
-        let n_params = 1 + group_idxs.len() + agg_idxs.len() * 5;
-        let placeholders = (1..=n_params)
+        // Columns are named, not positional: ALTER TABLE ADD COLUMN puts
+        // new stat columns at the table's end, which may not match this
+        // plan's canonical (groups, then aggs) order.
+        let mut names = vec!["ts".to_owned()];
+        for &i in &group_idxs {
+            names.push(quote_ident(&columns[i].name));
+        }
+        for &i in &agg_idxs {
+            for suffix in ["count", "sum", "sumsq", "min", "max"] {
+                names.push(quote_ident(&format!("{}_{suffix}", columns[i].name)));
+            }
+        }
+        let placeholders = (1..=names.len())
             .map(|i| format!("?{i}"))
             .collect::<Vec<_>>()
             .join(", ");
         let insert_sql = format!(
-            "INSERT INTO {} VALUES ({placeholders})",
-            quote_ident(&spec.rollup_table)
+            "INSERT INTO {} ({}) VALUES ({placeholders})",
+            quote_ident(&spec.rollup_table),
+            names.join(", ")
         );
         RollupPlan {
             spec,
@@ -880,6 +934,11 @@ impl<'a> RollupAcc<'a> {
                 .group_idxs
                 .iter()
                 .map(|&i| {
+                    // Files older than an ADD COLUMN are a prefix of the
+                    // plan's schema — a column past the file's end is NULL.
+                    if i >= batch.num_columns() {
+                        return KeyVal::Null;
+                    }
                     let col = batch.column(i);
                     if col.is_null(row) {
                         return KeyVal::Null;
@@ -906,6 +965,9 @@ impl<'a> RollupAcc<'a> {
                 continue;
             };
             for (slot, &i) in agg_idxs.iter().enumerate() {
+                if i >= batch.num_columns() {
+                    continue; // pre-ADD COLUMN file: all NULL, nothing to add
+                }
                 let col = batch.column(i).as_primitive::<Float64Type>();
                 if !col.is_null(row) {
                     aggs[slot].add(col.value(row));
@@ -1085,14 +1147,25 @@ impl FileStatsPlan {
             quote_ident(&format!("{stats_table}_path")),
             quote_ident(&stats_table),
         );
-        let n_params = 1 + group_idxs.len() + agg_idxs.len() * 5;
-        let placeholders = (1..=n_params)
+        // Named for the same reason as RollupPlan: ALTER-appended stat
+        // columns sit at the table's end, not in canonical order.
+        let mut names = vec!["path".to_owned()];
+        for &i in &group_idxs {
+            names.push(quote_ident(&columns[i].name));
+        }
+        for &i in &agg_idxs {
+            for suffix in ["count", "sum", "sumsq", "min", "max"] {
+                names.push(quote_ident(&format!("{}_{suffix}", columns[i].name)));
+            }
+        }
+        let placeholders = (1..=names.len())
             .map(|i| format!("?{i}"))
             .collect::<Vec<_>>()
             .join(", ");
         let insert_sql = format!(
-            "INSERT INTO {} VALUES ({placeholders})",
-            quote_ident(&stats_table)
+            "INSERT INTO {} ({}) VALUES ({placeholders})",
+            quote_ident(&stats_table),
+            names.join(", ")
         );
         FileStatsPlan {
             stats_table,
@@ -1154,6 +1227,10 @@ impl<'a> FileStatsAcc<'a> {
                 .group_idxs
                 .iter()
                 .map(|&i| {
+                    // Prefix-evolved older file: missing column is NULL.
+                    if i >= batch.num_columns() {
+                        return KeyVal::Null;
+                    }
                     let col = batch.column(i);
                     if col.is_null(row) {
                         return KeyVal::Null;
@@ -1180,6 +1257,9 @@ impl<'a> FileStatsAcc<'a> {
                 .entry(key)
                 .or_insert_with(|| vec![Aggs::new(); self.plan.agg_idxs.len()]);
             for (slot, &i) in self.plan.agg_idxs.iter().enumerate() {
+                if i >= batch.num_columns() {
+                    continue;
+                }
                 let col = batch.column(i).as_primitive::<Float64Type>();
                 if !col.is_null(row) {
                     aggs[slot].add(col.value(row));

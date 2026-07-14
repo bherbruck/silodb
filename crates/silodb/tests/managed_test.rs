@@ -181,12 +181,15 @@ fn drop_preserves_history_and_recreate_sees_it() {
     }
     silodb::maintain(&conn, "readings", DAY + MARGIN + 1).unwrap();
     assert_eq!(count(&conn, "SELECT count(*) FROM readings"), 24);
+    // One uncompacted hot row — DROP must not destroy it either.
+    conn.execute("INSERT INTO readings VALUES (?1, 'a', 24.0)", [24 * HOUR])
+        .unwrap();
 
     conn.execute_batch("DROP TABLE readings").unwrap();
     assert_eq!(
         count(&conn, "SELECT count(*) FROM sqlite_master WHERE name='readings_data'"),
-        0,
-        "shadow dropped"
+        1,
+        "shadow survives DROP — DDL detaches the name, it never deletes rows"
     );
     assert!(
         !silodb::catalog::entries_for_table(&conn, "readings")
@@ -195,7 +198,7 @@ fn drop_preserves_history_and_recreate_sees_it() {
         "cold history survives DROP"
     );
 
-    // Recreate: history reappears, writes work again.
+    // Recreate: hot rows and cold history reappear, writes work again.
     conn.execute_batch(&format!(
         "CREATE VIRTUAL TABLE readings USING silodb('{}',
             schema='ts TIMESTAMP, device TEXT, value REAL',
@@ -203,10 +206,10 @@ fn drop_preserves_history_and_recreate_sees_it() {
         base.display()
     ))
     .unwrap();
-    assert_eq!(count(&conn, "SELECT count(*) FROM readings"), 24);
+    assert_eq!(count(&conn, "SELECT count(*) FROM readings"), 25);
     conn.execute("INSERT INTO readings VALUES (?1, 'b', 1.0)", [25 * HOUR])
         .unwrap();
-    assert_eq!(count(&conn, "SELECT count(*) FROM readings"), 25);
+    assert_eq!(count(&conn, "SELECT count(*) FROM readings"), 26);
 }
 
 #[test]

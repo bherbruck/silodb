@@ -566,13 +566,19 @@ impl<'vtab> CreateVTab<'vtab> for SiloTab {
             policy.ts_column = parsed.ts_column.clone();
             if let Some(existing) = silodb_catalog::get_policy(&hot, &vtab.logical_table)
                 .map_err(module_err)?
-                && existing.origin_us != policy.origin_us
             {
-                return Err(module_err(format!(
-                    "origin changed for '{}' ({} -> {}); the window grid is \
-                     immutable once files exist",
-                    vtab.logical_table, existing.origin_us, policy.origin_us
-                )));
+                if existing.origin_us != policy.origin_us {
+                    return Err(module_err(format!(
+                        "origin changed for '{}' ({} -> {}); the window grid is \
+                         immutable once files exist",
+                        vtab.logical_table, existing.origin_us, policy.origin_us
+                    )));
+                }
+                // Re-creating the vtab (boot, or DROP + CREATE around an
+                // ALTER) must not clobber a retention set via
+                // silodb_set_retention: explicit retain= wins, absent
+                // preserves.
+                policy.retain_us = policy.retain_us.or(existing.retain_us);
             }
             silodb_catalog::set_policy(&hot, &policy).map_err(module_err)?;
 
@@ -604,18 +610,12 @@ impl<'vtab> CreateVTab<'vtab> for SiloTab {
         Ok((sql, vtab))
     }
 
-    /// DROP TABLE. The shadow hot table goes; **cold history survives** —
-    /// catalog rows, parquet files, stats and policy stay, and re-creating
-    /// the vtab sees them again. Destroying history is retention's job,
-    /// never DDL's.
+    /// DROP TABLE. **Nothing is destroyed** — not the shadow hot table,
+    /// not the catalog, files, stats, or policy. DDL detaches the name;
+    /// re-creating the vtab reattaches everything, hot rows included
+    /// (create's `CREATE TABLE IF NOT EXISTS` adopts the surviving
+    /// shadow). Destroying history is retention's job, never DDL's.
     fn destroy(&self) -> Result<()> {
-        if let Some(shadow) = &self.shadow {
-            let hot = self.hot_db()?;
-            hot.execute_batch(&format!(
-                "DROP TABLE IF EXISTS {}",
-                quote_ident(shadow)
-            ))?;
-        }
         Ok(())
     }
 }
@@ -938,6 +938,13 @@ struct ScanFile {
     path: PathBuf,
     meta: ArrowReaderMetadata,
     row_groups: Vec<usize>,
+    /// Schema indices this file actually has AND the statement uses —
+    /// its projection mask (files may be a prefix of the declared schema
+    /// after ADD COLUMN evolution).
+    projection: Vec<usize>,
+    /// Declared-schema index → position in this file's projected batch;
+    /// `None` = not requested or missing from the file (serve NULL).
+    col_map: Vec<Option<usize>>,
 }
 
 /// Cursor over the candidate files' record batches. `batch == None` with no
@@ -990,10 +997,11 @@ impl SiloCursor<'_> {
                 return Ok(());
             };
             self.next_file += 1;
+            self.col_map = next.col_map.clone();
             let file = File::open(&next.path).map_err(module_err)?;
             let mask = parquet::arrow::ProjectionMask::roots(
                 next.meta.metadata().file_metadata().schema_descr(),
-                self.projection.iter().copied(),
+                next.projection.iter().copied(),
             );
             let reader =
                 ParquetRecordBatchReaderBuilder::new_with_metadata(file, next.meta.clone())
@@ -1087,21 +1095,22 @@ unsafe impl VTabCursor for SiloCursor<'_> {
             let (meta, cache_hit) = vtab.file_meta(&path)?;
             stats.metadata_cache_hits += usize::from(cache_hit);
 
-            // Column names and order must line up with the declaration —
-            // xColumn maps by position. Arrow types may differ (hand-built
-            // files, older bucket layouts): cell conversion is driven by
-            // each file's own types, so that's fine.
+            // A file's columns must be a PREFIX of the declared columns
+            // (by name, in order): identical for freshly written files,
+            // shorter for files predating ADD COLUMN evolution — the
+            // missing tail reads as NULL. Anything else is real drift.
             let file_fields = meta.schema().fields();
             let decl_fields = vtab.schema.fields();
-            if file_fields.len() != decl_fields.len()
-                || file_fields
+            let is_prefix = file_fields.len() <= decl_fields.len()
+                && file_fields
                     .iter()
                     .zip(decl_fields.iter())
-                    .any(|(f, d)| f.name() != d.name())
-            {
+                    .all(|(f, d)| f.name() == d.name());
+            if !is_prefix {
                 return Err(module_err(format!(
-                    "'{}' has different columns than this table declares \
-                     (file: [{}], declared: [{}])",
+                    "'{}' has columns incompatible with this table \
+                     (file: [{}], declared: [{}]; files must be a prefix — \
+                     only ADD COLUMN evolution is supported)",
                     entry.path,
                     file_fields
                         .iter()
@@ -1115,6 +1124,15 @@ unsafe impl VTabCursor for SiloCursor<'_> {
                         .join(", "),
                 )));
             }
+            let n_file_cols = file_fields.len();
+
+            // A pushed EQ/range constraint on a column this file doesn't
+            // have can never match (the column is all-NULL here): skip the
+            // whole file. SQLite re-checks rows, so this is pure savings.
+            if pushed.iter().any(|p| p.col >= n_file_cols) {
+                stats.series_pruned_files += 1;
+                continue;
+            }
 
             let total = meta.metadata().num_row_groups();
             stats.total_row_groups += total;
@@ -1127,10 +1145,18 @@ unsafe impl VTabCursor for SiloCursor<'_> {
             stats.scanned_row_groups += keep.len();
             if !keep.is_empty() {
                 stats.scanned_files += 1;
+                let file_projection: Vec<usize> =
+                    used.iter().copied().filter(|&i| i < n_file_cols).collect();
+                let mut file_map = vec![None; n_cols];
+                for (pos, &schema_idx) in file_projection.iter().enumerate() {
+                    file_map[schema_idx] = Some(pos);
+                }
                 files.push(ScanFile {
                     path,
                     meta,
                     row_groups: keep,
+                    projection: file_projection,
+                    col_map: file_map,
                 });
             }
         }
@@ -1145,7 +1171,8 @@ unsafe impl VTabCursor for SiloCursor<'_> {
         };
         self.hot_idx = 0;
 
-        self.col_map = col_map;
+        let _ = col_map; // per-file maps supersede the scan-level one
+        self.col_map = Vec::new();
         self.projection = used;
         self.files = files;
         self.next_file = 0;

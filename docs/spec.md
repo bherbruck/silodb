@@ -386,6 +386,50 @@ Cost is bounded by *active file count* × series (~1.4k rows/year after
 tiering) — effectively free forever, which is why it's always-on rather
 than opt-in, unlike grain rollups.
 
+## Schema evolution (ADD COLUMN only)
+
+`alter_table_add_column(conn, table, "humidity REAL")` / SQL
+`silodb_add_column('readings', 'humidity REAL')` — the one supported
+edit. DROP COLUMN, RENAME and type changes would rewrite immutable
+history; they're refused by omission (no function exists).
+
+Semantics mirror plain SQLite's `ALTER TABLE ADD COLUMN`: instant,
+no data rewritten, pre-existing rows read `NULL` in the new column —
+except here "pre-existing rows" includes immutable parquet files, so
+the NULL is *served*, not stored:
+
+- **Cold files are never rewritten at ALTER time.** Files written before
+  the ALTER are a *column-name prefix* of files written after it — that
+  prefix rule is the entire compatibility contract, checked per file on
+  both the read and merge paths.
+- **Read path:** the vtab maps declared columns to each file's columns
+  per file; a declared column past a file's end yields NULL. A pushed
+  constraint on a column a file doesn't have prunes the whole file
+  (NULL never matches a vtab-pushable constraint).
+- **Merge path:** tier promotion NULL-pads narrower children up to the
+  widest child schema, so files converge to the newest schema as tiers
+  roll up — evolution debt erases itself over time instead of living
+  forever.
+- **Orchestration** (`alter_table_add_column`): validates refusals
+  first (duplicate column, multi-column defs, tiered rollup targets),
+  freezes the bucket axis into `policy.ts_column` if it was still
+  discovery-by-type (adding a second TIMESTAMP column must not move the
+  axis), ALTERs the hot table, then regenerates the surface — view +
+  trigger + cold vtab (init-style) or DROP/CREATE of the managed vtab —
+  and widens registered rollup tables, their views, and the stats
+  table. Rollup/stats INSERTs are by column name, so ALTER's
+  append-at-end ordering is fine.
+- **DDL destroys nothing:** the managed vtab's `destroy()` is a no-op —
+  DROP TABLE detaches the name; shadow hot rows, catalog, files, stats
+  and policy all survive, and re-CREATE reattaches them. That's what
+  makes the alter's DROP/CREATE cycle safe, and it's the right rule
+  independently (destroying history is retention's job, never DDL's).
+- **Boot re-init with the pre-ALTER schema string is accepted** (the
+  requested schema being a proper prefix of the hot table is the
+  expected post-ALTER state; everything init runs is `IF NOT EXISTS`,
+  so nothing narrows). Genuinely different columns still fail loudly as
+  schema drift.
+
 ## Type & timestamp mapping (`silodb-schema`)
 
 Single source of truth for both directions; never depends on `rusqlite`.

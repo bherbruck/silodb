@@ -155,7 +155,7 @@ fn schema_mismatch_across_files_errors() {
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap_err();
-    assert!(err.to_string().contains("different columns"), "{err}");
+    assert!(err.to_string().contains("incompatible"), "{err}");
 }
 
 #[test]

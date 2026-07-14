@@ -13,8 +13,9 @@ let conn = rusqlite::Connection::open("hot.db")?;
 silodb::load_module(&conn)?;                       // every boot
 silodb::init_table_tiered(&conn, "readings",
     "ts TIMESTAMP, device TEXT, sensor TEXT, value REAL",
-    "1d,7d,28d,retain=2y")?;   // idempotent; cold files land in hot.db.silodb/
+    "1d,7d,28d")?;             // idempotent; cold files land in hot.db.silodb/
                                // (set_default_dir / init_table_tiered_at to choose)
+silodb::set_retention(&conn, "readings", Some("2y"))?;   // its own policy, like Timescale
 
 // the app's whole world is one name:
 conn.execute("INSERT INTO readings VALUES (silodb_ts('2026-07-13T10:00:00Z'), 'boiler', 'temp', 21.5)", [])?;
@@ -43,13 +44,14 @@ conn.query_row("SELECT value_avg FROM readings_1h
 CREATE TABLE readings (ts TIMESTAMP, device TEXT, sensor TEXT, value REAL);
 SELECT silodb_create_table('readings');                    -- infers ts, tiers '1d',
                                                            -- files in hot.db.silodb/
-SELECT silodb_create_table('readings', NULL, '1d,7d,28d,retain=2y');  -- or explicit
+SELECT silodb_create_table('readings', NULL, '1d,7d,28d');  -- or explicit tiers
 
 INSERT INTO readings VALUES (silodb_ts('2026-07-14T10:00:00Z'), 'boiler', 'temp', 21.5);
 SELECT avg(value) FROM readings WHERE ts >= silodb_ts('2026-07-07') AND device = 'boiler';
 SELECT silodb_maintain('readings', unixepoch()*1000000);   -- on a timer
 SELECT silodb_set_default_dir('/mnt/sd/cold/');            -- db on flash, files on SD
 SELECT silodb_set_retention('readings', '2y');             -- add/change/clear anytime
+SELECT silodb_add_column('readings', 'humidity REAL');     -- instant; history reads NULL
 ```
 
 Or self-contained in one DDL statement (FTS5-style; the vtab owns a shadow
@@ -61,10 +63,10 @@ CREATE VIRTUAL TABLE readings USING silodb('cold/',
     device    TEXT,
     sensor    TEXT,
     value     REAL,
-    tiers='1d,7d,28d,retain=2y'
+    tiers='1d,7d,28d'
 );
-DROP TABLE readings;   -- removes the hot tier only; history + catalog survive,
-                       -- re-creating the table sees it all again
+DROP TABLE readings;   -- detaches the name, deletes nothing: hot rows, history,
+                       -- catalog all survive; re-creating the table reattaches them
 ```
 
 In every form `UPDATE`/`DELETE` on history are refused — compacted data is

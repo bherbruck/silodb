@@ -313,6 +313,26 @@ pub fn parse_duration_micros(s: &str) -> Option<i64> {
         .filter(|&us| us > 0)
 }
 
+/// Render microseconds back into the largest exact duration unit —
+/// `format_duration_micros(parse_duration_micros(s))` round-trips the
+/// magnitude. Used to reconstruct policy strings (e.g. when regenerating
+/// a managed vtab's DDL during ALTER).
+pub fn format_duration_micros(us: i64) -> String {
+    for (unit, size) in [
+        ("y", 365 * 86_400 * 1_000_000i64),
+        ("w", 7 * 86_400 * 1_000_000),
+        ("d", 86_400 * 1_000_000),
+        ("h", 3600 * 1_000_000),
+        ("m", 60 * 1_000_000),
+        ("s", 1_000_000),
+    ] {
+        if us % size == 0 {
+            return format!("{}{unit}", us / size);
+        }
+    }
+    format!("{us}us") // unreachable for parse-produced values
+}
+
 /// Floor `ts` to the start of its `width`-sized window, in the grid
 /// anchored at `origin` (0 = epoch). The single bucketing definition used
 /// by the `silodb_bucket()` SQL function, tier/compaction windows, and
