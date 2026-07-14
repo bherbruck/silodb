@@ -79,6 +79,52 @@ fn single_ddl_lifecycle() {
     assert!((avg - 11.5).abs() < 1e-9);
 }
 
+/// The pretty form: bare column definitions, FTS5-style — no schema='...'
+/// string. Must behave identically to the string form.
+#[test]
+fn inline_column_definitions() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("cold");
+    let conn = Connection::open_in_memory().unwrap();
+    silodb::load_module(&conn).unwrap();
+    conn.execute_batch(&format!(
+        "CREATE VIRTUAL TABLE readings USING silodb('{}',
+            ts        TIMESTAMP,
+            device    TEXT,
+            value     REAL,
+            tiers='1d,7d'
+        )",
+        base.display()
+    ))
+    .unwrap();
+
+    conn.execute("INSERT INTO readings VALUES (?1, 'a', 1.5)", params![HOUR])
+        .unwrap();
+    assert_eq!(count(&conn, "SELECT count(*) FROM readings"), 1);
+    silodb::maintain(&conn, "readings", &base, DAY + MARGIN + 1).unwrap();
+    assert_eq!(count(&conn, "SELECT count(*) FROM readings_data"), 0);
+    assert_eq!(count(&conn, "SELECT count(*) FROM readings"), 1, "cold now");
+
+    // Shadow got the verbatim decls (TIMESTAMP marker survives).
+    let decl: String = conn
+        .query_row(
+            "SELECT type FROM pragma_table_info('readings_data') WHERE name = 'ts'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(decl, "TIMESTAMP");
+
+    // Mixing both forms is refused.
+    let err = conn
+        .execute_batch(
+            "CREATE VIRTUAL TABLE bad USING silodb('x/', ts TIMESTAMP, schema='ts TIMESTAMP')",
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("not both"), "{err}");
+}
+
 #[test]
 fn writes_are_guarded() {
     let (conn, _dir, base) = setup();

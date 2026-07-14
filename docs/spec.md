@@ -304,11 +304,19 @@ silodb::create_rollup_view(&conn, "readings", "1h")?;  // real-time view reading
 
 ```sql
 CREATE VIRTUAL TABLE readings USING silodb('cold/',
-    schema='ts TIMESTAMP, device TEXT, value REAL',
+    ts     TIMESTAMP,                           -- bare column defs, FTS5-style
+    device TEXT,                                -- (schema='...' also accepted,
+    value  REAL,                                --  but not both)
     tiers='1d,7d,28d,retain=2y');
 INSERT INTO readings VALUES (...);              -- xUpdate → shadow hot table
 SELECT * FROM readings WHERE ts > ...;          -- cursor serves hot ∪ cold
 ```
+
+`CREATE TABLE ... USING` is not SQLite grammar (verified: syntax error) and
+declared column types are inert text — no DDL hook exists short of the
+single-slot authorizer, which a library must not clobber. `VIRTUAL` is the
+entry fee for module-backed tables; `init_table` remains the zero-VIRTUAL
+front door for Rust hosts.
 
 The FTS5 pattern: `tiers=` in the DDL turns the vtab into the whole
 system. `xCreate` creates the `<name>_data` shadow hot table (verbatim

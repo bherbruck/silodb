@@ -238,20 +238,40 @@ fn parse_args(args: &[&[u8]]) -> Result<TabArgs> {
     let mut hot_table = None;
     let mut schema = None;
     let mut tiers = None;
+    let mut columns = Vec::new();
     for arg in rest {
         let s = parse_str_arg(arg)?;
-        let (key, value) = s
+        // `key=value` where the key is a bare word → a parameter.
+        // Anything else (`device TEXT`) is a column definition, exactly
+        // like FTS5 declares columns as bare arguments.
+        let param = s
             .split_once('=')
-            .ok_or_else(|| module_err(format!("unrecognized argument '{s}'")))?;
-        let value = value.trim().trim_matches('\'').trim_matches('"');
-        match key.trim() {
-            "table" => logical_table = Some(value.to_owned()),
-            "ts_column" => ts_column = Some(value.to_owned()),
-            "hot_table" => hot_table = Some(value.to_owned()),
-            "schema" => schema = Some(value.to_owned()),
-            "tiers" => tiers = Some(value.to_owned()),
-            other => return Err(module_err(format!("unrecognized parameter '{other}'"))),
+            .filter(|(key, _)| !key.trim().is_empty() && !key.contains(char::is_whitespace));
+        match param {
+            Some((key, value)) => {
+                let value = value.trim().trim_matches('\'').trim_matches('"');
+                match key.trim() {
+                    "table" => logical_table = Some(value.to_owned()),
+                    "ts_column" => ts_column = Some(value.to_owned()),
+                    "hot_table" => hot_table = Some(value.to_owned()),
+                    "schema" => schema = Some(value.to_owned()),
+                    "tiers" => tiers = Some(value.to_owned()),
+                    other => {
+                        return Err(module_err(format!("unrecognized parameter '{other}'")))
+                    }
+                }
+            }
+            None => columns.push(s),
         }
+    }
+    if !columns.is_empty() {
+        if schema.is_some() {
+            return Err(module_err(
+                "give columns either inline (device TEXT, ...) or via \
+                 schema='...', not both",
+            ));
+        }
+        schema = Some(columns.join(", "));
     }
 
     Ok(TabArgs {

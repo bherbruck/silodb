@@ -33,6 +33,29 @@ conn.query_row("SELECT value_avg FROM readings_1h
                 AND device = 'boiler'", [], |r| r.get::<_, f64>(0))?;
 ```
 
+## Or: one DDL statement is the whole system
+
+```sql
+CREATE VIRTUAL TABLE readings USING silodb('cold/',
+    ts        TIMESTAMP,
+    device    TEXT,
+    sensor    TEXT,
+    value     REAL,
+    tiers='1d,7d,28d,retain=2y'
+);
+
+INSERT INTO readings VALUES (silodb_ts('2026-07-14T10:00:00Z'), 'boiler', 'temp', 21.5);
+SELECT avg(value) FROM readings WHERE ts >= silodb_ts('2026-07-07') AND device = 'boiler';
+DROP TABLE readings;   -- removes the hot tier only; history + catalog survive,
+                       -- re-creating the table sees it all again
+```
+
+The vtab owns a shadow hot table, routes INSERTs into it, serves hot ∪ cold
+itself, and `maintain()` runs the declared policy. `UPDATE`/`DELETE` are
+refused — compacted history is immutable (retention deletes data, DDL never
+does). This is the form the future loadable extension exposes to Python /
+Node / the `sqlite3` CLI with zero Rust.
+
 ## How the tiers work
 
 ![tiered compaction](docs/tiers.svg)
