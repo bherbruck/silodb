@@ -245,8 +245,9 @@ fn retention_evicts_whole_expired_files() {
     let base = dir.path().join("cold");
     let conn = Connection::open_in_memory().unwrap();
     silodb::load_module(&conn).unwrap();
-    silodb::init_table_tiered_at(&conn, "readings", "ts TIMESTAMP, value REAL", "1d,7d,retain=14d", &base)
-    .unwrap();
+    silodb::init_table_tiered_at(&conn, "readings", "ts TIMESTAMP, value REAL", "1d,7d", &base)
+        .unwrap();
+    silodb::set_retention(&conn, "readings", Some("14d")).unwrap();
     let e = Env {
         conn,
         base,
@@ -306,15 +307,27 @@ fn retention_evicts_whole_expired_files() {
 fn retention_shorter_than_largest_tier_is_rejected() {
     let conn = Connection::open_in_memory().unwrap();
     silodb::load_module(&conn).unwrap();
-    let err = silodb::init_table_tiered_at(
+    silodb::init_table_tiered_at(
         &conn,
         "readings",
         "ts TIMESTAMP, value REAL",
-        "1d,7d,28d,retain=14d",
+        "1d,7d,28d",
+        "cold/",
+    )
+    .unwrap();
+    let err = silodb::set_retention(&conn, "readings", Some("14d")).unwrap_err();
+    assert!(err.to_string().contains("largest tier"), "{err}");
+    // And retain= in the tiers string is rejected outright — retention is
+    // set_retention's alone.
+    let err = silodb::init_table_tiered_at(
+        &conn,
+        "other",
+        "ts TIMESTAMP, value REAL",
+        "1d,7d,retain=30d",
         "cold/",
     )
     .unwrap_err();
-    assert!(err.to_string().contains("retain"), "{err}");
+    assert!(err.to_string().contains("silodb_set_retention"), "{err}");
 }
 
 #[test]

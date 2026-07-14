@@ -13,7 +13,8 @@
 //! // + insert trigger on first boot, no-ops after. Cold files land in
 //! // hot.db.silodb/ unless set_default_dir / init_table_at says otherwise:
 //! silodb::init_table_tiered(&conn, "readings",
-//!     "ts TIMESTAMP, value REAL, name TEXT", "1d,7d,28d,retain=2y")?;
+//!     "ts TIMESTAMP, value REAL, name TEXT", "1d,7d,28d")?;
+//! silodb::set_retention(&conn, "readings", Some("2y"))?;
 //!
 //! // The app's whole world is now one name:
 //! conn.execute("INSERT INTO readings VALUES (?1, ?2, ?3)",
@@ -290,12 +291,12 @@ pub fn init_table_at(
 /// epoch-aligned; `30d` after `7d` would strand straddling files — use
 /// `28d`).
 ///
-/// An optional trailing `retain=<duration>` element sets the retention
-/// policy: cold files entirely older than `now - retain` are evicted
-/// (deleted) by [`maintain`], at whole-file granularity — a file
-/// straddling the cutoff stays until all of it has expired. Example:
-/// `"1d, 7d, 28d, retain=2y"`. Without it, history is kept forever.
-/// The policy persists in `_silodb_policy`; [`maintain`] executes it.
+/// The tiers string carries only tier windows (plus an optional
+/// `origin=`); retention is its own policy — set it with
+/// [`set_retention`] (never expressed at create time, so a boot re-init
+/// can't fight a later policy change). Without one, history is kept
+/// forever. The policy persists in `_silodb_policy`; [`maintain`]
+/// executes it.
 pub fn init_table_tiered(
     conn: &Connection,
     table: &str,
@@ -388,12 +389,9 @@ fn init_impl(
         Some(dir) if !dir.is_empty() => dir.to_owned(),
         _ => resolve_base_dir(conn, explicit_dir)?,
     };
-    // Boot-time re-init must not clobber a retention set later via
-    // set_retention(): an explicit retain= in the string wins, an absent
-    // one preserves what's stored.
-    policy.retain_us = policy
-        .retain_us
-        .or(existing.as_ref().and_then(|e| e.retain_us));
+    // Retention is set_retention()'s alone (the tiers string can't carry
+    // it) — boot-time re-init always preserves what's stored.
+    policy.retain_us = existing.as_ref().and_then(|e| e.retain_us);
     policy.ts_column = ts_column
         .map(str::to_owned)
         .or(existing.and_then(|e| e.ts_column));
@@ -996,7 +994,8 @@ pub fn create_rollup_view(conn: &Connection, table: &str, grain: &str) -> Result
 ///
 /// ```sql
 /// CREATE TABLE readings (ts TIMESTAMP, device TEXT, value REAL);
-/// SELECT silodb_create_table('readings', 'cold/', '1d,7d,28d,retain=2y');
+/// SELECT silodb_create_table('readings', 'cold/', '1d,7d,28d');
+/// SELECT silodb_set_retention('readings', '2y');
 /// SELECT silodb_maintain('readings', 'cold/', unixepoch()*1000000);
 /// ```
 ///
@@ -1166,8 +1165,8 @@ fn convert_table(
 /// [`maintain`] applies it. `retain` must be at least the largest tier
 /// window (files merge into windows that must be evictable whole).
 ///
-/// The `retain=` element of the create-time policy string keeps working;
-/// this call overrides it.
+/// This is the only way to set retention — the tiers/policy string
+/// rejects `retain=` so create-time DDL can never fight this call.
 pub fn set_retention(
     conn: &Connection,
     table: &str,

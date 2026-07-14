@@ -493,30 +493,32 @@ pub fn evict_older_than(
     Ok(expired)
 }
 
-/// Parse a policy string — `"1d, 7d, 28d[, retain=2y][, origin=<ISO|µs>]"`
-/// — into a [`TablePolicy`]. Validation: durations use s/m/h/d/w/y units;
-/// tiers ascend and each divides the next (epoch/origin-aligned windows
-/// can't merge straddling files); retain, when set, is at least the
-/// largest tier. Lives here so the vtab's managed mode (`tiers=` in the
-/// DDL) and the facade parse identically.
+/// Parse a policy string — `"1d, 7d, 28d[, origin=<ISO|µs>]"` — into a
+/// [`TablePolicy`]. Validation: durations use s/m/h/d/w/y units; tiers
+/// ascend and each divides the next (epoch/origin-aligned windows can't
+/// merge straddling files). Lives here so the vtab's managed mode
+/// (`tiers=` in the DDL) and the facade parse identically.
+///
+/// Retention is deliberately NOT part of this string: it's its own
+/// changeable policy (`set_retention` / `silodb_set_retention`, the
+/// Timescale `add_retention_policy` shape) — one way to set it, so a
+/// re-run of create-time DDL can never fight a later policy change.
+/// `retain=` is rejected with a pointer, not silently ignored.
 pub fn parse_policy_string(
     logical_table: &str,
     tiers: &str,
 ) -> std::result::Result<TablePolicy, String> {
     let mut tiers_us = Vec::new();
-    let mut retain = None;
     let mut origin = 0i64;
     for part in tiers.split(',') {
         let part = part.trim();
-        if let Some(dur) = part.strip_prefix("retain=") {
-            if retain.is_some() {
-                return Err("duplicate retain=".into());
-            }
-            retain = Some(
-                silodb_schema::parse_duration_micros(dur.trim())
-                    .ok_or_else(|| format!("bad retain duration '{dur}'"))?,
+        if part.strip_prefix("retain=").is_some() {
+            return Err(
+                "retain= is not part of the tiers string — retention is its \
+                 own policy: silodb_set_retention(table, dur) in SQL, or \
+                 set_retention() from Rust"
+                    .into(),
             );
-            continue;
         }
         if let Some(o) = part.strip_prefix("origin=") {
             let o = o.trim();
@@ -543,21 +545,11 @@ pub fn parse_policy_string(
     if tiers_us.is_empty() {
         return Err("no tiers".into());
     }
-    if let (Some(r), Some(&largest)) = (retain, tiers_us.last())
-        && r < largest
-    {
-        return Err(
-            "retain= is shorter than the largest tier window — files merge into \
-             windows bigger than the retention period and could never be evicted \
-             whole; use retain >= the largest tier"
-                .into(),
-        );
-    }
     Ok(TablePolicy {
         logical_table: logical_table.to_owned(),
         tiers_us,
         safety_margin_us: 2 * 3600 * 1_000_000,
-        retain_us: retain,
+        retain_us: None, // set_retention only — never from this string
         origin_us: origin,
         base_dir: String::new(), // caller fills after dir resolution
         ts_column: None,         // caller fills from its ts argument

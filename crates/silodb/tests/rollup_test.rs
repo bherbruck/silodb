@@ -292,8 +292,9 @@ fn rollup_rows_follow_source_retention() {
     let base = dir.path().join("cold");
     let conn = Connection::open_in_memory().unwrap();
     silodb::load_module(&conn).unwrap();
-    silodb::init_table_tiered_at(&conn, "readings", "ts TIMESTAMP, device TEXT, value REAL", "1d,7d,retain=7d", &base)
-    .unwrap();
+    silodb::init_table_tiered_at(&conn, "readings", "ts TIMESTAMP, device TEXT, value REAL", "1d,7d", &base)
+        .unwrap();
+    silodb::set_retention(&conn, "readings", Some("7d")).unwrap();
     let e = Env {
         conn,
         base,

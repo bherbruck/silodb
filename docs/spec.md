@@ -260,14 +260,15 @@ silodb::maintain(&conn, "readings", "cold/", now_us)?;  // timer + boot
   precedent): `set_retention(conn, table, Some("2y"))` /
   `SELECT silodb_set_retention('readings', '2y')` — changeable at any
   time (it never affects window alignment; the next `maintain` applies
-  it), `None`/NULL clears. Must be ≥ the largest tier window. The
-  create-time string element below still works as compact shorthand:
-  `"1d,7d,28d,retain=2y"`. `maintain` flips active files entirely older
-  than `now − retain` to `status='evicted'` (whole-file granularity — a
+  it), `None`/NULL clears. Must be ≥ the largest tier window (files
+  would merge into windows that could never be evicted whole — rejected).
+  **This is the only door**: the tiers/policy string rejects `retain=`
+  with a pointer here, so a re-run of create-time DDL can never fight a
+  later policy change (one way to set it, nothing to preserve or
+  precedence-order). `maintain` flips active files entirely older than
+  `now − retain` to `status='evicted'` (whole-file granularity — a
   straddling file survives until all of it has expired) and the same GC
-  step unlinks them. Retention shorter than the largest tier window is
-  rejected at init (files would merge into windows that could never be
-  evicted whole). No `retain=` → keep forever.
+  step unlinks them. No retention set → keep forever.
 - Contract: **one maintainer process at a time** (same as the compaction
   scheduling contract it subsumes).
 - **Origin**: all windows are epoch-aligned by default; `origin=<ISO or
@@ -309,8 +310,9 @@ silodb::create_rollup_view(&conn, "readings", "1h")?;  // real-time view reading
 - **Recursion**: the rollup target is an ordinary table; give it its own
   `init_table_tiered` *before* `create_rollup` and the rollup's history
   tiers into its own parquet buckets with its own retention ("2y raw,
-  10y hourlies" = two policy strings). Plain-table rollups follow the
-  source's `retain=` (whole grain buckets).
+  10y hourlies" = two tables, each with its own tiers + retention).
+  Plain-table rollups follow the source's retention (whole grain
+  buckets).
 - **SQL surface**: `silodb_bucket(width, ts[, origin])` — `time_bucket`'s
   argument order, deliberately not its name (global flat function
   namespace; integer-µs semantics). Admin stays Rust-API; a SQL admin
@@ -323,7 +325,7 @@ CREATE VIRTUAL TABLE readings USING silodb('cold/',
     ts     TIMESTAMP,                           -- bare column defs, FTS5-style
     device TEXT,                                -- (schema='...' also accepted,
     value  REAL,                                --  but not both)
-    tiers='1d,7d,28d,retain=2y');
+    tiers='1d,7d,28d');
 INSERT INTO readings VALUES (...);              -- xUpdate → shadow hot table
 SELECT * FROM readings WHERE ts > ...;          -- cursor serves hot ∪ cold
 ```

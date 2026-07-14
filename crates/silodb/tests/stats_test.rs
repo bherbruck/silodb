@@ -166,7 +166,8 @@ fn missing_stats_degrade_to_no_pruning_and_self_heal() {
 
 #[test]
 fn eviction_removes_stats_rows() {
-    let e = env("1d,7d,retain=7d");
+    let e = env("1d,7d");
+    silodb::set_retention(&e.conn, "readings", Some("7d")).unwrap();
     e.fill_sparse(3, 0);
     e.maintain(3 * DAY + MARGIN + 1);
     assert!(e.count("SELECT count(*) FROM readings_stats") > 0);

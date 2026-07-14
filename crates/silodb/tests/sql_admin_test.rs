@@ -276,8 +276,12 @@ fn boot_reinit_preserves_function_set_retention() {
     let p2 = silodb::catalog::get_policy(&conn, "r").unwrap().unwrap();
     assert_eq!(p.retain_us, p2.retain_us);
 
-    // Explicit retain= in the string still wins over the stored value.
-    silodb::init_table_tiered(&conn, "r", "ts TIMESTAMP, v REAL", "1d,7d,retain=30d").unwrap();
+    // retain= in the tiers string is rejected — set_retention is the only
+    // door, so create-time DDL can never fight a later policy change.
+    let err = silodb::init_table_tiered(&conn, "r", "ts TIMESTAMP, v REAL", "1d,7d,retain=30d")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("set_retention"), "{err}");
     let p3 = silodb::catalog::get_policy(&conn, "r").unwrap().unwrap();
-    assert_eq!(p3.retain_us, silodb_schema::parse_duration_micros("30d"));
+    assert_eq!(p3.retain_us, p2.retain_us, "rejected string changed nothing");
 }

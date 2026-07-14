@@ -576,9 +576,9 @@ impl<'vtab> CreateVTab<'vtab> for SiloTab {
                 }
                 // Re-creating the vtab (boot, or DROP + CREATE around an
                 // ALTER) must not clobber a retention set via
-                // silodb_set_retention: explicit retain= wins, absent
-                // preserves.
-                policy.retain_us = policy.retain_us.or(existing.retain_us);
+                // silodb_set_retention — the tiers string can't carry
+                // retention, so what's stored always survives.
+                policy.retain_us = existing.retain_us;
             }
             silodb_catalog::set_policy(&hot, &policy).map_err(module_err)?;
 
