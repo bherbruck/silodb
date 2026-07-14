@@ -1175,6 +1175,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "silodb-examples"
+version = "0.0.0"
+dependencies = [
+ "rusqlite",
+ "silodb",
+]
+
+[[package]]
 name = "silodb-fixture-gen"
 version = "0.1.0"
 dependencies = [

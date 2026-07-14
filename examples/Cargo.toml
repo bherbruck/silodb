@@ -1,0 +1,21 @@
+[package]
+name = "silodb-examples"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[dependencies]
+silodb = { path = "../crates/silodb" }
+rusqlite = { version = "0.40.1", features = ["bundled", "functions", "vtab"] }
+
+[[bin]]
+name = "quickstart"
+path = "quickstart.rs"
+
+[[bin]]
+name = "sql_only"
+path = "sql_only.rs"
+
+[[bin]]
+name = "plain_sqlite"
+path = "plain_sqlite.rs"

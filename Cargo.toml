@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/*", "fixtures/gen"]
+members = ["crates/*", "fixtures/gen", "examples"]
 exclude = ["fuzz"]
 
 [profile.release]

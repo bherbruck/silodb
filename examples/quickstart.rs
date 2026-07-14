@@ -2,7 +2,7 @@
 //! lifecycle — ingest, tiered compaction, pruned queries, continuous
 //! aggregates, late data, retention.
 //!
-//! Run: `cargo run -p silodb --example quickstart`
+//! Run: `cargo run -p silodb-examples --bin quickstart`
 
 use rusqlite::{params, Connection};
 

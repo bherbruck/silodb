@@ -139,7 +139,7 @@ cold/           # one base dir for all tables
     bucket-<start>-<end>-<seq>.parquet   # TIMESTAMP(µs, UTC) — real dates in any viewer
 ```
 
-Canonical design doc: [`docs/spec.md`](docs/spec.md). Crate boundaries:
+Runnable examples: [`examples/`](examples/). Canonical design doc: [`docs/spec.md`](docs/spec.md). Crate boundaries:
 [`CLAUDE.md`](CLAUDE.md). Status: all spec phases built and tested (~90
 tests incl. property tests, fuzzing, crash simulation, concurrency);
 next planned: FTS5-style writable vtab so `CREATE VIRTUAL TABLE` is the

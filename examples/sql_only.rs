@@ -2,7 +2,7 @@
 //! the exact experience the loadable extension will give Python/Node/CLI
 //! users. TimescaleDB-style: plain CREATE TABLE, then convert in place.
 //!
-//! Run: `cargo run -p silodb --example sql_only`
+//! Run: `cargo run -p silodb-examples --bin sql_only`
 
 use rusqlite::Connection;
 
