@@ -75,6 +75,56 @@ pub fn load_module(conn: &Connection) -> rusqlite::Result<()> {
         let us: i64 = ctx.get(0)?;
         Ok(silodb_schema::format_timestamp_micros(us))
     })?;
+    // silodb_bucket(width, ts[, origin]) — floor ts to its epoch-aligned
+    // (or origin-anchored) window start. Same argument order as
+    // time_bucket() in TimescaleDB/DuckDB; deliberately NOT named
+    // time_bucket: SQLite's function namespace is global/flat, and ours
+    // returns integer µs, not a timestamp type. width is a duration
+    // string ('1h') or integer µs; ts and origin accept integer µs or ISO
+    // text (silodb_ts semantics).
+    for n_args in [2, 3] {
+        conn.create_scalar_function("silodb_bucket", n_args, flags, move |ctx| {
+            let err = |m: String| rusqlite::Error::UserFunctionError(m.into());
+            let as_us = |v: rusqlite::types::ValueRef<'_>, what: &str| -> rusqlite::Result<i64> {
+                match v {
+                    rusqlite::types::ValueRef::Integer(i) => Ok(i),
+                    rusqlite::types::ValueRef::Text(t) => {
+                        let s = std::str::from_utf8(t)
+                            .map_err(|e| rusqlite::Error::UserFunctionError(e.into()))?;
+                        silodb_schema::parse_timestamp_micros(s)
+                            .ok_or_else(|| err(format!("silodb_bucket: bad {what} '{s}'")))
+                    }
+                    other => Err(err(format!(
+                        "silodb_bucket: {what} must be INTEGER or TEXT, got {}",
+                        other.data_type()
+                    ))),
+                }
+            };
+            let width = match ctx.get_raw(0) {
+                rusqlite::types::ValueRef::Integer(i) => i,
+                rusqlite::types::ValueRef::Text(t) => {
+                    let s = std::str::from_utf8(t)
+                        .map_err(|e| rusqlite::Error::UserFunctionError(e.into()))?;
+                    silodb_schema::parse_duration_micros(s)
+                        .ok_or_else(|| err(format!("silodb_bucket: bad width '{s}'")))?
+                }
+                other => {
+                    return Err(err(format!(
+                        "silodb_bucket: width must be a duration string or INTEGER µs, got {}",
+                        other.data_type()
+                    )))
+                }
+            };
+            let ts = as_us(ctx.get_raw(1), "ts")?;
+            let origin = if n_args == 3 {
+                as_us(ctx.get_raw(2), "origin")?
+            } else {
+                0
+            };
+            silodb_schema::bucket_floor(width, ts, origin)
+                .ok_or_else(|| err("silodb_bucket: overflow or non-positive width".into()))
+        })?;
+    }
     Ok(())
 }
 
@@ -213,7 +263,20 @@ pub fn init_table_tiered(
     base_dir: impl AsRef<Path>,
     tiers: &str,
 ) -> Result<(), InitError> {
-    let (tiers_us, retain_us) = parse_tiers(tiers)?;
+    let (tiers_us, retain_us, origin_us) = parse_tiers(tiers)?;
+    // Origin is immutable once set: every written file's windows are
+    // anchored to it, and moving it would misalign all of them. Detect a
+    // changed origin loudly instead of silently re-anchoring.
+    if let Some(existing) = catalog::get_policy(conn, table)?
+        && existing.origin_us != origin_us
+    {
+        return Err(InitError::BadSchema(format!(
+            "origin changed for '{table}' ({} -> {origin_us}); the window \
+             grid is immutable once files exist — re-aligning is a \
+             migration, not a knob",
+            existing.origin_us
+        )));
+    }
     catalog::set_policy(
         conn,
         &catalog::TablePolicy {
@@ -221,38 +284,25 @@ pub fn init_table_tiered(
             tiers_us,
             safety_margin_us: 2 * 3600 * 1_000_000, // 2h, per spec contract
             retain_us,
+            origin_us,
         },
     )?;
     init_table_inner(conn, table, schema, base_dir)
 }
 
 fn parse_duration_us(part: &str, bad: impl Fn(String) -> InitError) -> Result<i64, InitError> {
-    let (num, unit) = part.split_at(part.len().saturating_sub(1));
-    let n: i64 = num
-        .trim()
-        .parse()
-        .map_err(|_| bad(format!("bad duration '{part}'")))?;
-    let secs = match unit {
-        "s" => 1,
-        "m" => 60,
-        "h" => 3600,
-        "d" => 86_400,
-        "w" => 7 * 86_400,
-        "y" => 365 * 86_400,
-        _ => return Err(bad(format!("bad unit in '{part}' (use s/m/h/d/w/y)"))),
-    };
-    n.checked_mul(secs)
-        .and_then(|s| s.checked_mul(1_000_000))
-        .filter(|&us| us > 0)
-        .ok_or_else(|| bad(format!("duration '{part}' out of range")))
+    silodb_schema::parse_duration_micros(part)
+        .ok_or_else(|| bad(format!("bad duration '{part}' (use <n><s|m|h|d|w|y>)")))
 }
 
-/// Parse `"1d, 7d, 28d[, retain=2y]"` into ascending microsecond windows
-/// (each validated as a multiple of the previous) plus optional retention.
-fn parse_tiers(tiers: &str) -> Result<(Vec<i64>, Option<i64>), InitError> {
+/// Parse `"1d, 7d, 28d[, retain=2y][, origin=<ISO date or epoch-µs>]"` into
+/// ascending microsecond windows (each validated as a multiple of the
+/// previous) plus optional retention and window-grid origin.
+fn parse_tiers(tiers: &str) -> Result<(Vec<i64>, Option<i64>, i64), InitError> {
     let bad = InitError::BadSchema;
     let mut out = Vec::new();
     let mut retain = None;
+    let mut origin = 0i64;
     for part in tiers.split(',') {
         let part = part.trim();
         if let Some(dur) = part.strip_prefix("retain=") {
@@ -260,6 +310,19 @@ fn parse_tiers(tiers: &str) -> Result<(Vec<i64>, Option<i64>), InitError> {
                 return Err(bad("duplicate retain=".into()));
             }
             retain = Some(parse_duration_us(dur.trim(), bad)?);
+            continue;
+        }
+        if let Some(o) = part.strip_prefix("origin=") {
+            let o = o.trim();
+            origin = o
+                .parse::<i64>()
+                .ok()
+                .or_else(|| silodb_schema::parse_timestamp_micros(o))
+                .ok_or_else(|| {
+                    bad(format!(
+                        "bad origin '{o}' (epoch microseconds or ISO 8601)"
+                    ))
+                })?;
             continue;
         }
         let us = parse_duration_us(part, bad)?;
@@ -287,7 +350,7 @@ fn parse_tiers(tiers: &str) -> Result<(Vec<i64>, Option<i64>), InitError> {
                 .into(),
         ));
     }
-    Ok((out, retain))
+    Ok((out, retain, origin))
 }
 
 fn init_table_inner(
@@ -517,10 +580,11 @@ pub fn maintain(
             )?;
             let bounds = lo.zip(hi);
             if let Some((lo, hi)) = bounds {
-                let first = lo.div_euclid(t0);
-                let last = hi.div_euclid(t0);
+                let first = (lo - policy.origin_us).div_euclid(t0);
+                let last = (hi - policy.origin_us).div_euclid(t0);
                 for b in first..=last {
-                    let (start, end) = (b * t0, (b + 1) * t0);
+                    let (start, end) =
+                        (b * t0 + policy.origin_us, (b + 1) * t0 + policy.origin_us);
                     if end > cutoff {
                         break; // bucket still open (or inside the margin)
                     }
@@ -549,6 +613,20 @@ pub fn maintain(
                 path: e.path,
             });
         }
+        // Plain-table rollups follow the source's retention (whole grain
+        // buckets only). A tiered rollup (its own policy) governs itself.
+        for spec in catalog::rollups_for_table(conn, table)? {
+            if catalog::get_policy(conn, &spec.rollup_table)?.is_some() {
+                continue;
+            }
+            conn.execute(
+                &format!(
+                    "DELETE FROM {} WHERE ts + ?1 <= ?2",
+                    quote_ident(&spec.rollup_table)
+                ),
+                rusqlite::params![spec.grain_us, retain_cutoff],
+            )?;
+        }
     }
 
     // --- higher tiers: promote finer files into closed windows -------
@@ -560,12 +638,12 @@ pub fn maintain(
         let mut windows: Vec<i64> = entries
             .iter()
             .filter(|e| (e.range_end - e.range_start) < w)
-            .map(|e| e.range_start.div_euclid(w))
+            .map(|e| (e.range_start - policy.origin_us).div_euclid(w))
             .collect();
         windows.sort_unstable();
         windows.dedup();
         for win in windows {
-            let (start, end) = (win * w, (win + 1) * w);
+            let (start, end) = (win * w + policy.origin_us, (win + 1) * w + policy.origin_us);
             if end > cutoff {
                 continue;
             }
@@ -597,4 +675,229 @@ pub fn maintain(
     }
 
     Ok(actions)
+}
+
+// --- continuous aggregates (rollups) ---------------------------------------
+
+/// Register a continuous aggregate for `table` at `grain` (e.g. `"1h"`)
+/// and backfill it from all existing cold files — Timescale-style
+/// declare-anytime semantics. One transaction covers registration +
+/// backfill, so a crash leaves no half-registered rollup.
+///
+/// The rollup target is `<table>_rollup_<grain>`, holding sufficient
+/// statistics per (grain bucket, series columns): `<col>_count/_sum/
+/// _sumsq/_min/_max` for every REAL column, grouped by every other
+/// column. avg/stddev derive at query time — nothing inexact (no
+/// avg-of-avg) is ever materialized.
+///
+/// If a table **or silodb single-name view** with that name already
+/// exists (schema-compatible), it's used as the target — that's the
+/// recursion: `init_table_tiered` the rollup name first and the rollup's
+/// own history gets tiered/retained under its own policy.
+///
+/// Going forward, compaction computes deltas from its own stream and
+/// commits them in the tier-migration transaction. Requirements: the
+/// table has a policy (grain must divide tier 0) and a hot table to read
+/// the schema from.
+pub fn create_rollup(conn: &Connection, table: &str, grain: &str) -> Result<(), InitError> {
+    let bad = InitError::BadSchema;
+    let grain_us = silodb_schema::parse_duration_micros(grain)
+        .ok_or_else(|| bad(format!("bad grain '{grain}'")))?;
+    let policy = catalog::get_policy(conn, table)?
+        .ok_or_else(|| bad(format!("no policy for '{table}' — init_table first")))?;
+    let t0 = policy.tiers_us[0];
+    if grain_us > t0 || t0 % grain_us != 0 {
+        return Err(bad(format!(
+            "grain '{grain}' must divide tier 0 ({}s) so every compaction \
+             bucket contains whole grain buckets",
+            t0 / 1_000_000
+        )));
+    }
+
+    let columns = hot_decls(conn, &format!("{table}_hot"))?;
+    let decls: Vec<silodb_schema::ColumnDecl> = columns.clone();
+    let ts_idx = silodb_schema::resolve_ts_index(&decls, None)
+        .map_err(|e| bad(format!("hot table: {e}")))?;
+
+    let rollup_table = format!("{table}_rollup_{grain}");
+    let spec = catalog::RollupSpec {
+        logical_table: table.to_owned(),
+        grain_us,
+        rollup_table: rollup_table.clone(),
+    };
+    let plan = silodb_compact::RollupPlan::new(spec.clone(), &columns, ts_idx, policy.origin_us);
+
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT type FROM sqlite_master WHERE name = ?1 AND type IN ('table','view')",
+            [&rollup_table],
+            |r| r.get(0),
+        )
+        .optional()?;
+
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let txn: Result<(), InitError> = (|| {
+        if existing.is_none() {
+            conn.execute_batch(&plan.rollup_ddl(&columns))?;
+            conn.execute_batch(&format!(
+                "CREATE INDEX {} ON {} (ts)",
+                quote_ident(&format!("{rollup_table}_ts")),
+                quote_ident(&rollup_table)
+            ))?;
+        }
+        catalog::insert_rollup(conn, &spec)?;
+        let entries = catalog::entries_for_table(conn, table)?;
+        silodb_compact::rollup_backfill(conn, &plan, &entries)
+            .map_err(|e| bad(format!("backfill: {e}")))?;
+        Ok(())
+    })();
+    match txn {
+        Ok(()) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
+}
+
+/// Unregister a rollup and drop its plain table (a recursive/tiered rollup
+/// target is left in place — it has its own lifecycle; drop it like any
+/// silodb table).
+pub fn drop_rollup(conn: &Connection, table: &str, grain: &str) -> Result<(), InitError> {
+    let grain_us = silodb_schema::parse_duration_micros(grain)
+        .ok_or_else(|| InitError::BadSchema(format!("bad grain '{grain}'")))?;
+    let rollup_table = format!("{table}_rollup_{grain}");
+    catalog::delete_rollup(conn, table, grain_us)?;
+    let is_plain_table: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE name = ?1 AND type = 'table'",
+            [&rollup_table],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if is_plain_table.is_some() {
+        conn.execute_batch(&format!("DROP TABLE {}", quote_ident(&rollup_table)))?;
+    }
+    Ok(())
+}
+
+fn hot_decls(conn: &Connection, hot: &str) -> Result<Vec<silodb_schema::ColumnDecl>, InitError> {
+    let cols: Vec<silodb_schema::ColumnDecl> = conn
+        .prepare(&format!("PRAGMA table_info({})", quote_ident(hot)))?
+        .query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?
+        .filter_map(|r| r.ok().and_then(|(n, d)| silodb_schema::ColumnDecl::parse(&n, &d)))
+        .collect();
+    if cols.is_empty() {
+        return Err(InitError::BadSchema(format!("no hot table '{hot}'")));
+    }
+    Ok(cols)
+}
+
+/// Create the standard real-time view `<table>_<grain>`: materialized
+/// sufficient statistics UNION'd with a live aggregation of the hot tail,
+/// re-aggregated so late-data delta rows combine, with `<col>_avg`
+/// convenience columns. Requires [`load_module`] on querying connections
+/// (uses `silodb_bucket`).
+pub fn create_rollup_view(conn: &Connection, table: &str, grain: &str) -> Result<(), InitError> {
+    let bad = InitError::BadSchema;
+    let grain_us = silodb_schema::parse_duration_micros(grain)
+        .ok_or_else(|| bad(format!("bad grain '{grain}'")))?;
+    let specs = catalog::rollups_for_table(conn, table)?;
+    let spec = specs
+        .iter()
+        .find(|s| s.grain_us == grain_us)
+        .ok_or_else(|| bad(format!("no '{grain}' rollup registered for '{table}'")))?;
+    let origin = catalog::get_policy(conn, table)?
+        .map(|p| p.origin_us)
+        .unwrap_or(0);
+
+    let columns = hot_decls(conn, &format!("{table}_hot"))?;
+    let ts_idx = silodb_schema::resolve_ts_index(&columns, None)
+        .map_err(|e| bad(format!("hot table: {e}")))?;
+    let ts_name = quote_ident(&columns[ts_idx].name);
+    let mut group = Vec::new();
+    let mut aggs = Vec::new();
+    for (i, c) in columns.iter().enumerate() {
+        if i == ts_idx {
+            continue;
+        } else if c.ty == silodb_schema::SqliteType::Real {
+            aggs.push(quote_ident(&c.name));
+        } else {
+            group.push(quote_ident(&c.name));
+        }
+    }
+
+    let group_list = group.join(", ");
+    let comma_group = if group.is_empty() {
+        String::new()
+    } else {
+        format!(", {group_list}")
+    };
+    // Outer arm re-aggregates so additive delta rows (late data) combine.
+    let outer_stats = aggs
+        .iter()
+        .map(|a| {
+            let a = a.trim_matches('"');
+            format!(
+                "sum(\"{a}_count\") AS \"{a}_count\", sum(\"{a}_sum\") AS \"{a}_sum\", \
+                 sum(\"{a}_sumsq\") AS \"{a}_sumsq\", min(\"{a}_min\") AS \"{a}_min\", \
+                 max(\"{a}_max\") AS \"{a}_max\""
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    // Inner rollup arm passes the materialized columns through untouched.
+    let inner_pass = aggs
+        .iter()
+        .map(|a| {
+            let a = a.trim_matches('"');
+            format!("\"{a}_count\", \"{a}_sum\", \"{a}_sumsq\", \"{a}_min\", \"{a}_max\"")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let live_stats = aggs
+        .iter()
+        .map(|a| {
+            let raw = a.clone();
+            let a = a.trim_matches('"');
+            format!(
+                "count({raw}) AS \"{a}_count\", sum({raw}) AS \"{a}_sum\", \
+                 sum({raw}*{raw}) AS \"{a}_sumsq\", min({raw}) AS \"{a}_min\", \
+                 max({raw}) AS \"{a}_max\""
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let avg_cols = aggs
+        .iter()
+        .map(|a| {
+            let a = a.trim_matches('"');
+            format!(
+                "CAST(sum(\"{a}_sum\") AS REAL) / nullif(sum(\"{a}_count\"), 0) AS \"{a}_avg\""
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    conn.execute_batch(&format!(
+        "CREATE VIEW IF NOT EXISTS {view} AS
+         SELECT ts{comma_group}, {outer_stats}, {avg_cols}
+         FROM (
+           SELECT ts{comma_group}, {inner_pass} FROM {rollup}
+           UNION ALL
+           SELECT silodb_bucket('{grain}', {ts_name}, {origin}) AS ts{comma_group}, {live_stats}
+           FROM {hot} GROUP BY 1{live_group}
+         )
+         GROUP BY ts{comma_group}",
+        view = quote_ident(&format!("{table}_{grain}")),
+        rollup = quote_ident(&spec.rollup_table),
+        hot = quote_ident(&format!("{table}_hot")),
+        live_group = (2..=group.len() + 1)
+            .map(|i| format!(", {i}"))
+            .collect::<String>(),
+    ))?;
+    Ok(())
 }

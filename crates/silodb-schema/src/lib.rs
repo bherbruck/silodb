@@ -286,6 +286,49 @@ pub fn bucket_arrow_schema(columns: &[ColumnDecl], ts_idx: usize) -> Schema {
     )
 }
 
+// --- durations & bucketing, pure logic (no deps) ------------------------
+
+/// Parse a duration like `"1h"`, `"7d"`, `"2y"` into microseconds.
+/// Units: s m h d w y (y = 365d). `None` on anything else — no guessing.
+/// The one shared definition for policy strings, `silodb_bucket()`, and
+/// rollup grains, so they can never disagree.
+pub fn parse_duration_micros(s: &str) -> Option<i64> {
+    let s = s.trim();
+    // Last *char*, not last byte — split_at on a byte index panics inside
+    // multibyte characters (found by the never-panics proptest).
+    let (last_idx, _) = s.char_indices().last()?;
+    let (num, unit) = s.split_at(last_idx);
+    let n: i64 = num.trim().parse().ok()?;
+    let secs: i64 = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86_400,
+        "w" => 7 * 86_400,
+        "y" => 365 * 86_400,
+        _ => return None,
+    };
+    n.checked_mul(secs)
+        .and_then(|x| x.checked_mul(1_000_000))
+        .filter(|&us| us > 0)
+}
+
+/// Floor `ts` to the start of its `width`-sized window, in the grid
+/// anchored at `origin` (0 = epoch). The single bucketing definition used
+/// by the `silodb_bucket()` SQL function, tier/compaction windows, and
+/// rollup grains — query-side and write-side bucketing cannot disagree.
+///
+/// Euclidean: correct for pre-origin timestamps too. `None` only on
+/// arithmetic overflow at the i64 edges.
+pub fn bucket_floor(width_us: i64, ts_us: i64, origin_us: i64) -> Option<i64> {
+    if width_us <= 0 {
+        return None;
+    }
+    let rel = ts_us.checked_sub(origin_us)?;
+    rel.checked_sub(rel.rem_euclid(width_us))?
+        .checked_add(origin_us)
+}
+
 // --- timestamp text ↔ epoch-microseconds, pure logic (no deps) ---------
 //
 // Backs the `silodb_ts()` / `silodb_datetime()` SQL helpers the facade
@@ -438,6 +481,25 @@ mod prop_tests {
         fn decl_parsing_never_panics(name in "\\PC{0,16}", decl in "\\PC{0,24}") {
             let _ = SqliteType::from_decl(&decl);
             let _ = ColumnDecl::parse(&name, &decl);
+        }
+
+        /// bucket_floor lands in [bucket, bucket + width) with the bucket on
+        /// the origin grid, for any inputs that don't overflow.
+        #[test]
+        fn bucket_floor_is_a_floor(
+            width in 1i64..10_000_000_000,
+            ts in -2_000_000_000_000_000i64..2_000_000_000_000_000,
+            origin in -1_000_000_000_000i64..1_000_000_000_000,
+        ) {
+            let b = bucket_floor(width, ts, origin).unwrap();
+            prop_assert!(b <= ts && ts < b + width);
+            prop_assert_eq!((b - origin).rem_euclid(width), 0);
+        }
+
+        /// Duration parsing never panics on arbitrary strings.
+        #[test]
+        fn duration_parsing_never_panics(s in "\\PC{0,12}") {
+            let _ = parse_duration_micros(&s);
         }
     }
 }

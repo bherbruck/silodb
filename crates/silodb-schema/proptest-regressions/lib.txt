@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 44b75aef54d0830db1bc9b2f4b5561f3c426f64e1412c4ba8c315647cbb0de88 # shrinks to us = -62167219200000001
+cc f4fe5e3bd7923ad339ae8540ce0fea18d5e51e242dc3cf56f285dbb66c294f09 # shrinks to s = "ﬓ"

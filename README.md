@@ -22,6 +22,15 @@ conn.query_row("SELECT avg(value) FROM readings
 
 // storage management is one call on a dumb timer:
 silodb::maintain(&conn, "readings", "cold/", now_epoch_micros)?;
+
+// continuous aggregates — declare anytime, backfills from cold files,
+// stays exact via compaction-transaction deltas (no avg-of-avg: sufficient
+// statistics only). readings_1h = materialized history ∪ live hot tail:
+silodb::create_rollup(&conn, "readings", "1h")?;
+silodb::create_rollup_view(&conn, "readings", "1h")?;
+conn.query_row("SELECT value_avg FROM readings_1h
+                WHERE ts = silodb_bucket('1h', silodb_ts('2026-07-13T10:00:00Z'))
+                AND device = 'boiler'", [], |r| r.get::<_, f64>(0))?;
 ```
 
 ## How the tiers work

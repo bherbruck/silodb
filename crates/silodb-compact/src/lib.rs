@@ -373,13 +373,34 @@ pub fn compact_bucket(
     let mut buffered = 0usize;
     let mut total_rows = 0usize;
 
+    // Registered continuous aggregates get their deltas computed from this
+    // same stream and committed in this compaction's transaction.
+    let plans = rollup_plans(conn, spec.logical_table, &columns, ts_idx)?;
+    let mut accs: Vec<RollupAcc<'_>> = plans.iter().map(RollupAcc::new).collect();
+    let mut row_vals: Vec<Value> = Vec::with_capacity(columns.len());
+
     let write_result: Result<usize> = (|| {
         let mut rows = stmt.query(params![spec.bucket_start, spec.bucket_end])?;
         loop {
             let row = rows.next()?;
             if let Some(row) = row {
-                for (i, (buf, col)) in bufs.iter_mut().zip(&columns).enumerate() {
-                    buf.push(&col.name, row.get::<_, Value>(i)?)?;
+                if accs.is_empty() {
+                    for (i, (buf, col)) in bufs.iter_mut().zip(&columns).enumerate() {
+                        buf.push(&col.name, row.get::<_, Value>(i)?)?;
+                    }
+                } else {
+                    row_vals.clear();
+                    for i in 0..columns.len() {
+                        row_vals.push(row.get::<_, Value>(i)?);
+                    }
+                    for acc in &mut accs {
+                        acc.add_row(&row_vals)?;
+                    }
+                    for (buf, (col, v)) in
+                        bufs.iter_mut().zip(columns.iter().zip(row_vals.drain(..)))
+                    {
+                        buf.push(&col.name, v)?;
+                    }
                 }
                 buffered += 1;
                 total_rows += 1;
@@ -456,6 +477,11 @@ pub fn compact_bucket(
                 status: "active".into(),
             },
         )?;
+        // Rollup deltas commit with the migration: exact by construction,
+        // no invalidation machinery — every row enters cold exactly once.
+        for acc in accs {
+            acc.flush(conn)?;
+        }
         Ok(())
     })();
     match txn {
@@ -639,4 +665,312 @@ pub fn merge_window(
             Err(e)
         }
     }
+}
+
+// --- continuous-aggregate rollups ----------------------------------------
+
+/// Sufficient statistics for one REAL column in one (bucket, series) cell.
+/// avg/stddev are derived at query time (sum/count etc.) — materializing
+/// them would make re-aggregation inexact (avg-of-avg).
+#[derive(Clone, Copy)]
+struct Aggs {
+    count: i64,
+    sum: f64,
+    sumsq: f64,
+    min: f64,
+    max: f64,
+}
+
+impl Aggs {
+    fn new() -> Self {
+        Aggs {
+            count: 0,
+            sum: 0.0,
+            sumsq: 0.0,
+            min: f64::INFINITY,
+            max: f64::NEG_INFINITY,
+        }
+    }
+
+    fn add(&mut self, v: f64) {
+        self.count += 1;
+        self.sum += v;
+        self.sumsq += v * v;
+        self.min = self.min.min(v);
+        self.max = self.max.max(v);
+    }
+}
+
+/// Hashable series-identity key (group columns are never REAL, so no f64).
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum KeyVal {
+    Null,
+    Int(i64),
+    Text(String),
+    Blob(Vec<u8>),
+}
+
+/// Everything needed to compute and store one rollup's deltas: which
+/// column is the axis, which are series identity, which get aggregated,
+/// and the INSERT statement for the rollup table.
+pub struct RollupPlan {
+    pub spec: silodb_catalog::RollupSpec,
+    pub origin_us: i64,
+    ts_idx: usize,
+    group_idxs: Vec<usize>,
+    agg_idxs: Vec<usize>,
+    insert_sql: String,
+}
+
+impl RollupPlan {
+    /// Column classification: axis = `ts_idx`; aggregated = REAL columns;
+    /// series identity = everything else (INTEGER/TEXT/BLOB, including
+    /// secondary timestamp columns).
+    pub fn new(
+        spec: silodb_catalog::RollupSpec,
+        columns: &[silodb_schema::ColumnDecl],
+        ts_idx: usize,
+        origin_us: i64,
+    ) -> Self {
+        let mut group_idxs = Vec::new();
+        let mut agg_idxs = Vec::new();
+        for (i, c) in columns.iter().enumerate() {
+            if i == ts_idx {
+                continue;
+            } else if c.ty == SqliteType::Real {
+                agg_idxs.push(i);
+            } else {
+                group_idxs.push(i);
+            }
+        }
+        let n_params = 1 + group_idxs.len() + agg_idxs.len() * 5;
+        let placeholders = (1..=n_params)
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let insert_sql = format!(
+            "INSERT INTO {} VALUES ({placeholders})",
+            quote_ident(&spec.rollup_table)
+        );
+        RollupPlan {
+            spec,
+            origin_us,
+            ts_idx,
+            group_idxs,
+            agg_idxs,
+            insert_sql,
+        }
+    }
+
+    /// DDL for a fresh (plain-table) rollup target. `ts` keeps the
+    /// TIMESTAMP decl so the rollup table can itself be tiered
+    /// (recursion); group columns use their storage-class decls.
+    pub fn rollup_ddl(&self, columns: &[silodb_schema::ColumnDecl]) -> String {
+        let mut cols = vec!["ts TIMESTAMP".to_owned()];
+        for &i in &self.group_idxs {
+            cols.push(format!(
+                "{} {}",
+                quote_ident(&columns[i].name),
+                columns[i].ty.decl()
+            ));
+        }
+        for &i in &self.agg_idxs {
+            let n = &columns[i].name;
+            for (suffix, ty) in [
+                ("count", "INTEGER"),
+                ("sum", "REAL"),
+                ("sumsq", "REAL"),
+                ("min", "REAL"),
+                ("max", "REAL"),
+            ] {
+                cols.push(format!("{} {ty}", quote_ident(&format!("{n}_{suffix}"))));
+            }
+        }
+        format!(
+            "CREATE TABLE {} ({})",
+            quote_ident(&self.spec.rollup_table),
+            cols.join(", ")
+        )
+    }
+}
+
+/// Delta accumulator for one plan over one stream of rows.
+pub struct RollupAcc<'a> {
+    plan: &'a RollupPlan,
+    cells: std::collections::HashMap<(i64, Vec<KeyVal>), Vec<Aggs>>,
+}
+
+impl<'a> RollupAcc<'a> {
+    pub fn new(plan: &'a RollupPlan) -> Self {
+        RollupAcc {
+            plan,
+            cells: std::collections::HashMap::new(),
+        }
+    }
+
+    fn cell(&mut self, ts: i64, key: Vec<KeyVal>) -> Option<&mut Vec<Aggs>> {
+        let bucket =
+            silodb_schema::bucket_floor(self.plan.spec.grain_us, ts, self.plan.origin_us)?;
+        Some(
+            self.cells
+                .entry((bucket, key))
+                .or_insert_with(|| vec![Aggs::new(); self.plan.agg_idxs.len()]),
+        )
+    }
+
+    /// Accumulate one hot-table row (compaction path).
+    pub fn add_row(&mut self, values: &[Value]) -> Result<()> {
+        let Value::Integer(ts) = values[self.plan.ts_idx] else {
+            return Ok(()); // axis rows are validated upstream
+        };
+        let key: Vec<KeyVal> = self
+            .plan
+            .group_idxs
+            .iter()
+            .map(|&i| match &values[i] {
+                Value::Null => KeyVal::Null,
+                Value::Integer(v) => KeyVal::Int(*v),
+                Value::Text(s) => KeyVal::Text(s.clone()),
+                Value::Blob(b) => KeyVal::Blob(b.clone()),
+                Value::Real(f) => KeyVal::Int(f.to_bits() as i64), // unreachable: Real cols aggregate
+            })
+            .collect();
+        let agg_idxs = self.plan.agg_idxs.clone();
+        let Some(aggs) = self.cell(ts, key) else {
+            return Ok(());
+        };
+        for (slot, &i) in agg_idxs.iter().enumerate() {
+            match values[i] {
+                Value::Real(v) => aggs[slot].add(v),
+                Value::Integer(v) => aggs[slot].add(v as f64),
+                _ => {} // NULLs don't count (SQL aggregate semantics)
+            }
+        }
+        Ok(())
+    }
+
+    /// Accumulate a whole Arrow batch (backfill path, reading files this
+    /// crate wrote — types follow `bucket_arrow_schema`).
+    pub fn add_batch(&mut self, batch: &arrow::array::RecordBatch) -> Result<()> {
+        use arrow::array::{Array, AsArray};
+        use arrow::datatypes::{Float64Type, Int64Type, TimestampMicrosecondType};
+
+        let ts_col = batch
+            .column(self.plan.ts_idx)
+            .as_primitive::<TimestampMicrosecondType>();
+        for row in 0..batch.num_rows() {
+            let key: Vec<KeyVal> = self
+                .plan
+                .group_idxs
+                .iter()
+                .map(|&i| {
+                    let col = batch.column(i);
+                    if col.is_null(row) {
+                        return KeyVal::Null;
+                    }
+                    match col.data_type() {
+                        arrow::datatypes::DataType::Int64 => {
+                            KeyVal::Int(col.as_primitive::<Int64Type>().value(row))
+                        }
+                        arrow::datatypes::DataType::Timestamp(_, _) => KeyVal::Int(
+                            col.as_primitive::<TimestampMicrosecondType>().value(row),
+                        ),
+                        arrow::datatypes::DataType::Utf8 => {
+                            KeyVal::Text(col.as_string::<i32>().value(row).to_owned())
+                        }
+                        arrow::datatypes::DataType::Binary => {
+                            KeyVal::Blob(col.as_binary::<i32>().value(row).to_vec())
+                        }
+                        _ => KeyVal::Null,
+                    }
+                })
+                .collect();
+            let agg_idxs = self.plan.agg_idxs.clone();
+            let Some(aggs) = self.cell(ts_col.value(row), key) else {
+                continue;
+            };
+            for (slot, &i) in agg_idxs.iter().enumerate() {
+                let col = batch.column(i).as_primitive::<Float64Type>();
+                if !col.is_null(row) {
+                    aggs[slot].add(col.value(row));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// INSERT the accumulated deltas. Runs in the caller's ambient
+    /// transaction — compaction calls this inside its delete+catalog txn.
+    pub fn flush(self, conn: &Connection) -> Result<usize> {
+        let mut stmt = conn.prepare(&self.plan.insert_sql)?;
+        let n = self.cells.len();
+        for ((bucket, key), aggs) in self.cells {
+            let mut params: Vec<Value> = Vec::with_capacity(1 + key.len() + aggs.len() * 5);
+            params.push(Value::Integer(bucket));
+            for k in key {
+                params.push(match k {
+                    KeyVal::Null => Value::Null,
+                    KeyVal::Int(v) => Value::Integer(v),
+                    KeyVal::Text(s) => Value::Text(s),
+                    KeyVal::Blob(b) => Value::Blob(b),
+                });
+            }
+            for a in aggs {
+                params.push(Value::Integer(a.count));
+                params.push(Value::Real(a.sum));
+                params.push(Value::Real(a.sumsq));
+                if a.count == 0 {
+                    params.push(Value::Null);
+                    params.push(Value::Null);
+                } else {
+                    params.push(Value::Real(a.min));
+                    params.push(Value::Real(a.max));
+                }
+            }
+            stmt.execute(rusqlite::params_from_iter(params))?;
+        }
+        Ok(n)
+    }
+}
+
+/// Load the rollup plans registered for a table (empty when none).
+pub fn rollup_plans(
+    conn: &Connection,
+    logical_table: &str,
+    columns: &[silodb_schema::ColumnDecl],
+    ts_idx: usize,
+) -> Result<Vec<RollupPlan>> {
+    let specs = silodb_catalog::rollups_for_table(conn, logical_table)?;
+    if specs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let origin = silodb_catalog::get_policy(conn, logical_table)?
+        .map(|p| p.origin_us)
+        .unwrap_or(0);
+    Ok(specs
+        .into_iter()
+        .map(|s| RollupPlan::new(s, columns, ts_idx, origin))
+        .collect())
+}
+
+/// Backfill one plan from existing cold files, accumulating across all of
+/// them and flushing once. Caller wraps this (plus the registry insert) in
+/// one transaction so a crash leaves no half-registered rollup.
+pub fn rollup_backfill(
+    conn: &Connection,
+    plan: &RollupPlan,
+    entries: &[silodb_catalog::CatalogEntry],
+) -> Result<usize> {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    let mut acc = RollupAcc::new(plan);
+    for e in entries {
+        let file = File::open(&e.path).map_err(|_| CompactError::MissingCompactedFile {
+            path: e.path.clone(),
+        })?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
+        for batch in reader {
+            acc.add_batch(&batch?)?;
+        }
+    }
+    acc.flush(conn)
 }

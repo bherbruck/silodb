@@ -254,6 +254,51 @@ silodb::maintain(&conn, "readings", "cold/", now_us)?;  // timer + boot
   evicted whole). No `retain=` → keep forever.
 - Contract: **one maintainer process at a time** (same as the compaction
   scheduling contract it subsumes).
+- **Origin**: all windows are epoch-aligned by default; `origin=<ISO or
+  epoch-µs>` in the policy string re-anchors the whole grid (Monday weeks,
+  local-midnight days at a fixed offset). One origin per table, applied
+  uniformly to buckets/windows/grains, **immutable once set** (changing it
+  would misalign every written file — refused at re-init). True
+  DST-aware buckets are out of scope; document the fixed-offset caveat.
+
+## Continuous aggregates (rollups)
+
+Declare-anytime, Timescale-style — but with less machinery, because cold
+files are immutable and every row enters cold exactly once:
+
+```rust
+silodb::create_rollup(&conn, "readings", "1h")?;       // any time, even a year in
+silodb::create_rollup_view(&conn, "readings", "1h")?;  // real-time view readings_1h
+```
+
+- **Registration + backfill are one transaction**: the `_silodb_rollups`
+  row and a full backfill (streaming the existing cold files) commit
+  together — a crash leaves no half-registered rollup.
+- **Forward path rides compaction**: registered rollups get their deltas
+  computed from compaction's own row stream and committed **in the
+  tier-migration transaction**. Exact by construction — no invalidation
+  log (Timescale needs one because postgres history is mutable; ours
+  isn't). Late data is just another compaction, whose deltas are additive
+  rows the view re-aggregates.
+- **Sufficient statistics only**: `<col>_count/_sum/_sumsq/_min/_max` per
+  (grain bucket, series columns) — REAL columns aggregate, everything
+  else is series identity. avg/stddev derive at query time; nothing
+  inexact (avg-of-avg) is ever materialized, so grains re-aggregate to
+  coarser grains exactly.
+- **Grain must divide tier 0** (so every compaction bucket contains whole
+  grain buckets), and buckets sit on the table's origin grid — the same
+  `silodb_schema::bucket_floor` used by the `silodb_bucket()` SQL
+  function, so query-side and materialized bucketing cannot disagree
+  (tested as an equivalence property).
+- **Recursion**: the rollup target is an ordinary table; give it its own
+  `init_table_tiered` *before* `create_rollup` and the rollup's history
+  tiers into its own parquet buckets with its own retention ("2y raw,
+  10y hourlies" = two policy strings). Plain-table rollups follow the
+  source's `retain=` (whole grain buckets).
+- **SQL surface**: `silodb_bucket(width, ts[, origin])` — `time_bucket`'s
+  argument order, deliberately not its name (global flat function
+  namespace; integer-µs semantics). Admin stays Rust-API; a SQL admin
+  surface waits for the loadable extension.
 
 ## Type & timestamp mapping (`silodb-schema`)
 

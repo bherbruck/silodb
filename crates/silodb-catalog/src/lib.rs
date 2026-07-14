@@ -241,6 +241,11 @@ pub struct TablePolicy {
     /// Retention: evict cold files entirely older than now - retain.
     /// `None` = keep forever.
     pub retain_us: Option<i64>,
+    /// Window-grid anchor (epoch µs). All buckets/windows/grains for this
+    /// table align to multiples of their width *from this origin* (0 =
+    /// epoch). Immutable once files exist — changing it would misalign
+    /// every written file's windows.
+    pub origin_us: i64,
 }
 
 /// Create the policy table if needed, migrating older layouts. Idempotent.
@@ -250,15 +255,22 @@ pub fn ensure_policy_table(conn: &Connection) -> Result<()> {
             logical_table     TEXT PRIMARY KEY,
             tiers_us          TEXT NOT NULL,  -- comma-separated i64 µs
             safety_margin_us  INTEGER NOT NULL,
-            retain_us         INTEGER         -- NULL = keep forever
+            retain_us         INTEGER,        -- NULL = keep forever
+            origin_us         INTEGER NOT NULL DEFAULT 0
         );",
     )?;
-    // Migration for policy tables created before retain_us existed.
-    match conn.execute_batch("ALTER TABLE _silodb_policy ADD COLUMN retain_us INTEGER") {
-        Ok(()) => Ok(()),
-        Err(e) if e.to_string().contains("duplicate column") => Ok(()),
-        Err(e) => Err(e),
+    // Migrations for policy tables created before these columns existed.
+    for ddl in [
+        "ALTER TABLE _silodb_policy ADD COLUMN retain_us INTEGER",
+        "ALTER TABLE _silodb_policy ADD COLUMN origin_us INTEGER NOT NULL DEFAULT 0",
+    ] {
+        match conn.execute_batch(ddl) {
+            Ok(()) => {}
+            Err(e) if e.to_string().contains("duplicate column") => {}
+            Err(e) => return Err(e),
+        }
     }
+    Ok(())
 }
 
 /// Insert or replace a table's policy.
@@ -271,12 +283,13 @@ pub fn set_policy(conn: &Connection, policy: &TablePolicy) -> Result<()> {
         .collect::<Vec<_>>()
         .join(",");
     conn.execute(
-        "INSERT OR REPLACE INTO _silodb_policy VALUES (?1, ?2, ?3, ?4)",
+        "INSERT OR REPLACE INTO _silodb_policy VALUES (?1, ?2, ?3, ?4, ?5)",
         params![
             policy.logical_table,
             tiers,
             policy.safety_margin_us,
-            policy.retain_us
+            policy.retain_us,
+            policy.origin_us
         ],
     )?;
     Ok(())
@@ -296,8 +309,8 @@ pub fn get_policy(conn: &Connection, logical_table: &str) -> Result<Option<Table
     }
     ensure_policy_table(conn)?; // migrate before reading retain_us
     conn.query_row(
-        "SELECT logical_table, tiers_us, safety_margin_us, retain_us FROM _silodb_policy
-         WHERE logical_table = ?1",
+        "SELECT logical_table, tiers_us, safety_margin_us, retain_us, origin_us
+         FROM _silodb_policy WHERE logical_table = ?1",
         [logical_table],
         |r| {
             let tiers: String = r.get(1)?;
@@ -309,10 +322,83 @@ pub fn get_policy(conn: &Connection, logical_table: &str) -> Result<Option<Table
                     .collect(),
                 safety_margin_us: r.get(2)?,
                 retain_us: r.get(3)?,
+                origin_us: r.get(4)?,
             })
         },
     )
     .optional()
+}
+
+// --- rollup registry ------------------------------------------------------
+
+/// One registered continuous aggregate: sufficient statistics per
+/// `(grain bucket, series columns)` materialized into `rollup_table`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RollupSpec {
+    pub logical_table: String,
+    pub grain_us: i64,
+    /// Name deltas are INSERTed into. May be a plain table or a
+    /// silodb single-name view (recursion: a tiered rollup).
+    pub rollup_table: String,
+}
+
+/// Create the rollup registry table if needed. Idempotent.
+pub fn ensure_rollups_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS _silodb_rollups (
+            logical_table TEXT NOT NULL,
+            grain_us      INTEGER NOT NULL,
+            rollup_table  TEXT NOT NULL,
+            PRIMARY KEY (logical_table, grain_us)
+        );",
+    )
+}
+
+/// Register a rollup. Runs in the caller's ambient transaction —
+/// `create_rollup` commits this atomically with the backfill.
+pub fn insert_rollup(conn: &Connection, spec: &RollupSpec) -> Result<()> {
+    ensure_rollups_table(conn)?;
+    conn.execute(
+        "INSERT INTO _silodb_rollups VALUES (?1, ?2, ?3)",
+        params![spec.logical_table, spec.grain_us, spec.rollup_table],
+    )?;
+    Ok(())
+}
+
+/// Remove a rollup registration (its table is the caller's to drop).
+pub fn delete_rollup(conn: &Connection, logical_table: &str, grain_us: i64) -> Result<()> {
+    conn.execute(
+        "DELETE FROM _silodb_rollups WHERE logical_table = ?1 AND grain_us = ?2",
+        params![logical_table, grain_us],
+    )?;
+    Ok(())
+}
+
+/// All rollups registered for a table (empty if the registry doesn't
+/// exist yet).
+pub fn rollups_for_table(conn: &Connection, logical_table: &str) -> Result<Vec<RollupSpec>> {
+    let exists: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_silodb_rollups'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if exists.is_none() {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT logical_table, grain_us, rollup_table FROM _silodb_rollups
+         WHERE logical_table = ?1 ORDER BY grain_us",
+    )?;
+    let rows = stmt.query_map([logical_table], |r| {
+        Ok(RollupSpec {
+            logical_table: r.get(0)?,
+            grain_us: r.get(1)?,
+            rollup_table: r.get(2)?,
+        })
+    })?;
+    rows.collect()
 }
 
 /// Flip every active file entirely older than `cutoff` to
