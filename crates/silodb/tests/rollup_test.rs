@@ -20,13 +20,7 @@ fn env(tiers: &str) -> Env {
     let base = dir.path().join("cold");
     let conn = Connection::open_in_memory().unwrap();
     silodb::load_module(&conn).unwrap();
-    silodb::init_table_tiered(
-        &conn,
-        "readings",
-        "ts TIMESTAMP, device TEXT, value REAL",
-        &base,
-        tiers,
-    )
+    silodb::init_table_tiered_at(&conn, "readings", "ts TIMESTAMP, device TEXT, value REAL", tiers, &base)
     .unwrap();
     Env {
         conn,
@@ -59,7 +53,7 @@ impl Env {
     }
 
     fn maintain(&self, now: i64) {
-        silodb::maintain(&self.conn, "readings", &self.base, now).unwrap();
+        silodb::maintain(&self.conn, "readings", now).unwrap();
     }
 
     /// The equivalence property: rollup view ≡ raw GROUP BY silodb_bucket.
@@ -155,13 +149,7 @@ fn origin_aligns_rollup_buckets() {
     let base = dir.path().join("cold");
     let conn = Connection::open_in_memory().unwrap();
     silodb::load_module(&conn).unwrap();
-    silodb::init_table_tiered(
-        &conn,
-        "readings",
-        "ts TIMESTAMP, device TEXT, value REAL",
-        &base,
-        &format!("1d,7d,origin={origin}"),
-    )
+    silodb::init_table_tiered_at(&conn, "readings", "ts TIMESTAMP, device TEXT, value REAL", &format!("1d,7d,origin={origin}"), &base)
     .unwrap();
     let e = Env {
         conn,
@@ -196,13 +184,7 @@ fn origin_aligns_rollup_buckets() {
     assert_eq!(misaligned, 0);
 
     // Origin is immutable: re-init with a different one is refused.
-    let err = silodb::init_table_tiered(
-        &e.conn,
-        "readings",
-        "ts TIMESTAMP, device TEXT, value REAL",
-        &e.base,
-        "1d,7d,origin=0",
-    )
+    let err = silodb::init_table_tiered_at(&e.conn, "readings", "ts TIMESTAMP, device TEXT, value REAL", "1d,7d,origin=0", &e.base)
     .unwrap_err();
     assert!(err.to_string().contains("origin"), "{err}");
 }
@@ -242,13 +224,13 @@ fn rollup_validation_and_drop() {
 fn tiered_rollup_recursion() {
     let e = env("1d,7d");
     // Rollup's single-name surface FIRST (schema = the rollup layout)...
-    silodb::init_table_tiered(
+    silodb::init_table_tiered_at(
         &e.conn,
         "readings_rollup_1h",
         "ts TIMESTAMP, device TEXT, value_count INTEGER, value_sum REAL, \
          value_sumsq REAL, value_min REAL, value_max REAL",
-        &e.base,
         "7d,28d",
+        &e.base,
     )
     .unwrap();
     // ...then registration detects and uses it.
@@ -261,7 +243,7 @@ fn tiered_rollup_recursion() {
 
     // Maintain the rollup table itself: its hourly rows compact into its
     // own cold files.
-    silodb::maintain(&e.conn, "readings_rollup_1h", &e.base, now).unwrap();
+    silodb::maintain(&e.conn, "readings_rollup_1h", now).unwrap();
     let rollup_files = silodb::catalog::entries_for_table(&e.conn, "readings_rollup_1h")
         .unwrap()
         .len();
@@ -310,13 +292,7 @@ fn rollup_rows_follow_source_retention() {
     let base = dir.path().join("cold");
     let conn = Connection::open_in_memory().unwrap();
     silodb::load_module(&conn).unwrap();
-    silodb::init_table_tiered(
-        &conn,
-        "readings",
-        "ts TIMESTAMP, device TEXT, value REAL",
-        &base,
-        "1d,7d,retain=7d",
-    )
+    silodb::init_table_tiered_at(&conn, "readings", "ts TIMESTAMP, device TEXT, value REAL", "1d,7d,retain=7d", &base)
     .unwrap();
     let e = Env {
         conn,

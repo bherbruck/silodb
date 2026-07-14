@@ -186,7 +186,7 @@ fn insert_rows(conn: &Connection, table: &str, days: i64) -> f64 {
 }
 
 /// Bump when the generator or schema changes — invalidates cached datasets.
-const DATASET_VERSION: u32 = 2;
+const DATASET_VERSION: u32 = 3;
 
 /// Build the (silodb daily-compacted + plain indexed) dataset into `cache`
 /// unless a completed one is already there. This is the expensive part —
@@ -209,13 +209,7 @@ fn ensure_dataset(cache: &Path, days: i64) {
     conn.pragma_update(None, "journal_mode", "WAL").unwrap();
     conn.pragma_update(None, "synchronous", "NORMAL").unwrap();
     silodb::load_module(&conn).unwrap();
-    silodb::init_table_tiered(
-        &conn,
-        "readings",
-        "ts TIMESTAMP, device TEXT, sensor TEXT, value REAL",
-        &base,
-        "1d,7d,28d",
-    )
+    silodb::init_table_tiered_at(&conn, "readings", "ts TIMESTAMP, device TEXT, sensor TEXT, value REAL", "1d,7d,28d", &base)
     .unwrap();
     let insert_s = insert_rows(&conn, "readings", days);
     println!("  hot insert: {:.1}s ({:.0} rows/s)", insert_s, rows as f64 / insert_s);
@@ -223,7 +217,7 @@ fn ensure_dataset(cache: &Path, days: i64) {
     let mut files = 0;
     for b in 0..days {
         if let silodb::CompactOutcome::Compacted { .. } =
-            silodb::compact_table(&conn, "readings", b * BUCKET_US, (b + 1) * BUCKET_US, &base)
+            silodb::compact_table(&conn, "readings", b * BUCKET_US, (b + 1) * BUCKET_US)
                 .unwrap()
         {
             files += 1;
@@ -319,6 +313,13 @@ fn main() {
         ],
     )
     .unwrap();
+    // The policy's frozen base_dir must follow the copy too, or maintain()
+    // would write into (and GC from) the cache.
+    conn.execute(
+        "UPDATE _silodb_policy SET base_dir = ?1",
+        [base.display().to_string()],
+    )
+    .unwrap();
 
     let plain = Connection::open(cache.join("plain.db")).unwrap();
 
@@ -381,7 +382,7 @@ fn main() {
     let t = Instant::now();
     // Clock just past the end of the data + safety margin: everything due.
     let now = days * BUCKET_US + 3 * 3600 * 1_000_000;
-    let actions = silodb::maintain(&conn, "readings", &base, now).unwrap();
+    let actions = silodb::maintain(&conn, "readings", now).unwrap();
     let (mut merges, mut gcs) = (0, 0);
     for a in &actions {
         match a {
@@ -437,12 +438,12 @@ fn single_write_ingest(out: &Path) {
     conn.pragma_update(None, "journal_mode", "WAL").unwrap();
     conn.pragma_update(None, "synchronous", "NORMAL").unwrap();
     silodb::load_module(&conn).unwrap();
-    silodb::init_table_tiered(
+    silodb::init_table_tiered_at(
         &conn,
         "readings",
         "ts TIMESTAMP, device TEXT, sensor TEXT, value REAL",
-        scratch.join("cold"),
         "1d,7d,28d",
+        scratch.join("cold"),
     )
     .unwrap();
     let mut rng = Lcg(9);

@@ -33,7 +33,7 @@ fn reader_sees_consistent_counts_while_writer_compacts() {
     let db = dir.path().join("hot.db");
 
     let writer = open(&db);
-    silodb::init_table(&writer, "readings", SCHEMA, &base).unwrap();
+    silodb::init_table_at(&writer, "readings", SCHEMA, &base).unwrap();
 
     let done = Arc::new(AtomicBool::new(false));
     let reader_done = done.clone();
@@ -70,7 +70,7 @@ fn reader_sees_consistent_counts_while_writer_compacts() {
                 .unwrap();
         }
         let outcome =
-            silodb::compact_table(&writer, "readings", start, start + 1000, &base).unwrap();
+            silodb::compact_table(&writer, "readings", start, start + 1000).unwrap();
         assert!(
             matches!(outcome, CompactOutcome::Compacted { rows, .. } if rows == ROWS_PER_BUCKET as usize),
             "{outcome:?}"

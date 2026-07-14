@@ -261,6 +261,13 @@ pub struct TablePolicy {
     /// epoch). Immutable once files exist — changing it would misalign
     /// every written file's windows.
     pub origin_us: i64,
+    /// Base cold-storage directory, frozen at create time (explicit arg >
+    /// db default > `<dbfile>.silodb/`). Empty = not set (pre-upgrade
+    /// policies); callers fall back to passing it explicitly.
+    pub base_dir: String,
+    /// Explicit bucket-axis column, when inference (one TIMESTAMP column,
+    /// else INTEGER `ts`) isn't enough. Frozen at create time.
+    pub ts_column: Option<String>,
 }
 
 /// Create the policy table if needed, migrating older layouts. Idempotent.
@@ -271,13 +278,17 @@ pub fn ensure_policy_table(conn: &Connection) -> Result<()> {
             tiers_us          TEXT NOT NULL,  -- comma-separated i64 µs
             safety_margin_us  INTEGER NOT NULL,
             retain_us         INTEGER,        -- NULL = keep forever
-            origin_us         INTEGER NOT NULL DEFAULT 0
+            origin_us         INTEGER NOT NULL DEFAULT 0,
+            base_dir          TEXT NOT NULL DEFAULT '',
+            ts_column         TEXT
         );",
     )?;
     // Migrations for policy tables created before these columns existed.
     for ddl in [
         "ALTER TABLE _silodb_policy ADD COLUMN retain_us INTEGER",
         "ALTER TABLE _silodb_policy ADD COLUMN origin_us INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE _silodb_policy ADD COLUMN base_dir TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE _silodb_policy ADD COLUMN ts_column TEXT",
     ] {
         match conn.execute_batch(ddl) {
             Ok(()) => {}
@@ -298,13 +309,15 @@ pub fn set_policy(conn: &Connection, policy: &TablePolicy) -> Result<()> {
         .collect::<Vec<_>>()
         .join(",");
     conn.execute(
-        "INSERT OR REPLACE INTO _silodb_policy VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT OR REPLACE INTO _silodb_policy VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             policy.logical_table,
             tiers,
             policy.safety_margin_us,
             policy.retain_us,
-            policy.origin_us
+            policy.origin_us,
+            policy.base_dir,
+            policy.ts_column
         ],
     )?;
     Ok(())
@@ -324,7 +337,8 @@ pub fn get_policy(conn: &Connection, logical_table: &str) -> Result<Option<Table
     }
     ensure_policy_table(conn)?; // migrate before reading retain_us
     conn.query_row(
-        "SELECT logical_table, tiers_us, safety_margin_us, retain_us, origin_us
+        "SELECT logical_table, tiers_us, safety_margin_us, retain_us, origin_us,
+                base_dir, ts_column
          FROM _silodb_policy WHERE logical_table = ?1",
         [logical_table],
         |r| {
@@ -338,10 +352,46 @@ pub fn get_policy(conn: &Connection, logical_table: &str) -> Result<Option<Table
                 safety_margin_us: r.get(2)?,
                 retain_us: r.get(3)?,
                 origin_us: r.get(4)?,
+                base_dir: r.get(5)?,
+                ts_column: r.get(6)?,
             })
         },
     )
     .optional()
+}
+
+// --- db-level config -------------------------------------------------------
+
+/// Get a `_silodb_config` value (e.g. `default_dir`).
+pub fn get_config(conn: &Connection, key: &str) -> Result<Option<String>> {
+    let exists: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='_silodb_config'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if exists.is_none() {
+        return Ok(None);
+    }
+    conn.query_row(
+        "SELECT value FROM _silodb_config WHERE key = ?1",
+        [key],
+        |r| r.get(0),
+    )
+    .optional()
+}
+
+/// Set a `_silodb_config` value.
+pub fn set_config(conn: &Connection, key: &str, value: &str) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS _silodb_config (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+    )?;
+    conn.execute(
+        "INSERT OR REPLACE INTO _silodb_config VALUES (?1, ?2)",
+        params![key, value],
+    )?;
+    Ok(())
 }
 
 // --- rollup registry ------------------------------------------------------
@@ -509,6 +559,8 @@ pub fn parse_policy_string(
         safety_margin_us: 2 * 3600 * 1_000_000,
         retain_us: retain,
         origin_us: origin,
+        base_dir: String::new(), // caller fills after dir resolution
+        ts_column: None,         // caller fills from its ts argument
     })
 }
 

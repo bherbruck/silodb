@@ -19,7 +19,7 @@ fn env(tiers: &str) -> Env {
     let base = dir.path().join("cold");
     let conn = Connection::open_in_memory().unwrap();
     silodb::load_module(&conn).unwrap();
-    silodb::init_table_tiered(&conn, "readings", "ts TIMESTAMP, value REAL", &base, tiers)
+    silodb::init_table_tiered_at(&conn, "readings", "ts TIMESTAMP, value REAL", tiers, &base)
         .unwrap();
     Env {
         conn,
@@ -58,7 +58,7 @@ impl Env {
     }
 
     fn maintain(&self, now: i64) -> Vec<MaintainAction> {
-        silodb::maintain(&self.conn, "readings", &self.base, now).unwrap()
+        silodb::maintain(&self.conn, "readings", now).unwrap()
     }
 }
 
@@ -184,7 +184,7 @@ fn merge_crash_rerun_is_idempotent() {
     let now = 8 * DAY;
     // Compact the dailies only (tier0), leaving promotion undone.
     for d in 0..7 {
-        silodb::compact_table(&e.conn, "readings", d * DAY, (d + 1) * DAY, &e.base).unwrap();
+        silodb::compact_table(&e.conn, "readings", d * DAY, (d + 1) * DAY).unwrap();
     }
 
     // Do the real merge once to learn the exact file a finished run makes.
@@ -221,18 +221,18 @@ fn merge_crash_rerun_is_idempotent() {
 fn misaligned_tiers_are_rejected_at_init() {
     let conn = Connection::open_in_memory().unwrap();
     silodb::load_module(&conn).unwrap();
-    let err = silodb::init_table_tiered(
+    let err = silodb::init_table_tiered_at(
         &conn,
         "readings",
         "ts TIMESTAMP, value REAL",
-        "cold/",
         "1d,7d,30d", // 30 % 7 != 0
+        "cold/",
     )
     .unwrap_err();
     assert!(err.to_string().contains("multiple"), "{err}");
     for bad in ["", "0d", "-1d", "1x", "7d,1d"] {
         assert!(
-            silodb::init_table_tiered(&conn, "t", "ts TIMESTAMP", "cold/", bad).is_err(),
+            silodb::init_table_tiered_at(&conn, "t", "ts TIMESTAMP", bad, "cold/").is_err(),
             "{bad} should be rejected"
         );
     }
@@ -245,13 +245,7 @@ fn retention_evicts_whole_expired_files() {
     let base = dir.path().join("cold");
     let conn = Connection::open_in_memory().unwrap();
     silodb::load_module(&conn).unwrap();
-    silodb::init_table_tiered(
-        &conn,
-        "readings",
-        "ts TIMESTAMP, value REAL",
-        &base,
-        "1d,7d,retain=14d",
-    )
+    silodb::init_table_tiered_at(&conn, "readings", "ts TIMESTAMP, value REAL", "1d,7d,retain=14d", &base)
     .unwrap();
     let e = Env {
         conn,
@@ -312,12 +306,12 @@ fn retention_evicts_whole_expired_files() {
 fn retention_shorter_than_largest_tier_is_rejected() {
     let conn = Connection::open_in_memory().unwrap();
     silodb::load_module(&conn).unwrap();
-    let err = silodb::init_table_tiered(
+    let err = silodb::init_table_tiered_at(
         &conn,
         "readings",
         "ts TIMESTAMP, value REAL",
-        "cold/",
         "1d,7d,28d,retain=14d",
+        "cold/",
     )
     .unwrap_err();
     assert!(err.to_string().contains("retain"), "{err}");
@@ -327,6 +321,6 @@ fn retention_shorter_than_largest_tier_is_rejected() {
 fn maintain_without_policy_errors() {
     let conn = Connection::open_in_memory().unwrap();
     silodb::load_module(&conn).unwrap();
-    let err = silodb::maintain(&conn, "nope", "cold/", 0).unwrap_err();
+    let err = silodb::maintain(&conn, "nope", 0).unwrap_err();
     assert!(matches!(err, silodb::MaintainError::NoPolicy(_)));
 }

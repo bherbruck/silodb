@@ -69,7 +69,7 @@ proptest! {
                 }
                 Op::Maintain(dh) => {
                     clock += dh * HOUR;
-                    silodb::maintain(&conn, "t", &base, clock).unwrap();
+                    silodb::maintain(&conn, "t", clock).unwrap();
                 }
                 Op::Query(lo_h, len_h, dev) => {
                     let (lo, hi) = (lo_h * HOUR, (lo_h + len_h) * HOUR);

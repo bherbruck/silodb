@@ -10,7 +10,7 @@ const SCHEMA: &str = "ts INTEGER, value REAL, name TEXT";
 fn boot(db: &std::path::Path, base: &std::path::Path) -> Connection {
     let conn = Connection::open(db).unwrap();
     silodb::load_module(&conn).unwrap();
-    silodb::init_table(&conn, "readings", SCHEMA, base).unwrap();
+    silodb::init_table_at(&conn, "readings", SCHEMA, base).unwrap();
     conn
 }
 
@@ -41,7 +41,7 @@ fn single_name_surface_hides_the_hot_cold_split() {
 
     // Compact three closed buckets; the app-visible table never changes.
     for b in 0..3i64 {
-        let outcome = compact_table(&conn, "readings", b * 1000, (b + 1) * 1000, &base).unwrap();
+        let outcome = compact_table(&conn, "readings", b * 1000, (b + 1) * 1000).unwrap();
         assert!(matches!(outcome, CompactOutcome::Compacted { rows: 10, .. }));
         assert_eq!(count(&conn, "SELECT count(*) FROM readings"), 40);
     }
@@ -69,7 +69,7 @@ fn single_name_surface_hides_the_hot_cold_split() {
         .unwrap();
     assert_eq!(count(&conn, "SELECT count(*) FROM readings"), 41);
     assert!(matches!(
-        compact_table(&conn, "readings", 1000, 2000, &base).unwrap(),
+        compact_table(&conn, "readings", 1000, 2000).unwrap(),
         CompactOutcome::Compacted { rows: 1, .. }
     ));
     assert_eq!(count(&conn, "SELECT count(*) FROM readings"), 41);
@@ -84,7 +84,7 @@ fn second_boot_is_a_noop_and_data_survives() {
         let conn = boot(&db, &base);
         conn.execute("INSERT INTO readings VALUES (100, 1.0, 'a')", [])
             .unwrap();
-        compact_table(&conn, "readings", 0, 1000, &base).unwrap();
+        compact_table(&conn, "readings", 0, 1000).unwrap();
         conn.execute("INSERT INTO readings VALUES (2000, 2.0, 'b')", [])
             .unwrap();
     }
@@ -107,7 +107,7 @@ fn cold_only_database_keeps_working_without_the_hot_table() {
         let conn = boot(&db, &base);
         conn.execute("INSERT INTO readings VALUES (100, 1.0, 'a')", [])
             .unwrap();
-        compact_table(&conn, "readings", 0, 1000, &base).unwrap();
+        compact_table(&conn, "readings", 0, 1000).unwrap();
         conn.execute_batch(
             "DROP TRIGGER readings_insert;
              DROP VIEW readings;
@@ -130,7 +130,7 @@ fn init_table_detects_schema_drift() {
 
     let conn = Connection::open(&db).unwrap();
     silodb::load_module(&conn).unwrap();
-    let err = silodb::init_table(&conn, "readings", "ts INTEGER, other REAL", &base).unwrap_err();
+    let err = silodb::init_table_at(&conn, "readings", "ts INTEGER, other REAL", &base).unwrap_err();
     assert!(matches!(err, InitError::SchemaDrift { .. }), "{err}");
 }
 
@@ -139,10 +139,10 @@ fn init_table_requires_a_resolvable_ts_column() {
     let conn = Connection::open_in_memory().unwrap();
     silodb::load_module(&conn).unwrap();
     // No TIMESTAMP column and nothing named ts.
-    let err = silodb::init_table(&conn, "readings", "value REAL", "cold/").unwrap_err();
+    let err = silodb::init_table_at(&conn, "readings", "value REAL", "cold/").unwrap_err();
     assert!(matches!(err, InitError::BadSchema(_)), "{err}");
     // Two TIMESTAMP columns: refuse to guess the bucket axis.
-    let err = silodb::init_table(
+    let err = silodb::init_table_at(
         &conn,
         "readings",
         "a TIMESTAMP, b DATETIME, value REAL",
@@ -161,7 +161,7 @@ fn timestamp_typed_column_drives_everything_by_type() {
     let base = dir.path().join("cold");
     let conn = Connection::open_in_memory().unwrap();
     silodb::load_module(&conn).unwrap();
-    silodb::init_table(
+    silodb::init_table_at(
         &conn,
         "sensor",
         "stamped_at TIMESTAMP, seq INTEGER, value REAL",
@@ -184,7 +184,7 @@ fn timestamp_typed_column_drives_everything_by_type() {
     // Compact the 10:00 hour — bucket axis discovered by type, any name.
     let hour = 3_600_000_000i64;
     let start = silodb_schema_ts("2026-07-13T10:00:00Z");
-    let outcome = compact_table(&conn, "sensor", start, start + hour, &base).unwrap();
+    let outcome = compact_table(&conn, "sensor", start, start + hour).unwrap();
     let CompactOutcome::Compacted { rows: 1, path } = outcome else {
         panic!("{outcome:?}");
     };

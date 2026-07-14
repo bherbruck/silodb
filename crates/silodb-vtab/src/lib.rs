@@ -559,9 +559,11 @@ impl<'vtab> CreateVTab<'vtab> for SiloTab {
 
             // Policy first (validates tiers/retain/origin before any DDL);
             // origin immutability across re-creates.
-            let policy =
+            let mut policy =
                 silodb_catalog::parse_policy_string(&vtab.logical_table, &tiers_str)
                     .map_err(module_err)?;
+            policy.base_dir = vtab.base_dir.display().to_string();
+            policy.ts_column = parsed.ts_column.clone();
             if let Some(existing) = silodb_catalog::get_policy(&hot, &vtab.logical_table)
                 .map_err(module_err)?
                 && existing.origin_us != policy.origin_us

@@ -245,6 +245,17 @@ silodb::maintain(&conn, "readings", "cold/", now_us)?;  // timer + boot
 - `merge_window` is the one write-path operation that reads Parquet — its
   own children only, never the hot table. `compact_bucket`'s
   never-reads-Parquet invariant is per-function and unchanged.
+- **The policy also freezes the base directory and (optionally) the ts
+  column at create time.** Nothing downstream repeats them: `maintain(conn,
+  table, now)` and `compact_table(conn, table, start, end)` read the
+  policy, making wrong-dir bugs unrepresentable. Dir resolution at create:
+  explicit argument > db-level default (`silodb_set_default_dir` /
+  `set_default_dir`, stored in `_silodb_config`) > `<dbfile>.silodb/`
+  (anchored to the database file, never the CWD — in-memory dbs require an
+  explicit dir). Changing the default later never moves existing tables.
+  The ts column follows `create_hypertable` precedent: slot #2 of
+  `silodb_create_table(table[, ts[, tiers[, dir]]])`, NULL/omitted =
+  inference (one TIMESTAMP column, else INTEGER `ts`).
 - **Retention** is one more element of the same policy string:
   `"1d,7d,28d,retain=2y"`. `maintain` flips active files entirely older
   than `now − retain` to `status='evicted'` (whole-file granularity — a
@@ -451,6 +462,11 @@ Single source of truth for both directions; never depends on `rusqlite`.
   maintenance would merge its small files like anything else. Not designed
   further than this paragraph on purpose.
 - *(built — see Managed mode above)*
+- **Object-store backends (S3-style) as an optional cold tier.** The
+  catalog stores location strings verbatim (an `s3://` URI already fits),
+  parquet readers exist for object stores, and S3's atomic single PUT
+  replaces the tmp/fsync/rename dance outright. Read-side caching keyed by
+  ETag instead of `(mtime, size)`. Not designed further on purpose.
 - **Catalog rebuild / adopt** — recovering a database from bare parquet
   files (footer scan → catalog rows). Disaster-recovery tool, cheap to
   build when needed.

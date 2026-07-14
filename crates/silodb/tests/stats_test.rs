@@ -10,7 +10,6 @@ const MARGIN: i64 = 2 * HOUR;
 
 struct Env {
     conn: Connection,
-    base: std::path::PathBuf,
     _dir: tempfile::TempDir,
 }
 
@@ -19,19 +18,10 @@ fn env(tiers: &str) -> Env {
     let base = dir.path().join("cold");
     let conn = Connection::open_in_memory().unwrap();
     silodb::load_module(&conn).unwrap();
-    silodb::init_table_tiered(
-        &conn,
-        "readings",
-        "ts TIMESTAMP, device TEXT, value REAL",
-        &base,
-        tiers,
-    )
+    silodb::init_table_tiered_at(&conn, "readings", "ts TIMESTAMP, device TEXT, value REAL", tiers, &base)
     .unwrap();
-    Env {
-        conn,
-        base,
-        _dir: dir,
-    }
+    let _ = base;
+    Env { conn, _dir: dir }
 }
 
 impl Env {
@@ -59,7 +49,7 @@ impl Env {
     }
 
     fn maintain(&self, now: i64) {
-        silodb::maintain(&self.conn, "readings", &self.base, now).unwrap();
+        silodb::maintain(&self.conn, "readings", now).unwrap();
     }
 
     fn count(&self, sql: &str) -> i64 {

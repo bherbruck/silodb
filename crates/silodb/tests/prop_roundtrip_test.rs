@@ -31,7 +31,7 @@ proptest! {
         let base = dir.path().join("cold");
         let conn = Connection::open_in_memory().unwrap();
         silodb::load_module(&conn).unwrap();
-        silodb::init_table(
+        silodb::init_table_at(
             &conn,
             "readings",
             "ts TIMESTAMP, seq INTEGER, value REAL, name TEXT, payload BLOB",
@@ -53,13 +53,7 @@ proptest! {
         let first = lo.div_euclid(bucket_width);
         let last = hi.div_euclid(bucket_width);
         for b in first..=last {
-            silodb::compact_table(
-                &conn,
-                "readings",
-                b * bucket_width,
-                (b + 1) * bucket_width,
-                &base,
-            )
+            silodb::compact_table(&conn, "readings", b * bucket_width, (b + 1) * bucket_width)
             .unwrap();
         }
         let hot: i64 = conn

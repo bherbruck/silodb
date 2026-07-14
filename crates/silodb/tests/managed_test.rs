@@ -29,7 +29,7 @@ fn count(conn: &Connection, sql: &str) -> i64 {
 
 #[test]
 fn single_ddl_lifecycle() {
-    let (conn, _dir, base) = setup();
+    let (conn, _dir, _base) = setup();
 
     // The DDL created the shadow + policy.
     assert_eq!(
@@ -54,7 +54,7 @@ fn single_ddl_lifecycle() {
     assert_eq!(count(&conn, "SELECT count(*) FROM readings_data"), 72);
 
     // maintain() finds the shadow by convention and compacts.
-    silodb::maintain(&conn, "readings", &base, 3 * DAY + MARGIN + 1).unwrap();
+    silodb::maintain(&conn, "readings", 3 * DAY + MARGIN + 1).unwrap();
     assert_eq!(count(&conn, "SELECT count(*) FROM readings_data"), 0);
     assert_eq!(count(&conn, "SELECT count(*) FROM readings"), 72, "hot ∪ cold");
 
@@ -101,7 +101,7 @@ fn inline_column_definitions() {
     conn.execute("INSERT INTO readings VALUES (?1, 'a', 1.5)", params![HOUR])
         .unwrap();
     assert_eq!(count(&conn, "SELECT count(*) FROM readings"), 1);
-    silodb::maintain(&conn, "readings", &base, DAY + MARGIN + 1).unwrap();
+    silodb::maintain(&conn, "readings", DAY + MARGIN + 1).unwrap();
     assert_eq!(count(&conn, "SELECT count(*) FROM readings_data"), 0);
     assert_eq!(count(&conn, "SELECT count(*) FROM readings"), 1, "cold now");
 
@@ -127,10 +127,10 @@ fn inline_column_definitions() {
 
 #[test]
 fn writes_are_guarded() {
-    let (conn, _dir, base) = setup();
+    let (conn, _dir, _base) = setup();
     conn.execute("INSERT INTO readings VALUES (0, 'a', 1.0)", [])
         .unwrap();
-    silodb::maintain(&conn, "readings", &base, DAY + MARGIN + 1).unwrap();
+    silodb::maintain(&conn, "readings", DAY + MARGIN + 1).unwrap();
 
     // UPDATE/DELETE refused with a pointer to the shadow table.
     let err = conn
@@ -179,7 +179,7 @@ fn drop_preserves_history_and_recreate_sees_it() {
         )
         .unwrap();
     }
-    silodb::maintain(&conn, "readings", &base, DAY + MARGIN + 1).unwrap();
+    silodb::maintain(&conn, "readings", DAY + MARGIN + 1).unwrap();
     assert_eq!(count(&conn, "SELECT count(*) FROM readings"), 24);
 
     conn.execute_batch("DROP TABLE readings").unwrap();
@@ -211,7 +211,7 @@ fn drop_preserves_history_and_recreate_sees_it() {
 
 #[test]
 fn rollups_work_on_managed_tables() {
-    let (conn, _dir, base) = setup();
+    let (conn, _dir, _base) = setup();
     for d in 0..2i64 {
         for h in 0..24 {
             conn.execute(
@@ -221,7 +221,7 @@ fn rollups_work_on_managed_tables() {
             .unwrap();
         }
     }
-    silodb::maintain(&conn, "readings", &base, 2 * DAY + MARGIN + 1).unwrap();
+    silodb::maintain(&conn, "readings", 2 * DAY + MARGIN + 1).unwrap();
     silodb::create_rollup(&conn, "readings", "1h").unwrap();
     silodb::create_rollup_view(&conn, "readings", "1h").unwrap();
 

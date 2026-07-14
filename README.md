@@ -13,15 +13,17 @@ let conn = rusqlite::Connection::open("hot.db")?;
 silodb::load_module(&conn)?;                       // every boot
 silodb::init_table_tiered(&conn, "readings",
     "ts TIMESTAMP, device TEXT, sensor TEXT, value REAL",
-    "cold/", "1d,7d,28d,retain=2y")?;              // idempotent; retention optional
+    "1d,7d,28d,retain=2y")?;   // idempotent; cold files land in hot.db.silodb/
+                               // (set_default_dir / init_table_tiered_at to choose)
 
 // the app's whole world is one name:
 conn.execute("INSERT INTO readings VALUES (silodb_ts('2026-07-13T10:00:00Z'), 'boiler', 'temp', 21.5)", [])?;
 conn.query_row("SELECT avg(value) FROM readings
                 WHERE ts >= silodb_ts('2026-07-06') AND device = 'boiler'", [], |r| r.get::<_, f64>(0))?;
 
-// storage management is one call on a dumb timer:
-silodb::maintain(&conn, "readings", "cold/", now_epoch_micros)?;
+// storage management is one call on a dumb timer — dir & policy live in
+// the db, never repeated at call sites:
+silodb::maintain(&conn, "readings", now_epoch_micros)?;
 
 // continuous aggregates — declare anytime, backfills from cold files,
 // stays exact via compaction-transaction deltas (no avg-of-avg: sufficient
@@ -37,13 +39,16 @@ conn.query_row("SELECT value_avg FROM readings_1h
 
 ```sql
 -- plain DDL, then convert in place — existing rows survive,
--- exactly like create_hypertable():
+-- exactly like create_hypertable(table, time_column):
 CREATE TABLE readings (ts TIMESTAMP, device TEXT, sensor TEXT, value REAL);
-SELECT silodb_create_table('readings', 'cold/', '1d,7d,28d,retain=2y');
+SELECT silodb_create_table('readings');                    -- infers ts, tiers '1d',
+                                                           -- files in hot.db.silodb/
+SELECT silodb_create_table('readings', NULL, '1d,7d,28d,retain=2y');  -- or explicit
 
 INSERT INTO readings VALUES (silodb_ts('2026-07-14T10:00:00Z'), 'boiler', 'temp', 21.5);
 SELECT avg(value) FROM readings WHERE ts >= silodb_ts('2026-07-07') AND device = 'boiler';
-SELECT silodb_maintain('readings', 'cold/', unixepoch()*1000000);  -- on a timer
+SELECT silodb_maintain('readings', unixepoch()*1000000);   -- on a timer
+SELECT silodb_set_default_dir('/mnt/sd/cold/');            -- db on flash, files on SD
 ```
 
 Or self-contained in one DDL statement (FTS5-style; the vtab owns a shadow

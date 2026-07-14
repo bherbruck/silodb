@@ -10,8 +10,10 @@
 //! // Every boot (module registration is per-connection):
 //! silodb::load_module(&conn)?;
 //! // Idempotent; creates readings_hot / readings_cold / the readings view
-//! // + insert trigger on first boot, no-ops after:
-//! silodb::init_table(&conn, "readings", "ts INTEGER, value REAL, name TEXT", "cold/")?;
+//! // + insert trigger on first boot, no-ops after. Cold files land in
+//! // hot.db.silodb/ unless set_default_dir / init_table_at says otherwise:
+//! silodb::init_table_tiered(&conn, "readings",
+//!     "ts TIMESTAMP, value REAL, name TEXT", "1d,7d,28d,retain=2y")?;
 //!
 //! // The app's whole world is now one name:
 //! conn.execute("INSERT INTO readings VALUES (?1, ?2, ?3)",
@@ -19,9 +21,9 @@
 //! let n: i64 = conn.query_row(
 //!     "SELECT count(*) FROM readings WHERE ts > ?1", [0i64], |r| r.get(0))?;
 //!
-//! // Aging a closed bucket out is one call; the view's contents never
-//! // change, rows just move from SQLite pages to a Parquet file:
-//! silodb::compact_table(&conn, "readings", 0, 3_600_000_000, "cold/")?;
+//! // Storage management is one call on a dumb timer; the dir and policy
+//! // live in the database, never repeated at call sites:
+//! silodb::maintain(&conn, "readings", 1_700_000_000_000_000)?;
 //! # Ok(()) }
 //! ```
 //!
@@ -258,9 +260,26 @@ pub fn init_table(
     conn: &Connection,
     table: &str,
     schema: &str,
+) -> Result<(), InitError> {
+    init_impl(conn, table, schema, "1d", None, None)
+}
+
+/// [`init_table`] with an explicit base directory (otherwise resolved:
+/// db-level default from [`set_default_dir`], else `<dbfile>.silodb/`).
+pub fn init_table_at(
+    conn: &Connection,
+    table: &str,
+    schema: &str,
     base_dir: impl AsRef<Path>,
 ) -> Result<(), InitError> {
-    init_table_tiered(conn, table, schema, base_dir, "1d")
+    init_impl(
+        conn,
+        table,
+        schema,
+        "1d",
+        Some(&base_dir.as_ref().display().to_string()),
+        None,
+    )
 }
 
 /// [`init_table`] plus an explicit compaction-tier policy, e.g.
@@ -281,15 +300,81 @@ pub fn init_table_tiered(
     conn: &Connection,
     table: &str,
     schema: &str,
-    base_dir: impl AsRef<Path>,
     tiers: &str,
+) -> Result<(), InitError> {
+    init_impl(conn, table, schema, tiers, None, None)
+}
+
+/// [`init_table_tiered`] with an explicit base directory.
+pub fn init_table_tiered_at(
+    conn: &Connection,
+    table: &str,
+    schema: &str,
+    tiers: &str,
+    base_dir: impl AsRef<Path>,
+) -> Result<(), InitError> {
+    init_impl(
+        conn,
+        table,
+        schema,
+        tiers,
+        Some(&base_dir.as_ref().display().to_string()),
+        None,
+    )
+}
+
+/// The base-dir resolution chain: explicit > db default (`_silodb_config`
+/// `default_dir`, see [`set_default_dir`]) > `<database file>.silodb/`.
+/// In-memory/temp databases have no file, so they require an explicit dir.
+fn resolve_base_dir(
+    conn: &Connection,
+    explicit: Option<&str>,
+) -> Result<String, InitError> {
+    if let Some(d) = explicit {
+        return Ok(d.to_owned());
+    }
+    if let Some(d) = catalog::get_config(conn, "default_dir")? {
+        return Ok(d);
+    }
+    match conn.path() {
+        Some(p) if !p.is_empty() => {
+            let derived = format!("{p}.silodb");
+            Ok(std::path::absolute(&derived)
+                .map(|p| p.display().to_string())
+                .unwrap_or(derived))
+        }
+        _ => Err(InitError::BadSchema(
+            "no base directory: this database has no file (in-memory?) — pass \
+             an explicit dir or SELECT silodb_set_default_dir(...)"
+                .into(),
+        )),
+    }
+}
+
+/// Persist the db-level default cold-storage directory (used when neither
+/// an explicit dir nor a table policy specifies one). Never moves existing
+/// tables — each table's dir is frozen in its policy at create time.
+pub fn set_default_dir(conn: &Connection, dir: impl AsRef<Path>) -> Result<(), InitError> {
+    catalog::set_config(conn, "default_dir", &dir.as_ref().display().to_string())?;
+    Ok(())
+}
+
+fn init_impl(
+    conn: &Connection,
+    table: &str,
+    schema: &str,
+    tiers: &str,
+    explicit_dir: Option<&str>,
+    ts_column: Option<&str>,
 ) -> Result<(), InitError> {
     let mut policy = catalog::parse_policy_string(table, tiers)
         .map_err(InitError::BadSchema)?;
+    let existing = catalog::get_policy(conn, table)?;
     // Origin is immutable once set: every written file's windows are
     // anchored to it, and moving it would misalign all of them. Detect a
-    // changed origin loudly instead of silently re-anchoring.
-    if let Some(existing) = catalog::get_policy(conn, table)?
+    // changed origin loudly instead of silently re-anchoring. The dir is
+    // frozen the same way: once a table has one, re-inits keep it.
+    if let Some(existing) = &existing
         && existing.origin_us != policy.origin_us
     {
         return Err(InitError::BadSchema(format!(
@@ -299,9 +384,16 @@ pub fn init_table_tiered(
             existing.origin_us, policy.origin_us
         )));
     }
+    policy.base_dir = match existing.as_ref().map(|e| e.base_dir.as_str()) {
+        Some(dir) if !dir.is_empty() => dir.to_owned(),
+        _ => resolve_base_dir(conn, explicit_dir)?,
+    };
+    policy.ts_column = ts_column
+        .map(str::to_owned)
+        .or(existing.and_then(|e| e.ts_column));
     policy.logical_table = table.to_owned();
     catalog::set_policy(conn, &policy)?;
-    init_table_inner(conn, table, schema, base_dir)
+    init_table_inner(conn, table, schema, &policy.base_dir, policy.ts_column.as_deref())
 }
 
 fn init_table_inner(
@@ -309,12 +401,13 @@ fn init_table_inner(
     table: &str,
     schema: &str,
     base_dir: impl AsRef<Path>,
+    ts_column: Option<&str>,
 ) -> Result<(), InitError> {
     let cols = parse_schema(schema)?;
-    // A bucket axis must be resolvable: TIMESTAMP-typed column (preferred),
-    // or the legacy INTEGER `ts` name.
+    // A bucket axis must be resolvable: explicit choice (persisted in the
+    // policy), else TIMESTAMP-typed column, else the legacy INTEGER `ts`.
     let decls: Vec<silodb_schema::ColumnDecl> = cols.iter().map(|(c, _)| c.clone()).collect();
-    silodb_schema::resolve_ts_index(&decls, None)
+    silodb_schema::resolve_ts_index(&decls, ts_column)
         .map_err(|e| InitError::BadSchema(e.to_string()))?;
 
     let hot = format!("{table}_hot");
@@ -367,7 +460,7 @@ fn init_table_inner(
         .join(", ");
 
     let ts_name = {
-        let idx = silodb_schema::resolve_ts_index(&decls, None).expect("validated above");
+        let idx = silodb_schema::resolve_ts_index(&decls, ts_column).expect("validated above");
         decls[idx].name.clone()
     };
     conn.execute_batch(&format!(
@@ -378,7 +471,7 @@ fn init_table_inner(
          -- 10x throughput loss at 2M rows in silodb-bench).
          CREATE INDEX IF NOT EXISTS {ts_idx_q} ON {hot_q} ({ts_q});
          CREATE VIRTUAL TABLE IF NOT EXISTS {cold_q} USING silodb('{base}',
-             table={table}, schema='{schema_esc}');
+             table={table}, schema='{schema_esc}'{ts_arg});
          CREATE VIEW IF NOT EXISTS {table_q} AS
            SELECT {col_names} FROM {hot_q}
            UNION ALL
@@ -396,6 +489,9 @@ fn init_table_inner(
         ts_q = quote_ident(&ts_name),
         base = base_dir.as_ref().display(),
         schema_esc = schema.replace('\'', "''"),
+        ts_arg = ts_column
+            .map(|t| format!(", ts_column={t}"))
+            .unwrap_or_default(),
     ))?;
     Ok(())
 }
@@ -409,21 +505,29 @@ pub fn compact_table(
     table: &str,
     bucket_start: i64,
     bucket_end: i64,
-    base_dir: impl AsRef<Path>,
 ) -> Result<CompactOutcome, CompactError> {
     let hot = resolve_hot_table(conn, table)
         .map_err(CompactError::Sqlite)?
         .unwrap_or_else(|| format!("{table}_hot"));
+    let policy = silodb_catalog::get_policy(conn, table).map_err(CompactError::Sqlite)?;
+    let (dir, ts) = match &policy {
+        Some(p) if !p.base_dir.is_empty() => (p.base_dir.clone(), p.ts_column.clone()),
+        _ => {
+            return Err(CompactError::Sqlite(rusqlite::Error::ModuleError(format!(
+                "no policy/base_dir for '{table}' — init/create it first"
+            ))))
+        }
+    };
     compact_bucket(
         conn,
         &BucketSpec {
             hot_table: &hot,
             logical_table: table,
-            ts_column: None,
+            ts_column: ts.as_deref(),
             bucket_start,
             bucket_end,
         },
-        base_dir.as_ref(),
+        Path::new(&dir),
     )
 }
 
@@ -495,12 +599,16 @@ impl From<rusqlite::Error> for MaintainError {
 pub fn maintain(
     conn: &Connection,
     table: &str,
-    base_dir: impl AsRef<Path>,
     now_us: i64,
 ) -> Result<Vec<MaintainAction>, MaintainError> {
-    let base = base_dir.as_ref();
     let policy = catalog::get_policy(conn, table)?
         .ok_or_else(|| MaintainError::NoPolicy(table.to_owned()))?;
+    if policy.base_dir.is_empty() {
+        return Err(MaintainError::NoPolicy(format!(
+            "{table} (policy has no base_dir — re-run init/create to upgrade it)"
+        )));
+    }
+    let base = Path::new(&policy.base_dir);
     // Idempotent; maintain is a writer by definition, and the promotion/GC
     // steps below query the catalog even when nothing was ever compacted
     // (found by the model-based lifecycle proptest: maintain-before-data).
@@ -522,7 +630,7 @@ pub fn maintain(
             .query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?
             .filter_map(|r| r.ok().and_then(|(n, d)| silodb_schema::ColumnDecl::parse(&n, &d)))
             .collect();
-        if let Ok(ts_idx) = silodb_schema::resolve_ts_index(&cols, None) {
+        if let Ok(ts_idx) = silodb_schema::resolve_ts_index(&cols, policy.ts_column.as_deref()) {
             let ts_q = quote_ident(&cols[ts_idx].name);
             let (lo, hi) = conn.query_row(
                 &format!(
@@ -542,7 +650,7 @@ pub fn maintain(
                     if end > cutoff {
                         break; // bucket still open (or inside the margin)
                     }
-                    match compact_table(conn, table, start, end, base)? {
+                    match compact_table(conn, table, start, end)? {
                         CompactOutcome::Compacted { rows, path } => {
                             actions.push(MaintainAction::Compacted {
                                 window: (start, end),
@@ -681,7 +789,7 @@ pub fn create_rollup(conn: &Connection, table: &str, grain: &str) -> Result<(), 
         .ok_or_else(|| InitError::BadSchema(format!("no hot table for '{table}'")))?;
     let columns = hot_decls(conn, &hot_name)?;
     let decls: Vec<silodb_schema::ColumnDecl> = columns.clone();
-    let ts_idx = silodb_schema::resolve_ts_index(&decls, None)
+    let ts_idx = silodb_schema::resolve_ts_index(&decls, policy.ts_column.as_deref())
         .map_err(|e| bad(format!("hot table: {e}")))?;
 
     let rollup_table = format!("{table}_rollup_{grain}");
@@ -782,7 +890,8 @@ pub fn create_rollup_view(conn: &Connection, table: &str, grain: &str) -> Result
     let hot_name = resolve_hot_table(conn, table)?
         .ok_or_else(|| InitError::BadSchema(format!("no hot table for '{table}'")))?;
     let columns = hot_decls(conn, &hot_name)?;
-    let ts_idx = silodb_schema::resolve_ts_index(&columns, None)
+    let policy_ts = catalog::get_policy(conn, table)?.and_then(|p| p.ts_column);
+    let ts_idx = silodb_schema::resolve_ts_index(&columns, policy_ts.as_deref())
         .map_err(|e| bad(format!("hot table: {e}")))?;
     let ts_name = quote_ident(&columns[ts_idx].name);
     let mut group = Vec::new();
@@ -889,23 +998,52 @@ pub fn create_rollup_view(conn: &Connection, table: &str, grain: &str) -> Result
 /// Called automatically by [`load_module`].
 fn register_admin_functions(conn: &Connection) -> rusqlite::Result<()> {
     let flags = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DIRECTONLY;
-    conn.create_scalar_function("silodb_create_table", 3, flags, |ctx| {
+    // silodb_create_table(table[, ts_column[, tiers[, dir]]]) — ts_column
+    // is slot #2 like create_hypertable; NULL infers (one TIMESTAMP column,
+    // else INTEGER 'ts'). tiers default '1d'. dir default: db-level
+    // default (silodb_set_default_dir), else <dbfile>.silodb/.
+    for n_args in 1..=4 {
+        conn.create_scalar_function("silodb_create_table", n_args, flags, move |ctx| {
+            let table: String = ctx.get(0)?;
+            let opt_text = |i: usize| -> rusqlite::Result<Option<String>> {
+                if i >= n_args as usize {
+                    return Ok(None);
+                }
+                match ctx.get_raw(i) {
+                    rusqlite::types::ValueRef::Null => Ok(None),
+                    rusqlite::types::ValueRef::Text(t) => Ok(Some(
+                        std::str::from_utf8(t)
+                            .map_err(|e| rusqlite::Error::UserFunctionError(e.into()))?
+                            .to_owned(),
+                    )),
+                    other => Err(rusqlite::Error::UserFunctionError(
+                        format!("expected TEXT or NULL, got {}", other.data_type()).into(),
+                    )),
+                }
+            };
+            let ts = opt_text(1)?;
+            let tiers = opt_text(2)?.unwrap_or_else(|| "1d".to_owned());
+            let dir = opt_text(3)?;
+            let conn = unsafe { ctx.get_connection()? };
+            convert_table(&conn, &table, ts.as_deref(), &tiers, dir.as_deref())
+                .map_err(|e| rusqlite::Error::UserFunctionError(e.to_string().into()))?;
+            Ok(table)
+        })?;
+    }
+    conn.create_scalar_function("silodb_maintain", 2, flags, |ctx| {
         let table: String = ctx.get(0)?;
-        let base: String = ctx.get(1)?;
-        let tiers: String = ctx.get(2)?;
+        let now: i64 = ctx.get(1)?;
         let conn = unsafe { ctx.get_connection()? };
-        convert_table(&conn, &table, &base, &tiers)
-            .map_err(|e| rusqlite::Error::UserFunctionError(e.to_string().into()))?;
-        Ok(table)
-    })?;
-    conn.create_scalar_function("silodb_maintain", 3, flags, |ctx| {
-        let table: String = ctx.get(0)?;
-        let base: String = ctx.get(1)?;
-        let now: i64 = ctx.get(2)?;
-        let conn = unsafe { ctx.get_connection()? };
-        let actions = maintain(&conn, &table, &base, now)
+        let actions = maintain(&conn, &table, now)
             .map_err(|e| rusqlite::Error::UserFunctionError(e.to_string().into()))?;
         Ok(actions.len() as i64)
+    })?;
+    conn.create_scalar_function("silodb_set_default_dir", 1, flags, |ctx| {
+        let dir: String = ctx.get(0)?;
+        let conn = unsafe { ctx.get_connection()? };
+        set_default_dir(&conn, &dir)
+            .map_err(|e| rusqlite::Error::UserFunctionError(e.to_string().into()))?;
+        Ok(dir)
     })?;
     Ok(())
 }
@@ -916,8 +1054,9 @@ fn register_admin_functions(conn: &Connection) -> rusqlite::Result<()> {
 fn convert_table(
     conn: &Connection,
     table: &str,
-    base_dir: &str,
+    ts_column: Option<&str>,
     tiers: &str,
+    base_dir: Option<&str>,
 ) -> Result<(), InitError> {
     // Validate the policy BEFORE any DDL — a bad tiers string must not
     // leave the table stranded mid-rename.
@@ -971,5 +1110,5 @@ fn convert_table(
         })?
         .collect::<Result<Vec<_>, _>>()?
         .join(", ");
-    init_table_tiered(conn, table, &schema, base_dir, tiers)
+    init_impl(conn, table, &schema, tiers, base_dir, ts_column)
 }
