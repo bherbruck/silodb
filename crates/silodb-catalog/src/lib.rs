@@ -219,10 +219,25 @@ pub fn gc_entries(conn: &Connection, logical_table: &str) -> Result<Vec<CatalogE
     rows.collect()
 }
 
-/// Remove one catalog row (after its file has been unlinked by GC).
+/// Remove one catalog row entirely. **Not used by GC** — see
+/// [`purge_entry`]; deleting rows resets [`bucket_seq`] and a later
+/// compaction could reuse an active file's name.
 pub fn delete_entry(conn: &Connection, logical_table: &str, path: &str) -> Result<()> {
     conn.execute(
         "DELETE FROM _silodb_catalog WHERE logical_table = ?1 AND path = ?2",
+        params![logical_table, path],
+    )?;
+    Ok(())
+}
+
+/// Tombstone a GC'd row (`status = 'purged'`): the file is gone, the row
+/// stays so [`bucket_seq`] remains monotonic — file names are never
+/// reused. (Found by the model-based lifecycle proptest: GC-delete +
+/// late-arrival re-merge regenerated an active file's name.)
+pub fn purge_entry(conn: &Connection, logical_table: &str, path: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE _silodb_catalog SET status = 'purged'
+         WHERE logical_table = ?1 AND path = ?2",
         params![logical_table, path],
     )?;
     Ok(())
@@ -428,6 +443,75 @@ pub fn evict_older_than(
     Ok(expired)
 }
 
+/// Parse a policy string — `"1d, 7d, 28d[, retain=2y][, origin=<ISO|µs>]"`
+/// — into a [`TablePolicy`]. Validation: durations use s/m/h/d/w/y units;
+/// tiers ascend and each divides the next (epoch/origin-aligned windows
+/// can't merge straddling files); retain, when set, is at least the
+/// largest tier. Lives here so the vtab's managed mode (`tiers=` in the
+/// DDL) and the facade parse identically.
+pub fn parse_policy_string(
+    logical_table: &str,
+    tiers: &str,
+) -> std::result::Result<TablePolicy, String> {
+    let mut tiers_us = Vec::new();
+    let mut retain = None;
+    let mut origin = 0i64;
+    for part in tiers.split(',') {
+        let part = part.trim();
+        if let Some(dur) = part.strip_prefix("retain=") {
+            if retain.is_some() {
+                return Err("duplicate retain=".into());
+            }
+            retain = Some(
+                silodb_schema::parse_duration_micros(dur.trim())
+                    .ok_or_else(|| format!("bad retain duration '{dur}'"))?,
+            );
+            continue;
+        }
+        if let Some(o) = part.strip_prefix("origin=") {
+            let o = o.trim();
+            origin = o
+                .parse::<i64>()
+                .ok()
+                .or_else(|| silodb_schema::parse_timestamp_micros(o))
+                .ok_or_else(|| format!("bad origin '{o}' (epoch µs or ISO 8601)"))?;
+            continue;
+        }
+        let us = silodb_schema::parse_duration_micros(part)
+            .ok_or_else(|| format!("bad duration '{part}' (use <n><s|m|h|d|w|y>)"))?;
+        if let Some(&prev) = tiers_us.last()
+            && (us <= prev || us % prev != 0)
+        {
+            return Err(format!(
+                "tier '{part}' must be an ascending exact multiple of the \
+                 previous tier (epoch-aligned windows can't merge straddling \
+                 files — e.g. use 28d after 7d, not 30d)"
+            ));
+        }
+        tiers_us.push(us);
+    }
+    if tiers_us.is_empty() {
+        return Err("no tiers".into());
+    }
+    if let (Some(r), Some(&largest)) = (retain, tiers_us.last())
+        && r < largest
+    {
+        return Err(
+            "retain= is shorter than the largest tier window — files merge into \
+             windows bigger than the retention period and could never be evicted \
+             whole; use retain >= the largest tier"
+                .into(),
+        );
+    }
+    Ok(TablePolicy {
+        logical_table: logical_table.to_owned(),
+        tiers_us,
+        safety_margin_us: 2 * 3600 * 1_000_000,
+        retain_us: retain,
+        origin_us: origin,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -522,3 +606,4 @@ mod tests {
         assert_eq!(got, vec!["a-early.parquet", "z-late.parquet"]);
     }
 }
+

@@ -64,8 +64,8 @@ use parquet::file::statistics::Statistics;
 use rusqlite::ffi;
 use rusqlite::types::{Null, ValueRef};
 use rusqlite::vtab::{
-    Context, CreateVTab, Filters, IndexConstraintOp, IndexInfo, Module, VTab, VTabConnection,
-    VTabCursor, VTabKind,
+    Context, CreateVTab, Filters, IndexConstraintOp, IndexInfo, Inserts, Module, UpdateVTab,
+    Updates, VTab, VTabConnection, VTabCursor, VTabKind,
 };
 use rusqlite::{Connection, Error, OptionalExtension, Result};
 
@@ -73,7 +73,7 @@ const MODULE_NAME: &CStr = c"silodb";
 
 /// Register the `silodb` module on a connection.
 pub fn load_module(conn: &Connection) -> Result<()> {
-    const MODULE: Module<SiloTab> = Module::read_only_module();
+    const MODULE: Module<SiloTab> = Module::update_module();
     let aux: Option<()> = None;
     conn.create_module(MODULE_NAME, &MODULE, aux)
 }
@@ -143,6 +143,9 @@ pub struct SiloTab {
     /// Footer metadata per file, keyed by path; entries validated against
     /// `(mtime, size)` on every use.
     meta_cache: RefCell<HashMap<PathBuf, CachedMeta>>,
+    /// Managed mode (`tiers=` in the DDL): the vtab owns this shadow hot
+    /// table, routes INSERTs into it, and serves hot ∪ cold itself.
+    shadow: Option<String>,
 }
 
 impl SiloTab {
@@ -207,6 +210,9 @@ struct TabArgs {
     ts_column: Option<String>,
     hot_table: Option<String>,
     schema: Option<String>,
+    /// Presence turns on managed mode: the vtab owns a `<name>_data`
+    /// shadow table, accepts INSERTs, and serves hot ∪ cold itself.
+    tiers: Option<String>,
 }
 
 /// First argument: the base directory shared by every cold table (quoted).
@@ -231,6 +237,7 @@ fn parse_args(args: &[&[u8]]) -> Result<TabArgs> {
     let mut ts_column = None;
     let mut hot_table = None;
     let mut schema = None;
+    let mut tiers = None;
     for arg in rest {
         let s = parse_str_arg(arg)?;
         let (key, value) = s
@@ -242,6 +249,7 @@ fn parse_args(args: &[&[u8]]) -> Result<TabArgs> {
             "ts_column" => ts_column = Some(value.to_owned()),
             "hot_table" => hot_table = Some(value.to_owned()),
             "schema" => schema = Some(value.to_owned()),
+            "tiers" => tiers = Some(value.to_owned()),
             other => return Err(module_err(format!("unrecognized parameter '{other}'"))),
         }
     }
@@ -252,6 +260,7 @@ fn parse_args(args: &[&[u8]]) -> Result<TabArgs> {
         ts_column,
         hot_table,
         schema,
+        tiers,
     })
 }
 
@@ -363,12 +372,32 @@ unsafe impl<'vtab> VTab<'vtab> for SiloTab {
         // No existence check on base_dir: nothing on disk is required (or
         // even consulted) to connect. Compaction creates <dir>/<table>
         // lazily on its first run for a table.
+        let vtab_name = std::str::from_utf8(table_name)
+            .map_err(|_| module_err("table name is not UTF-8"))?
+            .to_owned();
+        if parsed.tiers.is_some() {
+            // Managed mode: the logical table IS the vtab name — an alias
+            // would orphan the shadow table from maintain()'s view.
+            if parsed.logical_table.is_some() || parsed.hot_table.is_some() {
+                return Err(module_err(
+                    "managed mode (tiers=) does not take table= or hot_table= — \
+                     the vtab's own name is the logical table",
+                ));
+            }
+            if parsed.schema.is_none() {
+                return Err(module_err(
+                    "managed mode (tiers=) requires an explicit schema='col TYPE, ...'",
+                ));
+            }
+        }
         let logical_table = match parsed.logical_table {
             Some(t) => t,
-            None => std::str::from_utf8(table_name)
-                .map_err(|_| module_err("table name is not UTF-8"))?
-                .to_owned(),
+            None => vtab_name.clone(),
         };
+        let shadow = parsed
+            .tiers
+            .as_ref()
+            .map(|_| format!("{vtab_name}_data"));
 
         let handle = unsafe { db.handle() };
 
@@ -406,6 +435,7 @@ unsafe impl<'vtab> VTab<'vtab> for SiloTab {
             ts_col,
             schema,
             meta_cache: RefCell::new(HashMap::new()),
+            shadow,
         };
         Ok((Cow::Owned(CString::new(sql)?), vtab))
     }
@@ -477,6 +507,8 @@ unsafe impl<'vtab> VTab<'vtab> for SiloTab {
             batch: None,
             row_in_batch: 0,
             rowid: 0,
+            hot_rows: Vec::new(),
+            hot_idx: 0,
             col_map: Vec::new(),
             projection: Vec::new(),
             phantom: PhantomData,
@@ -484,8 +516,167 @@ unsafe impl<'vtab> VTab<'vtab> for SiloTab {
     }
 }
 
-impl CreateVTab<'_> for SiloTab {
+impl<'vtab> CreateVTab<'vtab> for SiloTab {
     const KIND: VTabKind = VTabKind::Default;
+
+    /// CREATE VIRTUAL TABLE. In managed mode this is where the shadow hot
+    /// table and the maintenance policy come to exist — one DDL statement
+    /// defines the entire system.
+    fn create(
+        db: &mut VTabConnection,
+        aux: Option<&Self::Aux>,
+        module_name: &[u8],
+        database_name: &[u8],
+        table_name: &[u8],
+        args: &[&[u8]],
+    ) -> Result<(Cow<'static, CStr>, Self)> {
+        let (sql, vtab) = Self::connect(db, aux, module_name, database_name, table_name, args)?;
+        if let Some(shadow) = &vtab.shadow {
+            let parsed = parse_args(args)?; // cheap; re-read schema/tiers text
+            let schema_str = parsed.schema.expect("checked in connect");
+            let tiers_str = parsed.tiers.expect("managed");
+            let hot = vtab.hot_db()?;
+
+            // Policy first (validates tiers/retain/origin before any DDL);
+            // origin immutability across re-creates.
+            let policy =
+                silodb_catalog::parse_policy_string(&vtab.logical_table, &tiers_str)
+                    .map_err(module_err)?;
+            if let Some(existing) = silodb_catalog::get_policy(&hot, &vtab.logical_table)
+                .map_err(module_err)?
+                && existing.origin_us != policy.origin_us
+            {
+                return Err(module_err(format!(
+                    "origin changed for '{}' ({} -> {}); the window grid is \
+                     immutable once files exist",
+                    vtab.logical_table, existing.origin_us, policy.origin_us
+                )));
+            }
+            silodb_catalog::set_policy(&hot, &policy).map_err(module_err)?;
+
+            // Shadow hot table, verbatim decls (TIMESTAMP markers must
+            // survive for compaction's schema read), plus the bucket-axis
+            // index compaction depends on.
+            let cols = parse_verbatim_schema(&schema_str)?;
+            let ts_name = {
+                let decls: Vec<silodb_schema::ColumnDecl> =
+                    cols.iter().map(|(d, _)| d.clone()).collect();
+                let idx = silodb_schema::resolve_ts_index(&decls, parsed.ts_column.as_deref())
+                    .map_err(|e| module_err(format!("schema argument: {e}")))?;
+                decls[idx].name.clone()
+            };
+            let col_defs = cols
+                .iter()
+                .map(|(d, verbatim)| format!("{} {verbatim}", quote_ident(&d.name)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            hot.execute_batch(&format!(
+                "CREATE TABLE IF NOT EXISTS {sh} ({col_defs});
+                 CREATE INDEX IF NOT EXISTS {idx} ON {sh} ({ts});",
+                sh = quote_ident(shadow),
+                idx = quote_ident(&format!("{shadow}_ts")),
+                ts = quote_ident(&ts_name),
+            ))
+            .map_err(module_err)?;
+        }
+        Ok((sql, vtab))
+    }
+
+    /// DROP TABLE. The shadow hot table goes; **cold history survives** —
+    /// catalog rows, parquet files, stats and policy stay, and re-creating
+    /// the vtab sees them again. Destroying history is retention's job,
+    /// never DDL's.
+    fn destroy(&self) -> Result<()> {
+        if let Some(shadow) = &self.shadow {
+            let hot = self.hot_db()?;
+            hot.execute_batch(&format!(
+                "DROP TABLE IF EXISTS {}",
+                quote_ident(shadow)
+            ))?;
+        }
+        Ok(())
+    }
+}
+
+impl UpdateVTab<'_> for SiloTab {
+    fn insert(&mut self, args: &Inserts<'_>) -> Result<i64> {
+        let Some(shadow) = &self.shadow else {
+            return Err(module_err(
+                "this silodb table is read-only (no tiers= in its definition); \
+                 INSERT into the hot table instead",
+            ));
+        };
+        let n_cols = self.schema.fields().len();
+        // args[0..2] are the rowid slots; column values follow.
+        let values: Vec<rusqlite::types::Value> = args
+            .iter()
+            .skip(2)
+            .map(rusqlite::types::Value::try_from)
+            .collect::<std::result::Result<_, _>>()
+            .map_err(module_err)?;
+        if values.len() != n_cols {
+            return Err(module_err(format!(
+                "expected {n_cols} values, got {}",
+                values.len()
+            )));
+        }
+        let placeholders = (1..=n_cols)
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let hot = self.hot_db()?;
+        hot.execute(
+            &format!(
+                "INSERT INTO {} VALUES ({placeholders})",
+                quote_ident(shadow)
+            ),
+            rusqlite::params_from_iter(values),
+        )?;
+        Ok(hot.last_insert_rowid())
+    }
+
+    fn delete(&mut self, _arg: ValueRef<'_>) -> Result<()> {
+        Err(module_err(immutable_msg(self)))
+    }
+
+    fn update(&mut self, _args: &Updates<'_>) -> Result<()> {
+        Err(module_err(immutable_msg(self)))
+    }
+}
+
+fn immutable_msg(t: &SiloTab) -> String {
+    match &t.shadow {
+        Some(shadow) => format!(
+            "compacted history is immutable; for hot-only changes mutate the \
+             shadow table '{shadow}' directly"
+        ),
+        None => "this silodb table is read-only".to_owned(),
+    }
+}
+
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('\"', "\"\""))
+}
+
+/// Parse `schema=` keeping verbatim decl text (shadow-table DDL needs
+/// TIMESTAMP markers as written).
+fn parse_verbatim_schema(
+    schema: &str,
+) -> Result<Vec<(silodb_schema::ColumnDecl, String)>> {
+    schema
+        .split(',')
+        .map(|part| {
+            let part = part.trim();
+            let (name, decl) = part
+                .split_once(char::is_whitespace)
+                .unwrap_or((part, ""));
+            let name = name.trim_matches('\"').trim_matches('`');
+            let decl = decl.trim();
+            silodb_schema::ColumnDecl::parse(name, decl)
+                .map(|d| (d, decl.to_owned()))
+                .ok_or_else(|| module_err(format!("bad schema column '{part}'")))
+        })
+        .collect()
 }
 
 /// Column classes pruning understands. Unsigned ints are left out: their
@@ -739,6 +930,10 @@ pub struct SiloCursor<'vtab> {
     batch: Option<RecordBatch>,
     row_in_batch: usize,
     rowid: i64,
+    /// Managed mode: shadow-table rows served before the cold files,
+    /// materialized at filter time (the hot tier is small by design).
+    hot_rows: Vec<Vec<rusqlite::types::Value>>,
+    hot_idx: usize,
     /// Schema column index → position in the projected batch. `None` =
     /// column not requested by this statement (xColumn answers NULL,
     /// defensively — SQLite said it wouldn't ask).
@@ -919,17 +1114,40 @@ unsafe impl VTabCursor for SiloCursor<'_> {
         }
         LAST_SCAN.with(|c| c.set(Some(stats)));
 
+        // Managed mode: the hot arm — shadow rows matching the pushed
+        // constraints (SQLite re-checks everything, so this is best-effort
+        // narrowing, not correctness).
+        self.hot_rows = match &vtab.shadow {
+            Some(shadow) => fetch_hot_rows(&vtab.hot_db()?, shadow, &vtab.schema, &pushed)?,
+            None => Vec::new(),
+        };
+        self.hot_idx = 0;
+
         self.col_map = col_map;
         self.projection = used;
         self.files = files;
         self.next_file = 0;
         self.reader = None;
         self.rowid = 0;
-        self.advance_batch()
+        if self.hot_rows.is_empty() {
+            self.advance_batch()
+        } else {
+            // Cold batches start once the hot arm is exhausted.
+            self.batch = None;
+            self.row_in_batch = 0;
+            Ok(())
+        }
     }
 
     fn next(&mut self) -> Result<()> {
         self.rowid += 1;
+        if self.hot_idx < self.hot_rows.len() {
+            self.hot_idx += 1;
+            if self.hot_idx == self.hot_rows.len() {
+                self.advance_batch()?;
+            }
+            return Ok(());
+        }
         self.row_in_batch += 1;
         let in_batch = self.batch.as_ref().map_or(0, RecordBatch::num_rows);
         if self.row_in_batch >= in_batch {
@@ -939,10 +1157,17 @@ unsafe impl VTabCursor for SiloCursor<'_> {
     }
 
     fn eof(&self) -> bool {
-        self.batch.is_none()
+        self.hot_idx >= self.hot_rows.len() && self.batch.is_none()
     }
 
     fn column(&self, ctx: &mut Context, i: c_int) -> Result<()> {
+        if let Some(row) = self.hot_rows.get(self.hot_idx) {
+            // Hot arm carries full rows in schema order — no projection.
+            let v = row
+                .get(i as usize)
+                .ok_or_else(|| module_err("column index out of range"))?;
+            return set_result_from_value(ctx, v);
+        }
         let batch = self
             .batch
             .as_ref()
@@ -959,6 +1184,72 @@ unsafe impl VTabCursor for SiloCursor<'_> {
 
     fn rowid(&self) -> Result<i64> {
         Ok(self.rowid)
+    }
+}
+
+/// Shadow-table rows matching the pushed constraints, full columns in
+/// schema order.
+fn fetch_hot_rows(
+    hot: &Connection,
+    shadow: &str,
+    schema: &SchemaRef,
+    pushed: &[Pushed],
+) -> Result<Vec<Vec<rusqlite::types::Value>>> {
+    let cols = schema
+        .fields()
+        .iter()
+        .map(|f| quote_ident(f.name()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut preds = Vec::new();
+    let mut params: Vec<rusqlite::types::Value> = Vec::new();
+    for p in pushed {
+        let op = match p.op {
+            'E' => "=",
+            'G' => ">",
+            'g' => ">=",
+            'L' => "<",
+            'l' => "<=",
+            _ => continue,
+        };
+        preds.push(format!(
+            "{} {op} ?{}",
+            quote_ident(schema.field(p.col).name()),
+            params.len() + 1
+        ));
+        params.push(match &p.value {
+            PushedValue::Int(v) => rusqlite::types::Value::Integer(*v),
+            PushedValue::Real(v) => rusqlite::types::Value::Real(*v),
+            PushedValue::Text(v) => rusqlite::types::Value::Text(v.clone()),
+        });
+    }
+    let where_clause = if preds.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", preds.join(" AND "))
+    };
+    let n_cols = schema.fields().len();
+    let mut stmt = hot.prepare(&format!(
+        "SELECT {cols} FROM {}{where_clause}",
+        quote_ident(shadow)
+    ))?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params), |r| {
+        (0..n_cols)
+            .map(|i| r.get::<_, rusqlite::types::Value>(i))
+            .collect::<std::result::Result<Vec<_>, _>>()
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(module_err)
+}
+
+fn set_result_from_value(ctx: &mut Context, v: &rusqlite::types::Value) -> Result<()> {
+    use rusqlite::types::Value as V;
+    match v {
+        V::Null => ctx.set_result(&Null),
+        V::Integer(i) => ctx.set_result(i),
+        V::Real(f) => ctx.set_result(f),
+        V::Text(s) => ctx.set_result(&s.as_str()),
+        V::Blob(b) => ctx.set_result(&b.as_slice()),
     }
 }
 

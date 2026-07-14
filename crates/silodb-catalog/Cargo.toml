@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 rusqlite = "0.40.1"
+silodb-schema = { version = "0.1.0", path = "../silodb-schema" }
 
 [dev-dependencies]
 rusqlite = { version = "0.40.1", features = ["bundled"] }

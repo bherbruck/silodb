@@ -285,7 +285,7 @@ fn retention_evicts_whole_expired_files() {
     let statuses: i64 = e
         .conn
         .query_row(
-            "SELECT count(*) FROM _silodb_catalog WHERE status != 'active'",
+            "SELECT count(*) FROM _silodb_catalog WHERE status IN ('superseded','evicted')",
             [],
             |r| r.get(0),
         )

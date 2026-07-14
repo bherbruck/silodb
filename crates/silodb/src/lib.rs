@@ -204,6 +204,26 @@ fn parse_schema(
     Ok(cols)
 }
 
+
+/// The hot tier's table for a logical table: `<t>_hot` (init_table
+/// convention) or `<t>_data` (managed-vtab shadow). `None` when neither
+/// exists (cold-only database).
+pub fn resolve_hot_table(conn: &Connection, table: &str) -> rusqlite::Result<Option<String>> {
+    for cand in [format!("{table}_hot"), format!("{table}_data")] {
+        let found: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+                [&cand],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if found.is_some() {
+            return Ok(Some(cand));
+        }
+    }
+    Ok(None)
+}
+
 fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
@@ -263,94 +283,24 @@ pub fn init_table_tiered(
     base_dir: impl AsRef<Path>,
     tiers: &str,
 ) -> Result<(), InitError> {
-    let (tiers_us, retain_us, origin_us) = parse_tiers(tiers)?;
+    let mut policy = catalog::parse_policy_string(table, tiers)
+        .map_err(InitError::BadSchema)?;
     // Origin is immutable once set: every written file's windows are
     // anchored to it, and moving it would misalign all of them. Detect a
     // changed origin loudly instead of silently re-anchoring.
     if let Some(existing) = catalog::get_policy(conn, table)?
-        && existing.origin_us != origin_us
+        && existing.origin_us != policy.origin_us
     {
         return Err(InitError::BadSchema(format!(
-            "origin changed for '{table}' ({} -> {origin_us}); the window \
-             grid is immutable once files exist — re-aligning is a \
-             migration, not a knob",
-            existing.origin_us
+            "origin changed for '{table}' ({} -> {}); the window grid is \
+             immutable once files exist — re-aligning is a migration, not a \
+             knob",
+            existing.origin_us, policy.origin_us
         )));
     }
-    catalog::set_policy(
-        conn,
-        &catalog::TablePolicy {
-            logical_table: table.to_owned(),
-            tiers_us,
-            safety_margin_us: 2 * 3600 * 1_000_000, // 2h, per spec contract
-            retain_us,
-            origin_us,
-        },
-    )?;
+    policy.logical_table = table.to_owned();
+    catalog::set_policy(conn, &policy)?;
     init_table_inner(conn, table, schema, base_dir)
-}
-
-fn parse_duration_us(part: &str, bad: impl Fn(String) -> InitError) -> Result<i64, InitError> {
-    silodb_schema::parse_duration_micros(part)
-        .ok_or_else(|| bad(format!("bad duration '{part}' (use <n><s|m|h|d|w|y>)")))
-}
-
-/// Parse `"1d, 7d, 28d[, retain=2y][, origin=<ISO date or epoch-µs>]"` into
-/// ascending microsecond windows (each validated as a multiple of the
-/// previous) plus optional retention and window-grid origin.
-fn parse_tiers(tiers: &str) -> Result<(Vec<i64>, Option<i64>, i64), InitError> {
-    let bad = InitError::BadSchema;
-    let mut out = Vec::new();
-    let mut retain = None;
-    let mut origin = 0i64;
-    for part in tiers.split(',') {
-        let part = part.trim();
-        if let Some(dur) = part.strip_prefix("retain=") {
-            if retain.is_some() {
-                return Err(bad("duplicate retain=".into()));
-            }
-            retain = Some(parse_duration_us(dur.trim(), bad)?);
-            continue;
-        }
-        if let Some(o) = part.strip_prefix("origin=") {
-            let o = o.trim();
-            origin = o
-                .parse::<i64>()
-                .ok()
-                .or_else(|| silodb_schema::parse_timestamp_micros(o))
-                .ok_or_else(|| {
-                    bad(format!(
-                        "bad origin '{o}' (epoch microseconds or ISO 8601)"
-                    ))
-                })?;
-            continue;
-        }
-        let us = parse_duration_us(part, bad)?;
-        if let Some(&prev) = out.last()
-            && (us <= prev || us % prev != 0)
-        {
-            return Err(bad(format!(
-                "tier '{part}' must be an ascending exact multiple of the \
-                 previous tier (epoch-aligned windows can't merge \
-                 straddling files — e.g. use 28d after 7d, not 30d)"
-            )));
-        }
-        out.push(us);
-    }
-    if out.is_empty() {
-        return Err(bad("no tiers".into()));
-    }
-    if let (Some(r), Some(&largest)) = (retain, out.last())
-        && r < largest
-    {
-        return Err(bad(
-            "retain= is shorter than the largest tier window — files merge \
-             into windows bigger than the retention period and could never \
-             be evicted whole; use retain >= the largest tier"
-                .into(),
-        ));
-    }
-    Ok((out, retain, origin))
 }
 
 fn init_table_inner(
@@ -460,7 +410,9 @@ pub fn compact_table(
     bucket_end: i64,
     base_dir: impl AsRef<Path>,
 ) -> Result<CompactOutcome, CompactError> {
-    let hot = format!("{table}_hot");
+    let hot = resolve_hot_table(conn, table)
+        .map_err(CompactError::Sqlite)?
+        .unwrap_or_else(|| format!("{table}_hot"));
     compact_bucket(
         conn,
         &BucketSpec {
@@ -548,19 +500,20 @@ pub fn maintain(
     let base = base_dir.as_ref();
     let policy = catalog::get_policy(conn, table)?
         .ok_or_else(|| MaintainError::NoPolicy(table.to_owned()))?;
+    // Idempotent; maintain is a writer by definition, and the promotion/GC
+    // steps below query the catalog even when nothing was ever compacted
+    // (found by the model-based lifecycle proptest: maintain-before-data).
+    catalog::ensure_catalog(conn)?;
     let cutoff = now_us.saturating_sub(policy.safety_margin_us);
     let t0 = policy.tiers_us[0];
     let mut actions = Vec::new();
 
     // --- tier 0: age closed buckets out of the hot table -------------
-    let hot = format!("{table}_hot");
-    let hot_exists: Option<i64> = conn
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
-            [&hot],
-            |r| r.get(0),
-        )
-        .optional()?;
+    let hot_resolved = resolve_hot_table(conn, table)?;
+    let hot = hot_resolved
+        .clone()
+        .unwrap_or_else(|| format!("{table}_hot"));
+    let hot_exists: Option<i64> = hot_resolved.as_ref().map(|_| 1);
     if hot_exists.is_some() {
         // The ts column: same discovery compact_bucket uses.
         let cols: Vec<silodb_schema::ColumnDecl> = conn
@@ -679,7 +632,7 @@ pub fn maintain(
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(MaintainError::Compact(e.into())),
         }
-        catalog::delete_entry(conn, table, &entry.path)?;
+        catalog::purge_entry(conn, table, &entry.path)?;
         actions.push(MaintainAction::Gc { path: entry.path });
     }
 
@@ -723,7 +676,9 @@ pub fn create_rollup(conn: &Connection, table: &str, grain: &str) -> Result<(), 
         )));
     }
 
-    let columns = hot_decls(conn, &format!("{table}_hot"))?;
+    let hot_name = resolve_hot_table(conn, table)?
+        .ok_or_else(|| InitError::BadSchema(format!("no hot table for '{table}'")))?;
+    let columns = hot_decls(conn, &hot_name)?;
     let decls: Vec<silodb_schema::ColumnDecl> = columns.clone();
     let ts_idx = silodb_schema::resolve_ts_index(&decls, None)
         .map_err(|e| bad(format!("hot table: {e}")))?;
@@ -823,7 +778,9 @@ pub fn create_rollup_view(conn: &Connection, table: &str, grain: &str) -> Result
         .map(|p| p.origin_us)
         .unwrap_or(0);
 
-    let columns = hot_decls(conn, &format!("{table}_hot"))?;
+    let hot_name = resolve_hot_table(conn, table)?
+        .ok_or_else(|| InitError::BadSchema(format!("no hot table for '{table}'")))?;
+    let columns = hot_decls(conn, &hot_name)?;
     let ts_idx = silodb_schema::resolve_ts_index(&columns, None)
         .map_err(|e| bad(format!("hot table: {e}")))?;
     let ts_name = quote_ident(&columns[ts_idx].name);
@@ -903,7 +860,7 @@ pub fn create_rollup_view(conn: &Connection, table: &str, grain: &str) -> Result
          GROUP BY ts{comma_group}",
         view = quote_ident(&format!("{table}_{grain}")),
         rollup = quote_ident(&spec.rollup_table),
-        hot = quote_ident(&format!("{table}_hot")),
+        hot = quote_ident(&hot_name),
         live_group = (2..=group.len() + 1)
             .map(|i| format!(", {i}"))
             .collect::<String>(),

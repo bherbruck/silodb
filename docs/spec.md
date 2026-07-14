@@ -300,6 +300,38 @@ silodb::create_rollup_view(&conn, "readings", "1h")?;  // real-time view reading
   namespace; integer-µs semantics). Admin stays Rust-API; a SQL admin
   surface waits for the loadable extension.
 
+## Managed mode (writable vtab — one DDL defines the system)
+
+```sql
+CREATE VIRTUAL TABLE readings USING silodb('cold/',
+    schema='ts TIMESTAMP, device TEXT, value REAL',
+    tiers='1d,7d,28d,retain=2y');
+INSERT INTO readings VALUES (...);              -- xUpdate → shadow hot table
+SELECT * FROM readings WHERE ts > ...;          -- cursor serves hot ∪ cold
+```
+
+The FTS5 pattern: `tiers=` in the DDL turns the vtab into the whole
+system. `xCreate` creates the `<name>_data` shadow hot table (verbatim
+decls + bucket-axis index) and persists the policy; `xUpdate` routes
+INSERTs into the shadow (UPDATE/DELETE are refused — compacted history is
+immutable; mutate the shadow directly for hot-only changes); the cursor
+serves shadow rows first (materialized per scan — the hot tier is small
+by design), then the cold files with all the usual pruning. `maintain()`
+finds the shadow by convention (`<t>_hot` from `init_table`, else
+`<t>_data`).
+
+Rules: managed mode requires `schema=` and rejects `table=`/`hot_table=`
+(the vtab's name IS the logical table — an alias would orphan the shadow
+from maintenance). **`DROP TABLE` drops only the shadow**: catalog rows,
+parquet, stats and policy survive, and re-creating the vtab sees the
+history again — destroying data is retention's job, never DDL's.
+`init_table` remains as the view+trigger alternative.
+
+GC invariant found by the model-based lifecycle proptest: GC'd catalog
+rows are tombstoned (`status='purged'`), never deleted — `bucket_seq`
+counts rows of any status, and deleting rows would let a late-arrival
+re-merge regenerate an *active* file's name.
+
 ## Per-(file, series) statistics (always-on)
 
 Every compaction and merge also writes one row per (cold file, series)
@@ -404,12 +436,7 @@ Single source of truth for both directions; never depends on `rusqlite`.
   side picks it up on the next query with zero changes, and tiered
   maintenance would merge its small files like anything else. Not designed
   further than this paragraph on purpose.
-- **Writable vtab / shadow tables (next planned rework).** Make
-  `CREATE VIRTUAL TABLE readings USING silodb('cold/', schema=..., tiers=...)`
-  the *entire* definition — FTS5-style shadow table for the hot tier,
-  `xUpdate` for inserts, the hot∪cold union inside the cursor — subsuming
-  `init_table`, the view, and the trigger. Sequenced after tiered
-  compaction proved out.
+- *(built — see Managed mode above)*
 - **Catalog rebuild / adopt** — recovering a database from bare parquet
   files (footer scan → catalog rows). Disaster-recovery tool, cheap to
   build when needed.
