@@ -330,3 +330,35 @@ async fn influx_surface_respects_scope() {
     let (_, v) = call(&ts, "GET", &q("SELECT mean(temp) FROM weather"), &key, "").await;
     assert_eq!(v["results"][0]["series"][0]["values"][0][1], 21.5, "{v}");
 }
+
+#[tokio::test]
+async fn admin_ui_is_embedded_and_served() {
+    let ts = server();
+    // Shell at /admin (and SPA fallback for client-side paths).
+    for path in ["/admin", "/admin/", "/admin/some/route"] {
+        let req = Request::builder().uri(path).body(Body::empty()).unwrap();
+        let resp = ts.router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{path}");
+        let ct = resp.headers()["content-type"].to_str().unwrap().to_owned();
+        assert!(ct.contains("text/html"), "{path}: {ct}");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&body);
+        assert!(html.contains("/admin/assets/"), "shell references /admin assets");
+    }
+    // A hashed asset serves with a real mime type and immutable caching.
+    let shell = {
+        let req = Request::builder().uri("/admin").body(Body::empty()).unwrap();
+        let resp = ts.router.clone().oneshot(req).await.unwrap();
+        String::from_utf8(resp.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap()
+    };
+    let asset = shell
+        .split('"')
+        .find(|s| s.starts_with("/admin/assets/") && s.ends_with(".js"))
+        .expect("shell links a js asset")
+        .to_owned();
+    let req = Request::builder().uri(&asset).body(Body::empty()).unwrap();
+    let resp = ts.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "{asset}");
+    assert!(resp.headers()["content-type"].to_str().unwrap().contains("javascript"));
+    assert!(resp.headers()["cache-control"].to_str().unwrap().contains("immutable"));
+}

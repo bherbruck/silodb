@@ -1,0 +1,15 @@
+[package]
+name = "silodb-admin-ui"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+dioxus = { version = "0.7", features = ["web"] }
+dioxus-icons = { version = "0.1.0", default-features = false }
+dioxus-primitives = { git = "https://github.com/DioxusLabs/components", version = "0.0.1", default-features = false }
+gloo-net = { version = "0.7", features = ["http"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+web-sys = { version = "0.3.103", features = ["Window", "Storage"] }
+
+[workspace]

@@ -127,6 +127,21 @@ curl -s 'localhost:8080/write?precision=s' \
 - `?precision=ns|us|ms|s` (default `ns`); missing timestamp = server now
 - one request = one transaction: all lines land or none do
 
+## `/admin` — the admin UI (pure Rust, embedded)
+
+A Dioxus WASM SPA served straight from the binary at
+`http://…:8080/admin`: sign in with any token, then manage tables
+(create / add column / retention, live hot+cold stats), provision and
+revoke scoped API keys (copy-once secrets), and run SQL — all against
+the same JSON API documented above, with the same role/scope fences.
+
+The UI source lives in `admin-ui/` (Rust + rsx! on the official
+dioxus-components); the compiled output is committed in `ui-dist/` and
+embedded via rust-embed, so **`cargo build` needs no extra toolchain**.
+To hack on the UI: `cargo install dioxus-cli`, `rustup target add
+wasm32-unknown-unknown`, then `admin-ui/build.sh` (or `dx serve` for
+hot reload against a running server) — all cargo, no node.
+
 ## Grafana — no plugin, no Infinity: it *is* an InfluxDB (to Grafana)
 
 silodb-server emulates the InfluxDB 1.x query API (`/ping`, `/query`

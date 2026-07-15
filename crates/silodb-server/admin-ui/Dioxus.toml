@@ -1,0 +1,7 @@
+[application]
+name = "silodb-admin"
+
+[web.app]
+title = "silodb admin"
+# Served by silodb-server at /admin
+base_path = "admin"

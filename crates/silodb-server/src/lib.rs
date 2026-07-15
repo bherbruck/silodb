@@ -153,7 +153,52 @@ pub fn app(state: AppState) -> Router {
             "/admin/api/tables/{table}/retention",
             axum::routing::put(admin::set_retention),
         )
+        // The admin UI: a Dioxus WASM SPA, compiled ahead of time
+        // (admin-ui/build.sh) and embedded into the binary — cargo build
+        // needs no toolchain beyond the committed ui-dist/.
+        .route("/admin", get(admin_ui))
+        .route("/admin/", get(admin_ui))
+        .route("/admin/{*path}", get(admin_ui))
         .with_state(state)
+}
+
+#[derive(rust_embed::Embed)]
+#[folder = "ui-dist/"]
+struct AdminAssets;
+
+async fn admin_ui(req: axum::extract::Request) -> Response {
+    let path = req
+        .uri()
+        .path()
+        .trim_start_matches("/admin")
+        .trim_start_matches('/');
+    let file = AdminAssets::get(path)
+        // SPA fallback: any non-asset path serves the app shell.
+        .or_else(|| AdminAssets::get("index.html"));
+    match file {
+        Some(f) => {
+            let mime = mime_guess::from_path(if path.is_empty() { "index.html" } else { path })
+                .first_or_else(|| mime_guess::mime::TEXT_HTML);
+            (
+                [
+                    ("content-type", mime.to_string()),
+                    // Hashed asset names make long caching safe; the
+                    // shell itself must revalidate.
+                    (
+                        "cache-control",
+                        if path.starts_with("assets/") {
+                            "public, max-age=31536000, immutable".into()
+                        } else {
+                            "no-cache".into()
+                        },
+                    ),
+                ],
+                f.data,
+            )
+                .into_response()
+        }
+        None => (StatusCode::NOT_FOUND, "admin UI not embedded").into_response(),
+    }
 }
 
 async fn influx_ping() -> impl IntoResponse {
