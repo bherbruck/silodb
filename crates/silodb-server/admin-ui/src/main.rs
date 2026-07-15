@@ -12,14 +12,14 @@ use components::button::{Button, ButtonSize, ButtonVariant};
 use components::input::Input;
 use components::label::Label;
 use components::sidebar::{
-    Sidebar, SidebarContent, SidebarFooter, SidebarGroup, SidebarGroupContent, SidebarGroupLabel,
-    SidebarHeader, SidebarInset, SidebarMenu, SidebarMenuButton, SidebarMenuItem, SidebarProvider,
+    Sidebar, SidebarContent, SidebarFooter, SidebarGroup, SidebarGroupAction, SidebarGroupContent,
+    SidebarGroupLabel, SidebarHeader, SidebarInset, SidebarMenu, SidebarMenuButton,
+    SidebarMenuItem, SidebarMenuSub, SidebarMenuSubItem, SidebarProvider,
 };
 use dioxus::prelude::*;
 
 #[derive(Clone, PartialEq)]
 enum View {
-    Tables,
     Keys,
     Sql,
     Table(String),
@@ -110,8 +110,10 @@ fn Login(on_login: EventHandler<()>) -> Element {
 
 #[component]
 fn Shell(on_logout: EventHandler<()>) -> Element {
-    let mut view = use_signal(|| View::Tables);
-    let tables = use_resource(|| async { api::tables().await });
+    let mut view = use_signal(|| View::Sql);
+    let mut expanded = use_signal(Vec::<String>::new);
+    let mut create_open = use_signal(|| false);
+    let mut tables = use_resource(|| async { api::tables().await });
     let keys = use_resource(|| async { api::keys().await });
 
     rsx! {
@@ -126,24 +128,57 @@ fn Shell(on_logout: EventHandler<()>) -> Element {
                 SidebarContent {
                     SidebarGroup {
                         SidebarGroupLabel { "Tables" }
+                        SidebarGroupAction { title: "New table",
+                            div { onclick: move |_| create_open.set(true), "\u{FF0B}" }
+                        }
                         SidebarGroupContent {
                             SidebarMenu {
-                                SidebarMenuItem {
-                                    div { onclick: move |_| view.set(View::Tables),
-                                        SidebarMenuButton { is_active: view() == View::Tables, "All tables" }
-                                    }
-                                }
                                 if let Some(Ok(list)) = &*tables.read() {
-                                    for t in list.iter().map(|t| t.table.clone()) {
+                                    if list.is_empty() {
+                                        SidebarMenuItem {
+                                            span { class: "muted small sidebar-note", "none yet; use \u{FF0B}" }
+                                        }
+                                    }
+                                    for t in list.clone() {
                                         SidebarMenuItem {
                                             div {
+                                                class: "table-node",
                                                 onclick: {
-                                                    let t = t.clone();
-                                                    move |_| view.set(View::Table(t.clone()))
+                                                    let name = t.table.clone();
+                                                    move |_| view.set(View::Table(name.clone()))
                                                 },
                                                 SidebarMenuButton {
-                                                    is_active: view() == View::Table(t.clone()),
-                                                    span { class: "menu-table mono", "{t}" }
+                                                    is_active: view() == View::Table(t.table.clone()),
+                                                    span {
+                                                        class: "tree-chevron",
+                                                        onclick: {
+                                                            let name = t.table.clone();
+                                                            move |e: MouseEvent| {
+                                                                e.stop_propagation();
+                                                                let mut ex = expanded();
+                                                                match ex.iter().position(|x| *x == name) {
+                                                                    Some(i) => { ex.remove(i); }
+                                                                    None => ex.push(name.clone()),
+                                                                }
+                                                                expanded.set(ex);
+                                                            }
+                                                        },
+                                                        if expanded().contains(&t.table) { "\u{25BE}" } else { "\u{25B8}" }
+                                                    }
+                                                    span { class: "menu-table mono", "{t.table}" }
+                                                }
+                                            }
+                                            if expanded().contains(&t.table) {
+                                                SidebarMenuSub {
+                                                    for c in &t.columns {
+                                                        SidebarMenuSubItem {
+                                                            span { class: "tree-col mono",
+                                                                "{c.name}"
+                                                                span { class: "muted", " {c.ty.to_lowercase()}" }
+                                                                if c.name == t.ts_column { span { class: "muted", " \u{23F1}" } }
+                                                            }
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }
@@ -156,7 +191,7 @@ fn Shell(on_logout: EventHandler<()>) -> Element {
                         SidebarGroupLabel { "Server" }
                         SidebarGroupContent {
                             SidebarMenu {
-                                for (v, label) in [(View::Keys, "API keys"), (View::Sql, "SQL console")] {
+                                for (v, label) in [(View::Sql, "SQL console"), (View::Keys, "API keys")] {
                                     SidebarMenuItem {
                                         div {
                                             onclick: {
@@ -183,12 +218,17 @@ fn Shell(on_logout: EventHandler<()>) -> Element {
             SidebarInset {
                 main { class: "content",
                     match view() {
-                        View::Tables => rsx! { views::TablesView { tables, keys } },
                         View::Keys => rsx! { views::KeysView { keys, tables } },
                         View::Sql => rsx! { views::SqlView { tables } },
                         View::Table(t) => rsx! { views::TableDetail { key: "{t}", table: t.clone(), tables, keys } },
                     }
                 }
+            }
+        }
+        if create_open() {
+            views::CreateTableDialog {
+                onclose: move |_| create_open.set(false),
+                ondone: move |_| { create_open.set(false); tables.restart(); },
             }
         }
     }
