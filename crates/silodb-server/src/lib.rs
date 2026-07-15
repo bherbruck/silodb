@@ -90,12 +90,23 @@ pub(crate) fn forbidden(msg: impl Into<String>) -> ApiError {
 }
 
 /// Open connections, spawn actors, build the router. The caller serves it.
+///
+/// Zero-config first run: with no tokens configured at all, a random
+/// admin (ddl) token is generated and printed once — `docker compose up`
+/// works out of the box, and the operator is nudged to set a stable one.
 pub fn boot(config: &Config) -> Result<AppState, Box<dyn std::error::Error>> {
-    if !config.tokens.any_configured() {
-        return Err("no tokens configured — set SILODB_READONLY_TOKEN / \
-                    SILODB_READWRITE_TOKEN / SILODB_DDL_TOKEN (an unset role \
-                    is disabled; with none set, nothing could ever connect)"
-            .into());
+    let mut tokens = config.tokens.clone();
+    if !tokens.any_configured() {
+        let mut raw = [0u8; 24];
+        getrandom::fill(&mut raw)?;
+        let generated: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+        println!(
+            "no tokens configured — generated an admin token for this run:\n\n    \
+             SILODB_DDL_TOKEN={generated}\n\n\
+             it changes on every restart; set SILODB_DDL_TOKEN (e.g. in .env) \
+             to make it stable, or mint durable scoped keys at /admin"
+        );
+        tokens.ddl = Some(generated);
     }
     let writer = Connection::open(&config.db_path)?;
     // journal_mode returns a row; query it rather than pragma_update.
@@ -122,7 +133,7 @@ pub fn boot(config: &Config) -> Result<AppState, Box<dyn std::error::Error>> {
     Ok(AppState {
         writer,
         readers: Arc::new(ReaderPool::new(readers)),
-        tokens: config.tokens.clone(),
+        tokens,
         default_tiers: config.default_tiers.clone(),
         max_rows: config.max_rows,
     })

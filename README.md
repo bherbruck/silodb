@@ -83,8 +83,8 @@ full SQL over `POST /sql`, InfluxDB line protocol with autoschema over
 enforced inside SQLite itself, and background maintenance on a timer.
 
 ```sh
-cp .env.example .env   # set your tokens
-docker compose up
+docker compose up   # zero config: an admin token is generated and printed
+                    # (cp .env.example .env to set stable tokens)
 curl -s 'localhost:8080/write?precision=s' -H "Authorization: Bearer $DDL" \
   --data-binary 'weather,city=SF temp=21.5,humidity=40i 1752451200'
 curl -s localhost:8080/sql -H "Authorization: Bearer $RO" \

@@ -2,3 +2,4 @@ target/
 crates/silodb-server/admin-ui/target/
 crates/silodb-server/admin-ui/node_modules/
 .env
+/data/

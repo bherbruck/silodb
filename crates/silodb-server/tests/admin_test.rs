@@ -381,3 +381,28 @@ async fn key_listing_works_on_a_fresh_database() {
     assert_eq!(status, StatusCode::OK, "{v}");
     assert_eq!(v["keys"], json!([]));
 }
+
+#[tokio::test]
+async fn zero_config_boot_generates_admin_token() {
+    // No tokens configured at all: boot must generate a usable ddl token
+    // instead of refusing to start (docker compose up with no .env).
+    let dir = tempfile::tempdir().unwrap();
+    let config = Config {
+        db_path: dir.path().join("hot.db"),
+        addr: String::new(),
+        tokens: Tokens::default(),
+        default_tiers: "1d".into(),
+        cold_dir: None,
+        maintain_secs: 0,
+        readers: 1,
+        max_rows: 100,
+    };
+    let state = boot(&config).unwrap();
+    let generated = state.tokens.ddl.clone().expect("token generated");
+    assert_eq!(generated.len(), 48, "24 random bytes, hex");
+    let ts = TestServer { router: app(state), _dir: dir };
+    let (status, _) = sql(&ts, &generated, "SELECT 1").await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = sql(&ts, "wrong", "SELECT 1").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}

@@ -24,11 +24,12 @@ cargo run --release -p silodb-server
 | `SILODB_READERS` | `4` | read-only connection pool size |
 | `SILODB_MAX_ROWS` | `10000` | `/sql` result cap (`"truncated": true` past it) |
 
-At least one token must be set or the server refuses to start. Env
-tokens are the unscoped **root credentials**; day-to-day clients should
-hold provisioned keys instead (below). For compose, copy the repo-root
-`.env.example` to `.env` (git-ignored) and fill in the tokens — compose
-picks it up automatically.
+Env tokens are the unscoped **root credentials**; day-to-day clients
+should hold provisioned keys instead (below). All optional: **with no
+tokens set, the server generates an admin token and prints it in the
+logs** — it changes every restart, so for anything durable copy the
+repo-root `.env.example` to `.env` (git-ignored) and set your own;
+compose picks it up automatically.
 
 ## Provisioned keys — scoped credentials, managed over HTTP
 

@@ -13,10 +13,12 @@ services:
       #   - ./data:/data     (then: mkdir -p data && sudo chown 65532 data)
       - silodb-data:/data
     environment:
-      # A role with no token is disabled; at least one must be set.
+      # All optional: with no tokens set at all, the server generates an
+      # admin token and prints it in the logs (changes every restart —
+      # set SILODB_DDL_TOKEN in .env to make it stable).
       SILODB_READONLY_TOKEN: ${SILODB_READONLY_TOKEN:-}
       SILODB_READWRITE_TOKEN: ${SILODB_READWRITE_TOKEN:-}
-      SILODB_DDL_TOKEN: ${SILODB_DDL_TOKEN:?set SILODB_DDL_TOKEN (e.g. in .env)}
+      SILODB_DDL_TOKEN: ${SILODB_DDL_TOKEN:-}
       # Policy for tables auto-created by line-protocol writes.
       SILODB_DEFAULT_TIERS: ${SILODB_DEFAULT_TIERS:-1d}
       # Background maintenance interval (seconds; 0 disables).
@@ -35,7 +37,9 @@ services:
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
     environment:
-      SILODB_READONLY_TOKEN: ${SILODB_READONLY_TOKEN:?the datasource needs the readonly token}
+      # The provisioned datasource authenticates with the readonly token —
+      # set SILODB_READONLY_TOKEN in .env when using this profile.
+      SILODB_READONLY_TOKEN: ${SILODB_READONLY_TOKEN:-}
       GF_AUTH_ANONYMOUS_ENABLED: "true"
       GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
     depends_on:
