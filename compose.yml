@@ -1,5 +1,7 @@
 services:
   silodb:
+    # Compose reuses an existing image — after pulling new commits, run
+    # `docker compose up --build` or you'll serve the old binary.
     build: .
     ports:
       - "8080:8080"
