@@ -26,7 +26,9 @@ cargo run --release -p silodb-server
 
 At least one token must be set or the server refuses to start. Env
 tokens are the unscoped **root credentials**; day-to-day clients should
-hold provisioned keys instead (below).
+hold provisioned keys instead (below). For compose, copy the repo-root
+`.env.example` to `.env` (git-ignored) and fill in the tokens — compose
+picks it up automatically.
 
 ## Provisioned keys — scoped credentials, managed over HTTP
 

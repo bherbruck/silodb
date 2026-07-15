@@ -83,12 +83,20 @@ full SQL over `POST /sql`, InfluxDB line protocol with autoschema over
 enforced inside SQLite itself, and background maintenance on a timer.
 
 ```sh
-docker compose up   # tokens via .env; data in ./data
+cp .env.example .env   # set your tokens
+docker compose up
 curl -s 'localhost:8080/write?precision=s' -H "Authorization: Bearer $DDL" \
   --data-binary 'weather,city=SF temp=21.5,humidity=40i 1752451200'
 curl -s localhost:8080/sql -H "Authorization: Bearer $RO" \
   -d '{"sql": "SELECT city, avg(temp) FROM weather GROUP BY 1"}'
 ```
+
+An admin panel ships in the binary at `http://localhost:8080/admin`
+(tables, scoped API keys, SQL console — a pure-Rust Dioxus WASM app),
+and `docker compose --profile grafana up` adds Grafana on :3000 with
+silodb pre-wired as an InfluxDB datasource — the server emulates the
+InfluxDB 1.x query API, so stock Grafana's query builder and
+autocomplete just work.
 
 ## How the tiers work
 
