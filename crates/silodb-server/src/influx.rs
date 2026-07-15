@@ -134,13 +134,17 @@ fn measurements(conn: &Connection) -> Result<Vec<String>, String> {
         .map_err(|e| e.to_string())
 }
 
-/// Execute one statement; returns the influx `series` array.
+/// Execute one statement; returns the influx `series` array. `scope`
+/// (a provisioned key's table list) filters SHOW results and fences
+/// SELECT to the scope's measurements.
 pub fn execute(
     conn: &Connection,
     stmt: &Statement,
     epoch: Epoch,
     max_rows: usize,
+    scope: Option<&[String]>,
 ) -> Result<Json, String> {
+    let in_scope = |m: &str| scope.is_none_or(|s| s.iter().any(|t| t == m));
     match stmt {
         Statement::ShowDatabases => Ok(json!([{
             "name": "databases", "columns": ["name"], "values": [["silodb"]]
@@ -151,6 +155,7 @@ pub fn execute(
         }])),
         Statement::ShowMeasurements { limit } => {
             let mut names = measurements(conn)?;
+            names.retain(|n| in_scope(n));
             if let Some(l) = limit {
                 names.truncate(*l as usize);
             }
@@ -165,7 +170,7 @@ pub fn execute(
         }
         Statement::ShowTagKeys { from } => {
             let mut out = Vec::new();
-            for m in from_or_all(conn, from)? {
+            for m in from_or_all(conn, from)?.into_iter().filter(|m| in_scope(m)) {
                 if let Some(sh) = shape(conn, &m)? {
                     if sh.tags.is_empty() {
                         continue;
@@ -181,7 +186,7 @@ pub fn execute(
         }
         Statement::ShowFieldKeys { from } => {
             let mut out = Vec::new();
-            for m in from_or_all(conn, from)? {
+            for m in from_or_all(conn, from)?.into_iter().filter(|m| in_scope(m)) {
                 if let Some(sh) = shape(conn, &m)? {
                     if sh.fields.is_empty() {
                         continue;
@@ -197,7 +202,7 @@ pub fn execute(
         }
         Statement::ShowTagValues { from, key } => {
             let mut out = Vec::new();
-            for m in from_or_all(conn, from)? {
+            for m in from_or_all(conn, from)?.into_iter().filter(|m| in_scope(m)) {
                 let Some(sh) = shape(conn, &m)? else { continue };
                 if !sh.tags.contains(key) {
                     continue;
@@ -221,7 +226,15 @@ pub fn execute(
             }
             Ok(Json::Array(out))
         }
-        Statement::Select(sel) => select(conn, sel, epoch, max_rows),
+        Statement::Select(sel) => {
+            if !in_scope(&sel.measurement) {
+                return Err(format!(
+                    "measurement '{}' is outside this key's scope",
+                    sel.measurement
+                ));
+            }
+            select(conn, sel, epoch, max_rows)
+        }
     }
 }
 

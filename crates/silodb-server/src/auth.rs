@@ -39,17 +39,7 @@ impl Tokens {
     /// slot (how Grafana's InfluxDB datasource sends credentials; the
     /// username is ignored).
     pub fn role(&self, headers: &HeaderMap) -> Option<Role> {
-        let auth = headers.get("authorization")?.to_str().ok()?;
-        if let Some(bearer) = auth.strip_prefix("Bearer ") {
-            return self.role_for_secret(bearer.trim());
-        }
-        if let Some(b64) = auth.strip_prefix("Basic ") {
-            let decoded = base64_decode(b64.trim())?;
-            let creds = String::from_utf8(decoded).ok()?;
-            let secret = creds.split_once(':').map(|(_, p)| p).unwrap_or(&creds);
-            return self.role_for_secret(secret);
-        }
-        None
+        self.role_for_secret(&extract_secret(headers)?)
     }
 
     /// Match a bare secret (query-param `p=`, basic-auth password) to a
@@ -68,6 +58,23 @@ impl Tokens {
         }
         None
     }
+}
+
+/// Pull the presented secret out of the Authorization header, whatever
+/// convention the client speaks: `Bearer <secret>`, or `Basic` with the
+/// secret in the password slot.
+pub fn extract_secret(headers: &HeaderMap) -> Option<String> {
+    let auth = headers.get("authorization")?.to_str().ok()?;
+    if let Some(bearer) = auth.strip_prefix("Bearer ") {
+        return Some(bearer.trim().to_owned());
+    }
+    if let Some(b64) = auth.strip_prefix("Basic ") {
+        let decoded = base64_decode(b64.trim())?;
+        let creds = String::from_utf8(decoded).ok()?;
+        let secret = creds.split_once(':').map(|(_, p)| p).unwrap_or(&creds);
+        return Some(secret.to_owned());
+    }
+    None
 }
 
 /// Minimal base64 (standard alphabet, `=` padding) — one header field

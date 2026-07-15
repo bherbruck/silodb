@@ -11,13 +11,16 @@
 //! just the route: readonly runs on read-only connections, readwrite runs
 //! under a SQLite authorizer that denies DDL and silodb admin functions.
 
+pub mod admin;
 pub mod auth;
 pub mod db;
 pub mod influx;
 pub mod influxql;
+pub mod keys;
 pub mod lineproto;
 
 use auth::{Role, Tokens};
+use keys::Auth;
 use axum::extract::{RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -79,10 +82,10 @@ impl IntoResponse for ApiError {
     }
 }
 
-fn bad_request(msg: impl Into<String>) -> ApiError {
+pub(crate) fn bad_request(msg: impl Into<String>) -> ApiError {
     ApiError(StatusCode::BAD_REQUEST, msg.into())
 }
-fn forbidden(msg: impl Into<String>) -> ApiError {
+pub(crate) fn forbidden(msg: impl Into<String>) -> ApiError {
     ApiError(StatusCode::FORBIDDEN, msg.into())
 }
 
@@ -134,6 +137,22 @@ pub fn app(state: AppState) -> Router {
         // datasource (InfluxQL) points here, builder autocomplete and all.
         .route("/ping", get(influx_ping).head(influx_ping))
         .route("/query", get(influx_query).post(influx_query))
+        // Admin API: key provisioning + table management (the DDL front
+        // door for scoped keys — their SQL surface denies DDL outright).
+        .route(
+            "/admin/api/keys",
+            post(admin::create_key).get(admin::list_keys),
+        )
+        .route("/admin/api/keys/{name}", axum::routing::delete(admin::revoke_key))
+        .route(
+            "/admin/api/tables",
+            get(admin::list_tables).post(admin::create_table),
+        )
+        .route("/admin/api/tables/{table}/columns", post(admin::add_column))
+        .route(
+            "/admin/api/tables/{table}/retention",
+            axum::routing::put(admin::set_retention),
+        )
         .with_state(state)
 }
 
@@ -167,13 +186,10 @@ async fn influx_query(
         }
     }
     // Header auth (Bearer / Basic password), else influx-classic u/p.
-    let role = state
-        .tokens
-        .role(&headers)
-        .or_else(|| params.get("p").and_then(|p| state.tokens.role_for_secret(p)));
-    if role.is_none() {
-        return Err(ApiError(StatusCode::UNAUTHORIZED, "unauthorized".into()));
-    }
+    let auth = resolve_auth(&state, &headers, params.get("p").cloned())
+        .await
+        .ok_or_else(unauthorized)?;
+    let scope = auth.scope;
     let q = params
         .get("q")
         .cloned()
@@ -191,7 +207,9 @@ async fn influx_query(
             for (i, stmt_text) in influxql::split_statements(&q).into_iter().enumerate() {
                 let outcome = influxql::parse(&stmt_text, now)
                     .map_err(|e| e.to_string())
-                    .and_then(|stmt| influx::execute(conn, &stmt, epoch, max_rows));
+                    .and_then(|stmt| {
+                        influx::execute(conn, &stmt, epoch, max_rows, scope.as_deref())
+                    });
                 results.push(match outcome {
                     Ok(series) if series.as_array().is_some_and(|s| s.is_empty()) => {
                         json!({ "statement_id": i })
@@ -242,6 +260,99 @@ pub fn now_micros() -> i64 {
         .as_micros() as i64
 }
 
+// --- auth resolution -----------------------------------------------------
+
+/// Resolve a request to an [`Auth`]: env tokens first (unscoped root
+/// credentials), then provisioned keys from `_silodb_server_keys`.
+/// `extra_secret` carries query-param credentials (influx `p=`).
+pub(crate) async fn resolve_auth(
+    state: &AppState,
+    headers: &HeaderMap,
+    extra_secret: Option<String>,
+) -> Option<Auth> {
+    let secret = auth::extract_secret(headers).or(extra_secret)?;
+    if let Some(role) = state.tokens.role_for_secret(&secret) {
+        return Some(Auth::unscoped(role));
+    }
+    state
+        .readers
+        .get()
+        .run(move |conn| keys::lookup(conn, &secret).ok().flatten())
+        .await
+}
+
+pub(crate) fn unauthorized() -> ApiError {
+    ApiError(StatusCode::UNAUTHORIZED, "bad or missing token".into())
+}
+
+/// The database-level fence for a **scoped** key, any role: reads only
+/// within the scope's table family (plus engine internals), DML only for
+/// write/ddl roles and only on the scope's own tables, and no DDL or
+/// silodb admin functions at all — scoped schema changes go through the
+/// admin API, where scope is checked against the named table.
+fn scoped_authorizer(
+    role: Role,
+    scope: Vec<String>,
+) -> impl for<'a> FnMut(AuthContext<'a>) -> Authorization + Send + 'static {
+    move |ctx| match ctx.action {
+        AuthAction::Select
+        | AuthAction::Transaction { .. }
+        | AuthAction::Savepoint { .. }
+        | AuthAction::Recursive => Authorization::Allow,
+        // Reading a view emits NO event for the view's own name — only
+        // underlying-table reads tagged with the view as accessor. So an
+        // accessor is a grant exactly when the accessor itself is in
+        // scope ("this is the weather view doing the reading"), never a
+        // blanket pass — otherwise every view is readable by everyone.
+        AuthAction::Read { table_name, .. } => {
+            if keys::sql_read_allowed(&scope, table_name)
+                || ctx.accessor.is_some_and(|a| keys::sql_read_allowed(&scope, a))
+            {
+                Authorization::Allow
+            } else {
+                Authorization::Deny
+            }
+        }
+        AuthAction::Insert { table_name }
+        | AuthAction::Delete { table_name }
+        | AuthAction::Update { table_name, .. } => {
+            if role == Role::ReadOnly {
+                return Authorization::Deny;
+            }
+            // Same accessor rule: the scope's own INSTEAD OF trigger
+            // ("weather_insert") may route into the hot table; a foreign
+            // trigger may not.
+            if keys::sql_write_allowed(&scope, table_name)
+                || ctx.accessor.is_some_and(|a| keys::sql_read_allowed(&scope, a))
+            {
+                Authorization::Allow
+            } else {
+                Authorization::Deny
+            }
+        }
+        AuthAction::Function { function_name } => {
+            if function_name.to_ascii_lowercase().starts_with("silodb_")
+                && ADMIN_FUNCTIONS
+                    .iter()
+                    .any(|a| function_name.eq_ignore_ascii_case(a))
+            {
+                Authorization::Deny
+            } else {
+                Authorization::Allow
+            }
+        }
+        _ => Authorization::Deny,
+    }
+}
+
+const ADMIN_FUNCTIONS: [&str; 5] = [
+    "silodb_create_table",
+    "silodb_add_column",
+    "silodb_set_retention",
+    "silodb_set_default_dir",
+    "silodb_maintain",
+];
+
 // --- /sql --------------------------------------------------------------
 
 #[derive(Deserialize)]
@@ -261,23 +372,40 @@ async fn sql_handler(
     let req: SqlRequest = serde_json::from_str(&body).map_err(|e| {
         bad_request(format!("body must be JSON {{\"sql\": \"...\", \"params\": [...]}}: {e}"))
     })?;
-    let role = state
-        .tokens
-        .role(&headers)
-        .ok_or(ApiError(StatusCode::UNAUTHORIZED, "bad or missing token".into()))?;
+    let auth = resolve_auth(&state, &headers, None)
+        .await
+        .ok_or_else(unauthorized)?;
     let max_rows = state.max_rows;
-    let actor = match role {
+    let actor = match auth.role {
         Role::ReadOnly => state.readers.get().clone(),
         Role::ReadWrite | Role::Ddl => state.writer.clone(),
     };
     actor
         .run(move |conn| {
-            if role == Role::ReadWrite {
-                conn.authorizer(Some(readwrite_authorizer))
-                    .map_err(|e| bad_request(e.to_string()))?;
-            }
+            let guarded = match (&auth.scope, auth.role) {
+                (Some(scope), role) => {
+                    conn.authorizer(Some(scoped_authorizer(role, scope.clone())))
+                        .map_err(|e| bad_request(e.to_string()))?;
+                    true
+                }
+                (None, Role::ReadWrite) => {
+                    conn.authorizer(Some(readwrite_authorizer))
+                        .map_err(|e| bad_request(e.to_string()))?;
+                    true
+                }
+                // Unscoped readonly runs on a read-only connection —
+                // writes/DDL already impossible; the authorizer only
+                // hides the credential tables.
+                (None, Role::ReadOnly) => {
+                    conn.authorizer(Some(readonly_authorizer))
+                        .map_err(|e| bad_request(e.to_string()))?;
+                    true
+                }
+                // unscoped ddl is the root credential — unrestricted
+                (None, Role::Ddl) => false,
+            };
             let result = run_sql(conn, &req, max_rows);
-            if role == Role::ReadWrite {
+            if guarded {
                 let _ = conn.authorizer(None::<fn(AuthContext) -> Authorization>);
             }
             result
@@ -324,10 +452,17 @@ fn sql_err(e: rusqlite::Error) -> ApiError {
         rusqlite::Error::MultipleStatement => bad_request(
             "one statement per request (multi-statement scripts aren't supported)",
         ),
-        e if e.to_string().contains("not authorized") => forbidden(format!(
-            "{e} — this token's role doesn't allow that (DDL and silodb admin \
-             functions need the ddl token; writes need readwrite or ddl)"
-        )),
+        // SQLite authorizer denials: "not authorized" (statement-level)
+        // and "access to <t>.<c> is prohibited" (column-level).
+        e if e.to_string().contains("not authorized")
+            || e.to_string().contains("prohibited") =>
+        {
+            forbidden(format!(
+                "{e} — this credential's role or scope doesn't allow that \
+                 (DDL and silodb admin functions need an unscoped ddl token; \
+                 scoped keys reach only their own tables)"
+            ))
+        }
         e if e.to_string().contains("readonly database") => {
             forbidden(format!("{e} — this token is read-only"))
         }
@@ -363,6 +498,17 @@ fn sql_to_json(v: ValueRef<'_>) -> serde_json::Value {
     }
 }
 
+/// Unscoped readonly's only fence: the read-only connection already
+/// refuses writes and DDL; this hides the credential tables.
+fn readonly_authorizer(ctx: AuthContext<'_>) -> Authorization {
+    match ctx.action {
+        AuthAction::Read { table_name, .. } if table_name.starts_with("_silodb_server_") => {
+            Authorization::Deny
+        }
+        _ => Authorization::Allow,
+    }
+}
+
 /// The readwrite role's database-level fence: DML on user tables is fine,
 /// everything schema-shaped or engine-internal is not.
 fn readwrite_authorizer(ctx: AuthContext<'_>) -> Authorization {
@@ -370,10 +516,17 @@ fn readwrite_authorizer(ctx: AuthContext<'_>) -> Authorization {
         |t: &str| t.starts_with("_silodb_") || t.starts_with("sqlite_");
     match ctx.action {
         AuthAction::Select
-        | AuthAction::Read { .. }
         | AuthAction::Transaction { .. }
         | AuthAction::Savepoint { .. }
         | AuthAction::Recursive => Authorization::Allow,
+        AuthAction::Read { table_name, .. } => {
+            // Credential tables are unscoped-ddl-only, even for reads.
+            if table_name.starts_with("_silodb_server_") {
+                Authorization::Deny
+            } else {
+                Authorization::Allow
+            }
+        }
         AuthAction::Insert { table_name }
         | AuthAction::Delete { table_name }
         | AuthAction::Update { table_name, .. } => {
@@ -411,11 +564,10 @@ async fn write_handler(
     RawQuery(query): RawQuery,
     body: String,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let role = state
-        .tokens
-        .role(&headers)
-        .ok_or(ApiError(StatusCode::UNAUTHORIZED, "bad or missing token".into()))?;
-    if role == Role::ReadOnly {
+    let auth = resolve_auth(&state, &headers, None)
+        .await
+        .ok_or_else(unauthorized)?;
+    if auth.role == Role::ReadOnly {
         return Err(forbidden("readonly token can't write"));
     }
     let precision = query
@@ -432,7 +584,17 @@ async fn write_handler(
     if lines.is_empty() {
         return Ok(Json(json!({ "written": 0 })));
     }
-    let allow_ddl = role == Role::Ddl;
+    // Scope is exact here: line protocol names its measurement. A scoped
+    // ddl key may autoschema-create, but only tables its scope names.
+    for line in &lines {
+        if !auth.allows_table(&line.measurement) {
+            return Err(forbidden(format!(
+                "measurement '{}' is outside this key's scope",
+                line.measurement
+            )));
+        }
+    }
+    let allow_ddl = auth.role == Role::Ddl;
     let default_tiers = state.default_tiers.clone();
     let now = now_micros();
 

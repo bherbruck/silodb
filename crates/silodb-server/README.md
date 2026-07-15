@@ -24,7 +24,57 @@ cargo run --release -p silodb-server
 | `SILODB_READERS` | `4` | read-only connection pool size |
 | `SILODB_MAX_ROWS` | `10000` | `/sql` result cap (`"truncated": true` past it) |
 
-At least one token must be set or the server refuses to start.
+At least one token must be set or the server refuses to start. Env
+tokens are the unscoped **root credentials**; day-to-day clients should
+hold provisioned keys instead (below).
+
+## Provisioned keys — scoped credentials, managed over HTTP
+
+Keys live in the database (`_silodb_server_keys` + a many-to-many
+`_silodb_server_key_scopes` — inspectable with plain SQL like everything
+else), store only a SHA-256 hash, and are shown exactly once:
+
+```
+curl -s localhost:8080/admin/api/keys -H "Authorization: Bearer $DDL" \
+  -d '{"name": "site-a", "role": "write", "scope": ["weather"]}'
+# {"secret":"sk_…","note":"store this now — …"}
+
+curl -s localhost:8080/admin/api/keys -H "Authorization: Bearer $DDL"          # list (no secrets)
+curl -s -X DELETE localhost:8080/admin/api/keys/site-a -H "Authorization: Bearer $DDL"  # revoke
+```
+
+`role` = `read` | `write` | `ddl`; `scope` = exact table names (empty =
+unscoped). A scoped key touches **only its tables**, on every surface:
+
+- `/write`: measurement outside scope → 403. A scoped **ddl** key may
+  autoschema-create/evolve exactly the tables its scope names — so a
+  fleet key can bootstrap its own measurement and nothing else.
+- `/sql`: enforced by a per-request SQLite authorizer — reads limited to
+  the scope's table family (`t`, `t_hot`, `t_stats`, rollups, grain
+  views…), DML per role, and **no DDL or `silodb_*` admin functions at
+  all** (schema changes go through the admin API, where scope is checked
+  against the named table). Joins, views, `count(*)` shortcuts — the
+  database refuses, not a query parser.
+- `/query` (Grafana): `SHOW` output filtered to scope; `SELECT` on a
+  foreign measurement errors. Point a Grafana datasource at a `read`
+  key scoped to exactly the dashboards' tables.
+- Key management itself needs an **unscoped** ddl credential — a scoped
+  key can't mint itself wider access.
+
+## Admin API — table management (the DDL front door)
+
+```
+GET  /admin/api/tables                       # policy + columns + hot/cold stats
+POST /admin/api/tables                       # {"name","schema","tiers"?,"retention"?}
+POST /admin/api/tables/{t}/columns           # {"coldef": "humidity REAL"}
+PUT  /admin/api/tables/{t}/retention         # {"retain": "8w"} | {"retain": null}
+```
+
+ddl role required; a scoped ddl key may manage the tables in its scope.
+Pre-creating tables here is how write-only fleets get "autoschema just
+works": the admin shapes the table once, devices hold write keys that
+can insert but never alter — schema drift from a device is a 403, not a
+silent new column.
 
 ## Roles — enforced at the database, not just the route
 
