@@ -173,8 +173,19 @@ pub fn lookup(conn: &Connection, secret: &str) -> rusqlite::Result<Option<Auth>>
 }
 
 /// List keys for the admin API — names, roles, scopes; never secrets.
+/// Runs on read-only connections: probe rather than ensure (a fresh
+/// database simply has no keys yet).
 pub fn list(conn: &Connection) -> rusqlite::Result<Vec<serde_json::Value>> {
-    ensure_tables(conn)?;
+    let has: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='_silodb_server_keys'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if has.is_none() {
+        return Ok(Vec::new());
+    }
     let mut out = Vec::new();
     let mut stmt = conn.prepare(
         "SELECT k.id, k.name, k.role, k.created_at, k.revoked

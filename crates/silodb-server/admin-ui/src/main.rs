@@ -11,8 +11,19 @@ mod views;
 use components::button::{Button, ButtonSize, ButtonVariant};
 use components::input::Input;
 use components::label::Label;
-use components::tabs::{TabContent, TabList, TabTrigger, Tabs};
+use components::sidebar::{
+    Sidebar, SidebarContent, SidebarFooter, SidebarGroup, SidebarGroupContent, SidebarGroupLabel,
+    SidebarHeader, SidebarInset, SidebarMenu, SidebarMenuButton, SidebarMenuItem, SidebarProvider,
+};
 use dioxus::prelude::*;
+
+#[derive(Clone, PartialEq)]
+enum View {
+    Tables,
+    Keys,
+    Sql,
+    Table(String),
+}
 
 const MAIN_CSS: Asset = asset!("/assets/main.css");
 const THEME_CSS: Asset = asset!("/assets/dx-components-theme.css");
@@ -70,7 +81,7 @@ fn Login(on_login: EventHandler<()>) -> Element {
             div { class: "panel login-card",
                 div { class: "login-head",
                     h1 { "silodb" }
-                    p { class: "muted", "time-series on SQLite — admin panel" }
+                    p { class: "muted", "admin panel" }
                 }
                 div { class: "field",
                     Label { html_for: "", "API token" }
@@ -99,39 +110,83 @@ fn Login(on_login: EventHandler<()>) -> Element {
 
 #[component]
 fn Shell(on_logout: EventHandler<()>) -> Element {
+    let mut view = use_signal(|| View::Tables);
     let tables = use_resource(|| async { api::tables().await });
     let keys = use_resource(|| async { api::keys().await });
 
     rsx! {
-        div { class: "shell",
-            header { class: "topbar",
-                div { class: "brand",
-                    span { class: "brand-mark", "◱" }
-                    span { "silodb " span { class: "muted", "admin" } }
+        SidebarProvider {
+            Sidebar {
+                SidebarHeader {
+                    div { class: "brand",
+                        span { class: "brand-mark", "\u{25F1}" }
+                        span { "silodb " span { class: "muted", "admin" } }
+                    }
                 }
-                div { class: "topbar-spacer" }
-                Button {
-                    variant: ButtonVariant::Ghost,
-                    size: ButtonSize::Sm,
-                    onclick: move |_| on_logout.call(()),
-                    "Sign out"
+                SidebarContent {
+                    SidebarGroup {
+                        SidebarGroupLabel { "Tables" }
+                        SidebarGroupContent {
+                            SidebarMenu {
+                                SidebarMenuItem {
+                                    div { onclick: move |_| view.set(View::Tables),
+                                        SidebarMenuButton { is_active: view() == View::Tables, "All tables" }
+                                    }
+                                }
+                                if let Some(Ok(list)) = &*tables.read() {
+                                    for t in list.iter().map(|t| t.table.clone()) {
+                                        SidebarMenuItem {
+                                            div {
+                                                onclick: {
+                                                    let t = t.clone();
+                                                    move |_| view.set(View::Table(t.clone()))
+                                                },
+                                                SidebarMenuButton {
+                                                    is_active: view() == View::Table(t.clone()),
+                                                    span { class: "menu-table mono", "{t}" }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    SidebarGroup {
+                        SidebarGroupLabel { "Server" }
+                        SidebarGroupContent {
+                            SidebarMenu {
+                                for (v, label) in [(View::Keys, "API keys"), (View::Sql, "SQL console")] {
+                                    SidebarMenuItem {
+                                        div {
+                                            onclick: {
+                                                let v = v.clone();
+                                                move |_| view.set(v.clone())
+                                            },
+                                            SidebarMenuButton { is_active: view() == v, "{label}" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                SidebarFooter {
+                    Button {
+                        variant: ButtonVariant::Ghost,
+                        size: ButtonSize::Sm,
+                        onclick: move |_| on_logout.call(()),
+                        "Sign out"
+                    }
                 }
             }
-            main { class: "content",
-                Tabs { default_value: "tables".to_string(),
-                    TabList {
-                        TabTrigger { value: "tables".to_string(), index: 0usize, "Tables" }
-                        TabTrigger { value: "keys".to_string(), index: 1usize, "API keys" }
-                        TabTrigger { value: "sql".to_string(), index: 2usize, "SQL" }
-                    }
-                    TabContent { value: "tables".to_string(), index: 0usize,
-                        views::TablesView { tables, keys }
-                    }
-                    TabContent { value: "keys".to_string(), index: 1usize,
-                        views::KeysView { keys, tables }
-                    }
-                    TabContent { value: "sql".to_string(), index: 2usize,
-                        views::SqlView {}
+            SidebarInset {
+                main { class: "content",
+                    match view() {
+                        View::Tables => rsx! { views::TablesView { tables, keys } },
+                        View::Keys => rsx! { views::KeysView { keys, tables } },
+                        View::Sql => rsx! { views::SqlView { tables } },
+                        View::Table(t) => rsx! { views::TableDetail { key: "{t}", table: t.clone(), tables, keys } },
                     }
                 }
             }

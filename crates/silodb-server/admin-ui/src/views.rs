@@ -9,7 +9,6 @@ use crate::components::card::{Card, CardAction, CardContent, CardDescription, Ca
 use crate::components::dialog::{Dialog, DialogDescription, DialogTitle};
 use crate::components::input::Input;
 use crate::components::label::Label;
-use crate::components::textarea::Textarea;
 use dioxus::prelude::*;
 
 type Res<T> = Resource<Result<Vec<T>, ApiError>>;
@@ -63,7 +62,7 @@ pub fn TablesView(tables: Res<TableInfo>, keys: Res<KeyInfo>) -> Element {
                     None => rsx! { div { class: "empty", "loading…" } },
                     Some(Err(e)) => rsx! { div { class: "empty", "error: {e}" } },
                     Some(Ok(list)) if list.is_empty() => rsx! {
-                        div { class: "empty", "No tables yet — create one, or let a ddl key autoschema it via /write." }
+                        div { class: "empty", "No tables yet. Create one, or let a ddl key autoschema it via /write." }
                     },
                     Some(Ok(list)) => rsx! {
                         table { class: "table",
@@ -187,7 +186,7 @@ fn CreateTableDialog(onclose: EventHandler<()>, ondone: EventHandler<()>) -> Ele
             }
             div { class: "field",
                 Label { html_for: "", "Schema" }
-                Input { class: "mono", value: "{schema}", style: "width: 100%",
+                Input { value: "{schema}", style: "width: 100%",
                     oninput: move |e: FormEvent| schema.set(e.value()) }
             }
             div { class: "two-col",
@@ -227,10 +226,10 @@ fn AddColumnDialog(table: String, onclose: EventHandler<()>, ondone: EventHandle
     rsx! {
         Dialog { open: Some(true), on_open_change: move |o: bool| if !o { onclose.call(()) },
             DialogTitle { "Add column" }
-            DialogDescription { "Instant — existing rows (parquet included) read NULL." }
+            DialogDescription { "Instant. Existing rows (parquet included) read NULL." }
             div { class: "field",
                 Label { html_for: "", "Column definition" }
-                Input { class: "mono", placeholder: "humidity REAL", value: "{coldef}",
+                Input { placeholder: "humidity REAL", value: "{coldef}",
                     style: "width: 100%", oninput: move |e: FormEvent| coldef.set(e.value()) }
             }
             ErrorNote { error: error() }
@@ -315,7 +314,7 @@ pub fn KeysView(keys: Res<KeyInfo>, tables: Res<TableInfo>) -> Element {
         Card {
             CardHeader {
                 CardTitle { "API keys" }
-                CardDescription { "scoped credentials — only the SHA-256 hash is stored" }
+                CardDescription { "scoped credentials, only the SHA-256 hash is stored" }
                 CardAction {
                     Button { size: ButtonSize::Sm, onclick: move |_| create_open.set(true), "＋ New key" }
                 }
@@ -436,16 +435,16 @@ fn CreateKeyDialog(
                 Label { html_for: "", "Role" }
                 select { class: "native-select", value: "{role}",
                     onchange: move |e: FormEvent| role.set(e.value()),
-                    option { value: "read", "read — SELECT + Grafana only" }
-                    option { value: "write", "write — insert into existing schema" }
-                    option { value: "ddl", "ddl — may create/evolve its scoped tables" }
+                    option { value: "read", "read: SELECT + Grafana only" }
+                    option { value: "write", "write: insert into existing schema" }
+                    option { value: "ddl", "ddl: may create/evolve its scoped tables" }
                 }
             }
             div { class: "field",
-                Label { html_for: "", "Scope — none selected = every table" }
+                Label { html_for: "", "Scope (none = every table)" }
                 div { class: "scope-box",
                     if table_names.is_empty() {
-                        span { class: "muted small", "No tables yet — this will be an unscoped key." }
+                        span { class: "muted small", "No tables yet, so this will be an unscoped key." }
                     }
                     for t in table_names {
                         button {
@@ -479,8 +478,8 @@ fn SecretDialog(secret: String, onclose: EventHandler<()>) -> Element {
     let s = secret.clone();
     rsx! {
         Dialog { open: Some(true), on_open_change: move |o: bool| if !o { onclose.call(()) },
-            DialogTitle { "Key created — copy the secret now" }
-            DialogDescription { "Only its hash is stored — this secret will never be shown again." }
+            DialogTitle { "Key created: copy the secret now" }
+            DialogDescription { "Only its hash is stored. This secret will never be shown again." }
             div { class: "secret-row",
                 code { class: "mono secret", "{secret}" }
                 Button { variant: ButtonVariant::Outline, size: ButtonSize::Sm,
@@ -506,49 +505,224 @@ fn SecretDialog(secret: String, onclose: EventHandler<()>) -> Element {
 
 // --- sql ------------------------------------------------------------------
 
+const CODEMIRROR_JS: Asset = asset!("/assets/codemirror.js");
+
+/// Build the schema object CodeMirror's SQL mode wants:
+/// `{ table: ["col", ...], ... }` -> table + column completions.
+fn cm_schema(tables: &Res<TableInfo>) -> String {
+    let mut map = serde_json::Map::new();
+    if let Some(Ok(list)) = &*tables.read() {
+        for t in list {
+            map.insert(
+                t.table.clone(),
+                t.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>().into(),
+            );
+        }
+    }
+    serde_json::Value::Object(map).to_string()
+}
+
+/// A CodeMirror-backed SQL console: editor, run bar, results. Editors are
+/// keyed by `id` in `window.__sqlEds` and live outside the VDOM; callers
+/// give each console a distinct id (and `key:` it in rsx when the id can
+/// change in place).
 #[component]
-pub fn SqlView() -> Element {
-    let mut query = use_signal(|| {
-        "SELECT name FROM sqlite_master WHERE type IN ('view','table') ORDER BY 1".to_string()
-    });
+pub fn SqlConsole(id: String, initial: String, tables: Res<TableInfo>) -> Element {
     let mut result = use_signal(|| None::<SqlResult>);
     let mut error = use_signal(|| None::<String>);
     let mut busy = use_signal(|| false);
 
-    let mut run = move || {
-        let q = query();
+    // (Re)mount the editor whenever the schema resolves; the doc text
+    // survives re-init per id.
+    let id_fx = id.clone();
+    let initial_fx = initial.clone();
+    use_effect(move || {
+        let schema = cm_schema(&tables);
+        let id = id_fx.clone();
+        let initial = serde_json::to_string(&initial_fx).unwrap();
+        spawn(async move {
+            let _ = document::eval(&format!(
+                r#"
+                const mod = await import('{CODEMIRROR_JS}');
+                const parent = document.getElementById('sql-editor-{id}');
+                if (!parent) return;
+                window.__sqlEds = window.__sqlEds || {{}};
+                const prev = window.__sqlEds['{id}'];
+                const doc = (prev && prev.dom.isConnected !== false && prev.state)
+                    ? prev.state.doc.toString() : {initial};
+                if (prev) prev.destroy();
+                parent.replaceChildren();
+                const dark = matchMedia('(prefers-color-scheme: dark)').matches;
+                window.__sqlEds['{id}'] = new mod.EditorView({{
+                    doc,
+                    parent,
+                    extensions: [
+                        mod.basicSetup,
+                        mod.sql({{ dialect: mod.SQLite, schema: {schema}, upperCaseKeywords: true }}),
+                        ...(dark ? [mod.oneDark] : []),
+                    ],
+                }});
+                "#
+            ))
+            .await;
+        });
+    });
+
+    let id_run = id.clone();
+    let run = use_callback(move |_: ()| {
+        let id = id_run.clone();
         busy.set(true);
         spawn(async move {
-            match api::sql(&q).await {
-                Ok(r) => { error.set(None); result.set(Some(r)); }
-                Err(e) => { result.set(None); error.set(Some(e.message)); }
+            let text = document::eval(&format!(
+                "const ed = (window.__sqlEds||{{}})['{id}']; return ed ? ed.state.doc.toString() : ''"
+            ))
+            .await
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .unwrap_or_default();
+            if text.trim().is_empty() {
+                busy.set(false);
+                return;
+            }
+            match api::sql(&text).await {
+                Ok(r) => {
+                    error.set(None);
+                    result.set(Some(r));
+                }
+                Err(e) => {
+                    result.set(None);
+                    error.set(Some(e.message));
+                }
             }
             busy.set(false);
         });
-    };
+    });
 
+    rsx! {
+        div {
+            id: "sql-editor-{id}",
+            class: "sql-editor",
+            onkeydown: move |e: KeyboardEvent| {
+                if e.key() == Key::Enter && (e.modifiers().ctrl() || e.modifiers().meta()) {
+                    e.prevent_default();
+                    run(());
+                }
+            },
+        }
+        div { class: "sql-bar",
+            span { class: "muted small", "ctrl/cmd + enter to run \u{b7} one statement per request" }
+            Button { size: ButtonSize::Sm, disabled: busy(), onclick: move |_| run(()), "Run" }
+        }
+        ErrorNote { error: error() }
+        if let Some(r) = result() {
+            ResultTable { r }
+        }
+    }
+}
+
+#[component]
+pub fn SqlView(tables: Res<TableInfo>) -> Element {
     rsx! {
         Card {
             CardHeader {
                 CardTitle { "SQL console" }
-                CardDescription { "runs with this token's role — silodb_ts(), silodb_bucket(), rollup views, all of it" }
+                CardDescription { "runs with this token's role: silodb_ts(), silodb_bucket(), rollup views, all of it" }
             }
             CardContent {
-                Textarea { class: "mono sql-box", rows: 4,
-                    value: "{query}",
-                    oninput: move |e: FormEvent| query.set(e.value()),
-                    onkeydown: move |e: KeyboardEvent| {
-                        if e.key() == Key::Enter && (e.modifiers().ctrl() || e.modifiers().meta()) { run() }
-                    },
+                SqlConsole {
+                    id: "global".to_string(),
+                    initial: "SELECT name FROM sqlite_master WHERE type IN ('view','table') ORDER BY 1".to_string(),
+                    tables,
                 }
-                div { class: "sql-bar",
-                    span { class: "muted small", "⌘⏎ to run · one statement per request" }
-                    Button { size: ButtonSize::Sm, disabled: busy(), onclick: move |_| run(), "▶ Run" }
+            }
+        }
+    }
+}
+
+// --- table detail -----------------------------------------------------------
+
+/// One table: live data browse plus a seeded, schema-aware query console.
+#[component]
+pub fn TableDetail(table: String, tables: Res<TableInfo>, keys: Res<KeyInfo>) -> Element {
+    let info: Option<TableInfo> = match &*tables.read() {
+        Some(Ok(list)) => list.iter().find(|t| t.table == table).cloned(),
+        _ => None,
+    };
+    let mut column_open = use_signal(|| false);
+    let mut retention_open = use_signal(|| false);
+    let mut browse = use_signal(|| None::<Result<SqlResult, String>>);
+
+    // Load a preview whenever the table (or its schema) changes.
+    let t_fx = table.clone();
+    let ts_col = info.as_ref().map(|i| i.ts_column.clone()).unwrap_or_else(|| "ts".into());
+    let n_cols = info.as_ref().map(|i| i.columns.len()).unwrap_or(0);
+    use_effect(use_reactive!(|(t_fx, ts_col, n_cols)| {
+        let _ = n_cols; // re-browse after add-column
+        spawn(async move {
+            let q = format!("SELECT * FROM \"{t_fx}\" ORDER BY \"{ts_col}\" DESC LIMIT 100");
+            browse.set(Some(api::sql(&q).await.map_err(|e| e.message)));
+        });
+    }));
+
+    let Some(info) = info else {
+        return rsx! { div { class: "empty", "loading\u{2026}" } };
+    };
+    let seed = format!(
+        "SELECT * FROM \"{table}\"\nWHERE \"{ts}\" >= 0\nORDER BY \"{ts}\" DESC\nLIMIT 100",
+        ts = info.ts_column
+    );
+
+    rsx! {
+        Card {
+            CardHeader {
+                CardTitle { "{info.table}" }
+                CardDescription {
+                    "latest 100 rows \u{b7} {info.hot_rows} hot + {info.cold_rows} cold rows in {info.active_files} files"
                 }
-                ErrorNote { error: error() }
-                if let Some(r) = result() {
-                    ResultTable { r }
+                CardAction {
+                    div { class: "btn-row",
+                        for tier in &info.tiers {
+                            Badge { variant: BadgeVariant::Secondary, "{tier}" }
+                        }
+                        if let Some(r) = &info.retention {
+                            Badge { variant: BadgeVariant::Secondary, "keep {r}" }
+                        }
+                        Button { variant: ButtonVariant::Outline, size: ButtonSize::Sm,
+                            onclick: move |_| column_open.set(true), "Add column" }
+                        Button { variant: ButtonVariant::Outline, size: ButtonSize::Sm,
+                            onclick: move |_| retention_open.set(true), "Retention" }
+                    }
                 }
+            }
+            CardContent {
+                match &*browse.read() {
+                    None => rsx! { div { class: "empty", "loading\u{2026}" } },
+                    Some(Err(e)) => rsx! { ErrorNote { error: Some(e.clone()) } },
+                    Some(Ok(r)) => rsx! { ResultTable { r: r.clone() } },
+                }
+            }
+        }
+        Card {
+            CardHeader {
+                CardTitle { "Query {info.table}" }
+                CardDescription { "schema-aware autocomplete; the whole database is still in reach" }
+            }
+            CardContent {
+                SqlConsole { key: "{info.table}", id: info.table.clone(), initial: seed, tables }
+            }
+        }
+        if column_open() {
+            AddColumnDialog {
+                table: info.table.clone(),
+                onclose: move |_| column_open.set(false),
+                ondone: move |_| { column_open.set(false); tables.restart(); keys.restart(); },
+            }
+        }
+        if retention_open() {
+            RetentionDialog {
+                t: info.clone(),
+                onclose: move |_| retention_open.set(false),
+                ondone: move |_| { retention_open.set(false); tables.restart(); },
             }
         }
     }
@@ -557,7 +731,7 @@ pub fn SqlView() -> Element {
 #[component]
 fn ResultTable(r: SqlResult) -> Element {
     if let Some(n) = r.rows_affected {
-        return rsx! { p { class: "muted small", "OK — {n} row(s) affected." } };
+        return rsx! { p { class: "muted small", "OK, {n} row(s) affected." } };
     }
     if r.rows.is_empty() {
         return rsx! { div { class: "empty", "No rows." } };
@@ -586,7 +760,7 @@ fn ResultTable(r: SqlResult) -> Element {
             }
             div { class: "result-foot muted small",
                 "{r.rows.len()} row(s)"
-                if r.truncated { " — truncated at the server cap" }
+                if r.truncated { ", truncated at the server cap" }
             }
         }
     }

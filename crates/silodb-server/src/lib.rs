@@ -159,6 +159,11 @@ pub fn app(state: AppState) -> Router {
         .route("/admin", get(admin_ui))
         .route("/admin/", get(admin_ui))
         .route("/admin/{*path}", get(admin_ui))
+        // A human hitting the root in a browser wants the panel, not a 404.
+        .route(
+            "/",
+            get(|| async { axum::response::Redirect::temporary("/admin") }),
+        )
         .with_state(state)
 }
 

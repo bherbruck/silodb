@@ -362,3 +362,22 @@ async fn admin_ui_is_embedded_and_served() {
     assert!(resp.headers()["content-type"].to_str().unwrap().contains("javascript"));
     assert!(resp.headers()["cache-control"].to_str().unwrap().contains("immutable"));
 }
+
+#[tokio::test]
+async fn root_redirects_to_admin() {
+    let ts = server();
+    let req = Request::builder().uri("/").body(Body::empty()).unwrap();
+    let resp = ts.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(resp.headers()["location"], "/admin");
+}
+
+#[tokio::test]
+async fn key_listing_works_on_a_fresh_database() {
+    // No keys ever created: the tables don't exist yet, and the listing
+    // runs on a read-only connection — it must say "none", not 400.
+    let ts = server();
+    let (status, v) = call(&ts, "GET", "/admin/api/keys", "root", "").await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(v["keys"], json!([]));
+}

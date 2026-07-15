@@ -17,18 +17,10 @@ h1 { margin: 0; font-size: 22px; }
 .num { text-align: right; font-variant-numeric: tabular-nums; }
 
 /* shell */
-.shell { max-width: 1100px; margin: 0 auto; padding: 0 20px 48px; }
-.topbar {
-  display: flex; align-items: center; gap: 20px;
-  padding: 14px 0; margin-bottom: 20px;
-  border-bottom: 1px solid var(--primary-color-6, #e5e5e5);
-}
-.topbar-spacer { flex: 1; }
-.brand { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+.brand { display: flex; align-items: center; gap: 8px; font-weight: 600; padding: 6px 8px; }
 .brand-mark { font-size: 18px; }
+.content { max-width: 1000px; margin: 0 auto; padding: 24px 24px 48px; }
 .content > * + * { margin-top: 16px; }
-.content { display: block; }
-.content [role="tablist"] { margin-bottom: 14px; }
 
 /* generic panel (login) */
 .panel {
@@ -107,3 +99,22 @@ h1 { margin: 0; font-size: 22px; }
 .table.result thead th { position: sticky; top: 0; background: var(--primary-color-4, #f8f8f8); }
 .result-foot { padding: 7px 12px; border-top: 1px solid var(--primary-color-6, #e5e5e5);
   background: var(--primary-color-4, #f8f8f8); }
+
+/* codemirror editor */
+.sql-editor .cm-editor {
+  border: 1px solid var(--primary-color-6, #e5e5e5);
+  border-radius: 8px;
+  font-size: 13px;
+  min-height: 120px;
+}
+.sql-editor .cm-editor.cm-focused {
+  outline: 2px solid var(--focused-border-color, #2b7fff);
+  outline-offset: 1px;
+}
+.sql-editor .cm-scroller {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  border-radius: 8px;
+}
+.sql-editor .cm-gutters { border-radius: 8px 0 0 8px; }
+
+.menu-table { font-size: 12.5px; }
