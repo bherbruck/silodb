@@ -20,4 +20,8 @@ VOLUME /data
 ENV SILODB_DB=/data/silodb.db \
     SILODB_ADDR=0.0.0.0:8080
 EXPOSE 8080
+# The image ships one binary and no shell utilities, so the probe is the
+# server asking itself: `--healthcheck` GETs /health and exits 0/1.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD ["silodb-server", "--healthcheck"]
 CMD ["silodb-server"]
