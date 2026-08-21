@@ -1,5 +1,9 @@
 services:
   silodb:
+    # Builds from this checkout. To run the published multi-arch image
+    # instead (no Rust toolchain, no compile), swap the `build:` line for:
+    #   image: ghcr.io/bherbruck/silodb:latest
+    #
     # Compose reuses an existing image — after pulling new commits, run
     # `docker compose up --build` or you'll serve the old binary.
     build: .

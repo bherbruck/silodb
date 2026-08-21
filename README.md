@@ -91,6 +91,14 @@ curl -s localhost:8080/sql -H "Authorization: Bearer $RO" \
   -d '{"sql": "SELECT city, avg(temp) FROM weather GROUP BY 1"}'
 ```
 
+Prebuilt multi-arch images (`linux/amd64`, `linux/arm64` — a Pi 4/5 or an
+x86 box, same tag) are published to GHCR on every tagged release, so there
+is nothing to clone or compile:
+
+```sh
+docker run -p 8080:8080 -v silodb-data:/data ghcr.io/bherbruck/silodb:latest
+```
+
 An admin panel ships in the binary at `http://localhost:8080/admin`
 (tables, scoped API keys, SQL console — a pure-Rust Dioxus WASM app),
 and `docker compose --profile grafana up` adds Grafana on :3000 with
