@@ -58,7 +58,8 @@ unscoped). A scoped key touches **only its tables**, on every surface:
   all** (schema changes go through the admin API, where scope is checked
   against the named table). Joins, views, `count(*)` shortcuts — the
   database refuses, not a query parser.
-- `/query` (Grafana): `SHOW` output filtered to scope; `SELECT` on a
+- `/query` (Grafana): SQL and InfluxQL alike run behind the same
+  authorizer as `/sql`; `SHOW` output filtered to scope; `SELECT` on a
   foreign measurement errors. Point a Grafana datasource at a `read`
   key scoped to exactly the dashboards' tables.
 - Key management itself needs an **unscoped** ddl credential — a scoped
@@ -186,6 +187,38 @@ tag/field autocomplete, template variables, the lot:
   none|0)`, `ORDER BY time DESC`, `LIMIT`, multi-statement `;`.
 - Anything outside that subset returns a clear inline error naming what
   is supported (influx-style: HTTP 200, error in the result element).
+
+### The query box takes plain SQLite
+
+The InfluxQL subset is a convenience, not a ceiling. `/query` reads
+whatever it is given as SQL first, and only falls through to InfluxQL for
+text SQLite cannot prepare. So Grafana's raw query box is a SQLite
+console:
+
+```sql
+SELECT ts, camera, sum(v) FROM counts
+WHERE ts >= silodb_ts('2026-08-01') GROUP BY 1, 2 ORDER BY 1
+```
+
+Joins, CTEs, window functions, `silodb_bucket`, rollup views — anything
+`POST /sql` accepts.
+
+- A first column named `time`/`ts`/`__time` becomes the series time axis
+  in whatever `epoch=` the caller asked for, so time-series panels render
+  it. Any other leading column is passed through untouched — set the
+  panel to **Format as: Table**.
+- One series per query, no tag splitting. For a per-series legend, use
+  the builder (which stays on the InfluxQL path) or emit one query per
+  series.
+- The builder loses nothing to this rule: every query it emits carries
+  `time(...)`, `fill(...)`, a `SHOW` verb, or a `time >= 1234ms` literal,
+  and each of those is a SQLite syntax error. Only hand-typed text is
+  ever ambiguous, and there "this is a SQL database" is the right read.
+- Same fence as `POST /sql` — read-only connection, credential tables
+  invisible, scoped keys held to their table list, denial reported as an
+  error rather than an empty result.
+- Same truncation rule too: over `SILODB_MAX_ROWS` is an error, because
+  Grafana cannot send a limit and a truncated chart is a wrong chart.
 
 `docker compose --profile grafana up` starts Grafana on :3000 with the
 datasource already provisioned (see `grafana/provisioning/`).

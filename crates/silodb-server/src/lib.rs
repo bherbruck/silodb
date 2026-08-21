@@ -251,6 +251,7 @@ async fn influx_query(
         .await
         .ok_or_else(unauthorized)?;
     let scope = auth.scope;
+    let role = auth.role;
     let q = params
         .get("q")
         .cloned()
@@ -266,11 +267,15 @@ async fn influx_query(
         .run(move |conn| {
             let mut results = Vec::new();
             for (i, stmt_text) in influxql::split_statements(&q).into_iter().enumerate() {
-                let outcome = influxql::parse(&stmt_text, now)
-                    .map_err(|e| e.to_string())
-                    .and_then(|stmt| {
-                        influx::execute(conn, &stmt, epoch, max_rows, scope.as_deref())
-                    });
+                let outcome = run_query_statement(
+                    conn,
+                    &stmt_text,
+                    now,
+                    epoch,
+                    max_rows,
+                    scope.as_deref(),
+                    role,
+                );
                 results.push(match outcome {
                     Ok(series) if series.as_array().is_some_and(|s| s.is_empty()) => {
                         json!({ "statement_id": i })
@@ -282,6 +287,52 @@ async fn influx_query(
             Ok(Json(json!({ "results": results })))
         })
         .await
+}
+
+/// One `/query` statement, in whichever dialect it turns out to be.
+///
+/// **SQLite first.** silodb is a SQL store; the InfluxQL surface is a
+/// compatibility shim so stock Grafana's query builder works. Anything
+/// SQLite can prepare therefore runs as SQL, and the rest falls through
+/// to InfluxQL.
+///
+/// This costs the builder nothing, because the builder never emits a
+/// query that is legal SQLite: every one of them carries `time(...)`,
+/// `fill(...)`, a `SHOW` verb, or a `time >= 1234ms` duration literal,
+/// and each is a SQLite syntax error. What is left ambiguous is only
+/// hand-typed text, where "this is a SQL database" is the right reading.
+///
+/// The order is load-bearing in the other direction too: `SELECT * FROM
+/// t` is legal InfluxQL, and answers with one row or none depending on
+/// whether the table is a registered measurement. Letting InfluxQL take
+/// it would quietly mangle the simplest query anyone types into the box.
+fn run_query_statement(
+    conn: &Connection,
+    text: &str,
+    now: i64,
+    epoch: influx::Epoch,
+    max_rows: usize,
+    scope: Option<&[String]>,
+    role: Role,
+) -> Result<serde_json::Value, String> {
+    // Probe unguarded: this only asks "is this SQLite?". The real run
+    // below re-prepares under the authorizer, which is what enforces.
+    if conn.prepare(text).is_ok() {
+        // Same fence as POST /sql. The connection is already read-only,
+        // so this is here to hide the credential tables and to honour a
+        // scoped key's table list.
+        match scope {
+            Some(s) => conn.authorizer(Some(scoped_authorizer(role, s.to_vec()))),
+            None => conn.authorizer(Some(readonly_authorizer)),
+        }
+        .map_err(|e| e.to_string())?;
+        let as_sql = influx::sql_as_series(conn, text, epoch, max_rows);
+        let _ = conn.authorizer(None::<fn(AuthContext) -> Authorization>);
+        return as_sql;
+    }
+    influxql::parse(text, now)
+        .map_err(|e| e.to_string())
+        .and_then(|stmt| influx::execute(conn, &stmt, epoch, max_rows, scope))
 }
 
 /// Background maintenance: every `secs`, run `maintain(now)` on every

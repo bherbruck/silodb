@@ -104,7 +104,9 @@ An admin panel ships in the binary at `http://localhost:8080/admin`
 and `docker compose --profile grafana up` adds Grafana on :3000 with
 silodb pre-wired as an InfluxDB datasource — the server emulates the
 InfluxDB 1.x query API, so stock Grafana's query builder and
-autocomplete just work.
+autocomplete just work. The raw query box takes plain SQLite too (joins,
+CTEs, rollup views), so the InfluxQL subset is a convenience rather than
+a ceiling.
 
 ## How the tiers work
 

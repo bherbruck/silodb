@@ -5,7 +5,7 @@
 //! per GROUP BY tag combination).
 
 use crate::influxql::{Agg, Cond, Fill, ScalarValue, Select, Statement};
-use rusqlite::types::Value;
+use rusqlite::types::{Value, ValueRef};
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::{json, Value as Json};
 use std::collections::BTreeMap;
@@ -132,6 +132,60 @@ fn measurements(conn: &Connection) -> Result<Vec<String>, String> {
     conn.prepare("SELECT logical_table FROM _silodb_policy ORDER BY 1")
         .and_then(|mut s| s.query_map([], |r| r.get(0))?.collect())
         .map_err(|e| e.to_string())
+}
+
+/// Run a plain SQL statement and shape the rows into the InfluxDB
+/// response envelope, so Grafana's query box is a SQLite console.
+///
+/// A first column named `time`/`ts`/`__time` becomes the series time axis
+/// in whatever epoch the caller asked for; every other column passes
+/// through untouched. One series, no tag splitting — for a per-series
+/// legend either use Grafana's "Format as: Table" or emit one query per
+/// series. Over the row cap this errors rather than drawing a partial
+/// chart, for the same reason `POST /sql` does.
+pub fn sql_as_series(
+    conn: &Connection,
+    sql: &str,
+    epoch: Epoch,
+    max_rows: usize,
+) -> Result<Json, String> {
+    let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+    if stmt.column_count() == 0 {
+        // A statement with no result set (write/DDL) — the read-only
+        // connection will already have refused anything harmful.
+        stmt.execute([]).map_err(|e| e.to_string())?;
+        return Ok(json!([]));
+    }
+    let mut columns: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+    let time_axis = matches!(
+        columns[0].to_ascii_lowercase().as_str(),
+        "time" | "ts" | "__time"
+    );
+    if time_axis {
+        // Grafana keys the time series off a column literally named "time".
+        columns[0] = "time".to_owned();
+    }
+    let mut values: Vec<Json> = Vec::new();
+    let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
+    while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+        if values.len() >= max_rows {
+            return Err(format!(
+                "result exceeds {max_rows} rows. A truncated chart is a wrong \
+                 chart, so this is an error rather than a partial draw: narrow \
+                 the time range, aggregate, or raise SILODB_MAX_ROWS."
+            ));
+        }
+        let mut vals: Vec<Json> = Vec::with_capacity(columns.len());
+        for i in 0..columns.len() {
+            let v = row.get_ref(i).map_err(|e| e.to_string())?;
+            vals.push(match v {
+                ValueRef::Integer(us) if i == 0 && time_axis => epoch.time_json(us),
+                other => crate::sql_to_json(other),
+            });
+        }
+        values.push(Json::Array(vals));
+    }
+    Ok(json!([{ "name": "result", "columns": columns, "values": values }]))
 }
 
 /// Execute one statement; returns the influx `series` array. `scope`
