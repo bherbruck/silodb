@@ -20,6 +20,10 @@ struct TestServer {
 }
 
 fn server() -> TestServer {
+    server_with_cap(10_000)
+}
+
+fn server_with_cap(max_rows: usize) -> TestServer {
     let dir = tempfile::tempdir().unwrap();
     let config = Config {
         db_path: dir.path().join("hot.db"),
@@ -33,7 +37,7 @@ fn server() -> TestServer {
         cold_dir: None,
         maintain_secs: 0,
         readers: 2,
-        max_rows: 10_000,
+        max_rows,
     };
     let state = boot(&config).unwrap();
     TestServer {
@@ -78,6 +82,27 @@ async fn call(
 async fn sql(ts: &TestServer, token: &str, sql: &str, params: Value) -> (StatusCode, Value) {
     let body = json!({ "sql": sql, "params": params }).to_string();
     call(ts, "POST", "/sql", Some(token), &body, "application/json").await
+}
+
+async fn sql_limited(
+    ts: &TestServer,
+    token: &str,
+    sql: &str,
+    limit: Option<usize>,
+) -> (StatusCode, Value) {
+    let mut body = json!({ "sql": sql, "params": [] });
+    if let Some(l) = limit {
+        body["limit"] = json!(l);
+    }
+    call(
+        ts,
+        "POST",
+        "/sql",
+        Some(token),
+        &body.to_string(),
+        "application/json",
+    )
+    .await
 }
 
 async fn write(ts: &TestServer, token: &str, uri: &str, body: &str) -> (StatusCode, Value) {
@@ -273,4 +298,58 @@ async fn sql_shape_and_errors() {
     let (status, v) = write(&ts, "d-token", "/write", "m v=1.0\nbroken-line").await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
     assert!(v["error"].as_str().unwrap().contains("line 2"), "{v}");
+}
+
+/// A `GROUP BY` cut off at the row cap is wrong data, not partial data,
+/// so exceeding the cap is an error unless the caller opted in to a
+/// truncated preview by naming a `limit`.
+#[tokio::test]
+async fn truncation_is_an_error_unless_the_client_asks_for_it() {
+    let ts = server_with_cap(3);
+    let (status, v) = sql(
+        &ts,
+        "d-token",
+        "CREATE TABLE t (ts TIMESTAMP, v REAL)",
+        json!([]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    for i in 0..5 {
+        let (status, v) = sql(
+            &ts,
+            "w-token",
+            "INSERT INTO t VALUES (?1, ?2)",
+            json!([i * HOUR, i as f64]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+    }
+
+    // Over the cap with no limit: refused, and the message says what to do.
+    let (status, v) = sql_limited(&ts, "r-token", "SELECT * FROM t", None).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{v}");
+    let msg = v["error"].as_str().unwrap_or_default().to_owned() + &v.to_string();
+    assert!(msg.contains("limit"), "unhelpful message: {v}");
+
+    // Same query, truncation opted in: a page plus an honest flag.
+    let (status, v) = sql_limited(&ts, "r-token", "SELECT * FROM t", Some(3)).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(v["rows"].as_array().unwrap().len(), 3);
+    assert_eq!(v["truncated"], true);
+
+    // Under the cap: complete answer, no flag, no error.
+    let (status, v) = sql_limited(&ts, "r-token", "SELECT * FROM t WHERE v < 2", None).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(v["rows"].as_array().unwrap().len(), 2);
+    assert_eq!(v["truncated"], false);
+
+    // An aggregate that fits is unaffected — the case rollups exist for.
+    let (status, v) = sql_limited(&ts, "r-token", "SELECT count(*) FROM t", None).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(v["rows"][0][0], 5);
+
+    // Asking for more than the server will ever return is refused up front
+    // rather than quietly served short.
+    let (status, v) = sql_limited(&ts, "r-token", "SELECT * FROM t", Some(99)).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{v}");
 }

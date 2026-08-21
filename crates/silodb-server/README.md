@@ -22,7 +22,7 @@ cargo run --release -p silodb-server
 | `SILODB_COLD_DIR` | *(derived)* | override the parquet base directory |
 | `SILODB_MAINTAIN_SECS` | `60` | background `maintain()` interval; `0` disables |
 | `SILODB_READERS` | `4` | read-only connection pool size |
-| `SILODB_MAX_ROWS` | `10000` | `/sql` result cap (`"truncated": true` past it) |
+| `SILODB_MAX_ROWS` | `10000` | `/sql` result cap — past it, `413` unless the request names a `limit` |
 
 Env tokens are the unscoped **root credentials**; day-to-day clients
 should hold provisioned keys instead (below). All optional: **with no
@@ -106,6 +106,25 @@ curl -s localhost:8080/sql \
        "params": ["2026-07-01"]}'
 # {"columns":["device","avg(value)"],"rows":[["boiler",21.4]],"truncated":false}
 ```
+
+**Truncation is opt-in.** A result larger than `SILODB_MAX_ROWS` is a
+`413`, not a short answer, because a `GROUP BY` cut off at the cap is not
+partial data — the missing buckets render as gaps or zeros and the chart
+looks plausible. One ordinary "last month, per camera, per 10 minutes"
+panel is 107k rows against a 10k cap, so this is the common case, not the
+edge case.
+
+Pass `limit` when you genuinely want a preview and will treat it as one
+(the admin console does exactly this):
+
+```
+curl -s localhost:8080/sql -H "Authorization: Bearer $TOKEN" \
+  -d '{"sql": "SELECT * FROM readings", "limit": 500}'
+# {"columns":[...],"rows":[...500 rows...],"truncated":true}
+```
+
+A `limit` above the server's cap is refused up front rather than quietly
+served short.
 
 Everything the engine exposes works here: `silodb_ts`/`silodb_datetime`/
 `silodb_bucket`, rollup views, joins against plain tables — and with the

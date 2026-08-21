@@ -188,11 +188,17 @@ pub async fn revoke_key(name: &str) -> Result<(), ApiError> {
         .map(|_| ())
 }
 
+/// The console is a preview surface, so it opts in to truncation. Without
+/// an explicit limit the server refuses to truncate (a cut-off aggregate
+/// is wrong data, not partial data) and a broad SELECT would 413 here
+/// instead of showing the first page.
+const CONSOLE_PREVIEW_ROWS: usize = 10_000;
+
 pub async fn sql(query: &str) -> Result<SqlResult, ApiError> {
     call(
         Method::POST,
         "/sql",
-        Some(serde_json::json!({ "sql": query })),
+        Some(serde_json::json!({ "sql": query, "limit": CONSOLE_PREVIEW_ROWS })),
     )
     .await
 }

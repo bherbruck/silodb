@@ -421,6 +421,10 @@ struct SqlRequest {
     sql: String,
     #[serde(default)]
     params: Vec<serde_json::Value>,
+    /// Opt in to truncation, at this many rows. Without it, a result that
+    /// would be truncated is an error instead: see [`run_sql`].
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 async fn sql_handler(
@@ -475,11 +479,29 @@ async fn sql_handler(
         .map(Json)
 }
 
+/// Run one statement, materializing at most `max_rows` rows.
+///
+/// Truncation is opt-in. A `GROUP BY` cut off at the cap is not partial
+/// data, it is *wrong* data: the missing buckets render as gaps or zeros
+/// and the chart looks plausible. So a result that would be truncated is
+/// an error unless the request named a `limit`, which is the client
+/// saying it wants a preview and will treat it as one.
 fn run_sql(
     conn: &Connection,
     req: &SqlRequest,
     max_rows: usize,
 ) -> Result<serde_json::Value, ApiError> {
+    if let Some(l) = req.limit {
+        if l > max_rows {
+            return Err(ApiError(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!(
+                    "limit {l} exceeds this server's SILODB_MAX_ROWS ({max_rows})"
+                ),
+            ));
+        }
+    }
+    let cap = req.limit.unwrap_or(max_rows);
     let params: Vec<Value> = req.params.iter().map(json_to_sql).collect::<Result<_, _>>()?;
     let mut stmt = conn.prepare(&req.sql).map_err(sql_err)?;
     if stmt.column_count() == 0 {
@@ -495,7 +517,18 @@ fn run_sql(
         .query(rusqlite::params_from_iter(params))
         .map_err(sql_err)?;
     while let Some(row) = rows.next().map_err(sql_err)? {
-        if rows_out.len() >= max_rows {
+        if rows_out.len() >= cap {
+            if req.limit.is_none() {
+                return Err(ApiError(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    format!(
+                        "result exceeds {max_rows} rows. Truncating an aggregate \
+                         silently returns wrong numbers, so this is an error rather \
+                         than a flag: narrow the query, or pass \"limit\" to accept \
+                         a truncated preview, or raise SILODB_MAX_ROWS."
+                    ),
+                ));
+            }
             truncated = true;
             break;
         }
