@@ -439,3 +439,105 @@ async fn sql_on_query_refuses_to_truncate() {
     let err = v["results"][0]["error"].as_str().unwrap_or("");
     assert!(err.contains("exceeds 5 rows"), "{v}");
 }
+
+// --- autoschema records what line protocol already knows ----------------
+//
+// Tags are series identity and fields are measures - that is the whole
+// meaning of the two halves of a line. Autoschema used to flatten them into
+// one column list and drop the distinction, leaving per-file statistics to
+// re-derive series identity from SQL type: Float64 aggregates, everything
+// else groups. An INTEGER field that happens to be unique per row then became
+// a group key, and the stats table grew past the data it described - 830 MB
+// against 67 MB of parquet, on the deployment that found this.
+
+/// POST /sql with the ddl token, for statements that write.
+async fn post_sql(ts: &TestServer, sql: &str) -> Value {
+    let req = Request::builder()
+        .method("POST")
+        .uri("/sql")
+        .header("authorization", "Bearer d-token")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::json!({ "sql": sql }).to_string()))
+        .unwrap();
+    let (status, v) = raw(ts, req).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    v
+}
+
+/// Write `rows` of eggseer-shaped counts: four low-cardinality tags, and a
+/// per-row integer id as a *field*, which is exactly the shape that broke.
+async fn write_counts(ts: &TestServer, rows: usize) {
+    let mut body = String::new();
+    for i in 0..rows {
+        let cam = i % 24;
+        body.push_str(&format!(
+            "counts,farm=blue_springs,house=bs99,device_id=DEV{cam:02},name=BS99/C{cam:02} \
+             direction=1i,tracklet_id={i}i,quality=0.97,displacement=0.85 {}\n",
+            i as i64 * 1_000
+        ));
+    }
+    let req = Request::builder()
+        .method("POST")
+        .uri("/write?precision=us")
+        .header("authorization", "Bearer d-token")
+        .body(Body::from(body))
+        .unwrap();
+    let (status, v) = raw(ts, req).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+}
+
+#[tokio::test]
+async fn autoschema_records_tags_as_the_series() {
+    let ts = server();
+    write_counts(&ts, 100).await;
+
+    let v = query_as(
+        &ts,
+        "SELECT series_columns FROM _silodb_policy WHERE logical_table = 'counts'",
+        "r-token",
+    )
+    .await;
+    let got = v.to_string();
+    for tag in ["farm", "house", "device_id", "name"] {
+        assert!(got.contains(tag), "tag '{tag}' missing from series: {got}");
+    }
+    // Fields are measures and must not be in there - tracklet_id above all,
+    // since it is the one that is unique per row.
+    for field in ["tracklet_id", "direction", "quality", "displacement"] {
+        assert!(
+            !got.contains(field),
+            "field '{field}' recorded as series: {got}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn stats_group_by_tags_not_by_an_id_field() {
+    let ts = server();
+    // Two days of rows so the first bucket closes and compacts.
+    write_counts(&ts, 5_000).await;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/write?precision=us")
+        .header("authorization", "Bearer d-token")
+        .body(Body::from(format!(
+            "counts,farm=blue_springs,house=bs99,device_id=DEV00,name=BS99/C00 \
+             direction=1i,tracklet_id=999999i,quality=1.0,displacement=1.0 {}\n",
+            3 * 24 * HOUR_US
+        )))
+        .unwrap();
+    let (status, _) = raw(&ts, req).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Maintenance writes, so it goes through /sql - /query is read-only.
+    let v = post_sql(&ts, "SELECT silodb_maintain('counts', 345600000000)").await;
+    assert!(!v.to_string().contains("error"), "{v}");
+
+    // 24 cameras in one house: at most one stats row each, not one per row.
+    let v = post_sql(&ts, "SELECT count(*) AS n FROM counts_stats").await;
+    let n = v["rows"][0][0].as_i64().unwrap_or(-1);
+    assert!(
+        (0..=24).contains(&n),
+        "expected at most one stats row per camera, got {n}: {v}"
+    );
+}

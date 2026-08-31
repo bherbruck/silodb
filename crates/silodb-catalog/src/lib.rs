@@ -268,6 +268,14 @@ pub struct TablePolicy {
     /// Explicit bucket-axis column, when inference (one TIMESTAMP column,
     /// else INTEGER `ts`) isn't enough. Frozen at create time.
     pub ts_column: Option<String>,
+    /// Columns that identify a series, comma-separated, when the writer knew.
+    /// Line protocol does: its tags are series identity by definition and its
+    /// fields are measures. Recording that is what stops per-file statistics
+    /// grouping on an id column and growing past the data they describe.
+    ///
+    /// None means nobody said, and the type heuristic decides - which is what
+    /// every table created before this column does.
+    pub series_columns: Option<String>,
 }
 
 /// Create the policy table if needed, migrating older layouts. Idempotent.
@@ -280,7 +288,8 @@ pub fn ensure_policy_table(conn: &Connection) -> Result<()> {
             retain_us         INTEGER,        -- NULL = keep forever
             origin_us         INTEGER NOT NULL DEFAULT 0,
             base_dir          TEXT NOT NULL DEFAULT '',
-            ts_column         TEXT
+            ts_column         TEXT,
+            series_columns    TEXT
         );",
     )?;
     // Migrations for policy tables created before these columns existed.
@@ -289,6 +298,7 @@ pub fn ensure_policy_table(conn: &Connection) -> Result<()> {
         "ALTER TABLE _silodb_policy ADD COLUMN origin_us INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE _silodb_policy ADD COLUMN base_dir TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE _silodb_policy ADD COLUMN ts_column TEXT",
+        "ALTER TABLE _silodb_policy ADD COLUMN series_columns TEXT",
     ] {
         match conn.execute_batch(ddl) {
             Ok(()) => {}
@@ -309,7 +319,7 @@ pub fn set_policy(conn: &Connection, policy: &TablePolicy) -> Result<()> {
         .collect::<Vec<_>>()
         .join(",");
     conn.execute(
-        "INSERT OR REPLACE INTO _silodb_policy VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT OR REPLACE INTO _silodb_policy VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             policy.logical_table,
             tiers,
@@ -317,7 +327,8 @@ pub fn set_policy(conn: &Connection, policy: &TablePolicy) -> Result<()> {
             policy.retain_us,
             policy.origin_us,
             policy.base_dir,
-            policy.ts_column
+            policy.ts_column,
+            policy.series_columns
         ],
     )?;
     Ok(())
@@ -338,7 +349,7 @@ pub fn get_policy(conn: &Connection, logical_table: &str) -> Result<Option<Table
     ensure_policy_table(conn)?; // migrate before reading retain_us
     conn.query_row(
         "SELECT logical_table, tiers_us, safety_margin_us, retain_us, origin_us,
-                base_dir, ts_column
+                base_dir, ts_column, series_columns
          FROM _silodb_policy WHERE logical_table = ?1",
         [logical_table],
         |r| {
@@ -354,6 +365,7 @@ pub fn get_policy(conn: &Connection, logical_table: &str) -> Result<Option<Table
                 origin_us: r.get(4)?,
                 base_dir: r.get(5)?,
                 ts_column: r.get(6)?,
+                series_columns: r.get(7)?,
             })
         },
     )
@@ -553,6 +565,7 @@ pub fn parse_policy_string(
         origin_us: origin,
         base_dir: String::new(), // caller fills after dir resolution
         ts_column: None,         // caller fills from its ts argument
+        series_columns: None,    // set when the writer knew, e.g. line protocol tags
     })
 }
 

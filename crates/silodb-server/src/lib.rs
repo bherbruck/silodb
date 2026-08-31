@@ -861,8 +861,19 @@ fn ensure_schema(
         for (k, _, fv) in &line.fields {
             cols.push(format!("{k} {}", lineproto::field_decl(fv)));
         }
-        silodb::init_table_tiered(conn, table, &cols.join(", "), default_tiers)
-            .map_err(|e| bad_request(format!("autoschema create '{table}': {e}")))?;
+        // Tags are the series, fields are the measures - that is what the two
+        // halves of line protocol mean, and recording it is what keeps the
+        // per-file statistics from grouping on a field that happens to be an
+        // integer id and growing past the data they describe.
+        let series: Vec<&str> = line.tags.iter().map(|(k, _)| k.as_str()).collect();
+        silodb::init_table_tiered_with_series(
+            conn,
+            table,
+            &cols.join(", "),
+            default_tiers,
+            &series,
+        )
+        .map_err(|e| bad_request(format!("autoschema create '{table}': {e}")))?;
         return Ok("ts".into());
     }
     ensure_columns(conn, line, allow_ddl)?;

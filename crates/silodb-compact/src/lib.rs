@@ -378,7 +378,7 @@ pub fn compact_bucket(
     // series statistics are always-on.
     let plans = rollup_plans(conn, spec.logical_table, &columns, ts_idx)?;
     let mut accs: Vec<RollupAcc<'_>> = plans.iter().map(RollupAcc::new).collect();
-    let stats_plan = FileStatsPlan::new(spec.logical_table, &columns, ts_idx);
+    let stats_plan = FileStatsPlan::for_table(conn, spec.logical_table, &columns, ts_idx);
     let mut stats_acc = FileStatsAcc::new(&stats_plan);
     let mut row_vals: Vec<Value> = Vec::with_capacity(columns.len());
 
@@ -606,7 +606,7 @@ pub fn merge_window(
     // Stats plan from the widest schema — the merged file's schema.
     let stats_plan = {
         let (decls, ts) = decls_from_arrow(&widest);
-        FileStatsPlan::new(logical_table, &decls, ts)
+        FileStatsPlan::for_table(conn, logical_table, &decls, ts)
     };
     let mut stats_acc = FileStatsAcc::new(&stats_plan);
 
@@ -1108,10 +1108,46 @@ fn decls_from_arrow(
 }
 
 impl FileStatsPlan {
+    /// Build the plan, reading the table's declared series columns when it has
+    /// them.
+    ///
+    /// A writer that knows which columns identify a series should say so, and
+    /// line protocol always knows: its tags are series identity by definition,
+    /// its fields are measures. Without that the classification falls back to
+    /// type - Float64 aggregates, everything else groups - which puts an
+    /// INTEGER id column in the series key and makes one group per row.
+    pub fn for_table(
+        conn: &Connection,
+        logical_table: &str,
+        columns: &[silodb_schema::ColumnDecl],
+        ts_idx: usize,
+    ) -> Self {
+        let declared = silodb_catalog::get_policy(conn, logical_table)
+            .ok()
+            .flatten()
+            .and_then(|p| p.series_columns);
+        match declared {
+            Some(list) => {
+                let names: Vec<&str> = list.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+                Self::with_series(logical_table, columns, ts_idx, Some(&names))
+            }
+            None => Self::new(logical_table, columns, ts_idx),
+        }
+    }
+
     pub fn new(
         logical_table: &str,
         columns: &[silodb_schema::ColumnDecl],
         ts_idx: usize,
+    ) -> Self {
+        Self::with_series(logical_table, columns, ts_idx, None)
+    }
+
+    fn with_series(
+        logical_table: &str,
+        columns: &[silodb_schema::ColumnDecl],
+        ts_idx: usize,
+        series: Option<&[&str]>,
     ) -> Self {
         let stats_table = stats_table_name(logical_table);
         let mut group_idxs = Vec::new();
@@ -1120,11 +1156,19 @@ impl FileStatsPlan {
         for (i, c) in columns.iter().enumerate() {
             if i == ts_idx {
                 continue;
-            } else if c.ty == SqliteType::Real {
-                agg_idxs.push(i);
-            } else {
+            }
+            // Declared series identity wins over the type guess. A measure is
+            // then anything not named, whatever its type - which is the point:
+            // an INTEGER count is a measure, and only the writer knows.
+            let is_series = match series {
+                Some(names) => names.contains(&c.name.as_str()),
+                None => c.ty != SqliteType::Real,
+            };
+            if is_series {
                 group_idxs.push(i);
                 cols.push(format!("{} {}", quote_ident(&c.name), c.ty.decl()));
+            } else {
+                agg_idxs.push(i);
             }
         }
         for &i in &agg_idxs {
@@ -1412,7 +1456,7 @@ pub fn stats_backfill_missing(
     let columns = hot_columns(conn, hot_table)?;
     let ts_idx = silodb_schema::resolve_ts_index(&columns, None)
         .map_err(|reason| CompactError::BadTimestampColumn { reason })?;
-    let plan = FileStatsPlan::new(logical_table, &columns, ts_idx);
+    let plan = FileStatsPlan::for_table(conn, logical_table, &columns, ts_idx);
     conn.execute_batch(&plan.ddl)?;
 
     let mut done = 0;

@@ -262,7 +262,7 @@ pub fn init_table(
     table: &str,
     schema: &str,
 ) -> Result<(), InitError> {
-    init_impl(conn, table, schema, "1d", None, None)
+    init_impl(conn, table, schema, "1d", None, None, None)
 }
 
 /// [`init_table`] with an explicit base directory (otherwise resolved:
@@ -279,6 +279,7 @@ pub fn init_table_at(
         schema,
         "1d",
         Some(&base_dir.as_ref().display().to_string()),
+        None,
         None,
     )
 }
@@ -303,7 +304,40 @@ pub fn init_table_tiered(
     schema: &str,
     tiers: &str,
 ) -> Result<(), InitError> {
-    init_impl(conn, table, schema, tiers, None, None)
+    init_impl(conn, table, schema, tiers, None, None, None)
+}
+
+/// [`init_table_tiered`], naming the columns that identify a series.
+///
+/// Everything not named is a measure, whatever its SQL type. Without this the
+/// classification falls back to type - Float64 aggregates, everything else
+/// groups - which puts an INTEGER id column in the series key and makes
+/// per-file statistics one row per data row.
+///
+/// A writer that knows should say. Line protocol always knows: tags are series
+/// identity by definition and fields are measures, which is why autoschema
+/// passes its tags here.
+pub fn init_table_tiered_with_series(
+    conn: &Connection,
+    table: &str,
+    schema: &str,
+    tiers: &str,
+    series_columns: &[&str],
+) -> Result<(), InitError> {
+    let series = series_columns.join(",");
+    init_impl(
+        conn,
+        table,
+        schema,
+        tiers,
+        None,
+        None,
+        if series.is_empty() {
+            None
+        } else {
+            Some(series.as_str())
+        },
+    )
 }
 
 /// [`init_table_tiered`] with an explicit base directory.
@@ -320,6 +354,7 @@ pub fn init_table_tiered_at(
         schema,
         tiers,
         Some(&base_dir.as_ref().display().to_string()),
+        None,
         None,
     )
 }
@@ -367,6 +402,7 @@ fn init_impl(
     tiers: &str,
     explicit_dir: Option<&str>,
     ts_column: Option<&str>,
+    series_columns: Option<&str>,
 ) -> Result<(), InitError> {
     let mut policy = catalog::parse_policy_string(table, tiers)
         .map_err(InitError::BadSchema)?;
@@ -392,6 +428,12 @@ fn init_impl(
     // Retention is set_retention()'s alone (the tiers string can't carry
     // it) — boot-time re-init always preserves what's stored.
     policy.retain_us = existing.as_ref().and_then(|e| e.retain_us);
+    // Series identity is stated once, by whoever created the table. A re-init
+    // that does not name it keeps what is stored rather than silently falling
+    // back to the type guess and rewriting every future stats table.
+    policy.series_columns = series_columns
+        .map(str::to_owned)
+        .or_else(|| existing.as_ref().and_then(|e| e.series_columns.clone()));
     policy.ts_column = ts_column
         .map(str::to_owned)
         .or(existing.and_then(|e| e.ts_column));
@@ -1037,7 +1079,7 @@ fn register_admin_functions(conn: &Connection) -> rusqlite::Result<()> {
             let tiers = opt_text(2)?.unwrap_or_else(|| "1d".to_owned());
             let dir = opt_text(3)?;
             let conn = unsafe { ctx.get_connection()? };
-            convert_table(&conn, &table, ts.as_deref(), &tiers, dir.as_deref())
+            convert_table(&conn, &table, ts.as_deref(), &tiers, dir.as_deref(), None)
                 .map_err(|e| rusqlite::Error::UserFunctionError(e.to_string().into()))?;
             Ok(table)
         })?;
@@ -1102,6 +1144,7 @@ fn convert_table(
     ts_column: Option<&str>,
     tiers: &str,
     base_dir: Option<&str>,
+    series_columns: Option<&str>,
 ) -> Result<(), InitError> {
     // Validate the policy BEFORE any DDL — a bad tiers string must not
     // leave the table stranded mid-rename.
@@ -1155,7 +1198,7 @@ fn convert_table(
         })?
         .collect::<Result<Vec<_>, _>>()?
         .join(", ");
-    init_impl(conn, table, &schema, tiers, base_dir, ts_column)
+    init_impl(conn, table, &schema, tiers, base_dir, ts_column, series_columns)
 }
 
 /// Set (or clear, with `None`) a table's retention — the
