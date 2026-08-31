@@ -180,3 +180,75 @@ fn eviction_removes_stats_rows() {
         "stats die with their files"
     );
 }
+
+// --- cardinality guard -------------------------------------------------
+//
+// Stats only pay for themselves when groups are fewer than rows. A series
+// column that is unique per row - an event id - makes one group per row:
+// nothing is ever pruned, no aggregate is ever answered from stats, and the
+// table becomes a second copy of the data with five aggregate columns on it.
+// Found in production at 0.85 stats rows per row, 830 MB describing 67 MB of
+// parquet.
+//
+// Skipping is safe by construction: the vtab prunes by "files that have stats,
+// minus files with a matching series row", so a file with no stats rows is
+// kept and simply not pruned.
+
+/// Compact `rows` rows whose series column takes `distinct` values, and report
+/// how many stats rows survived.
+fn stats_rows_for(rows: i64, distinct: i64) -> i64 {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = Connection::open_in_memory().unwrap();
+    silodb::load_module(&conn).unwrap();
+    silodb::init_table_tiered_at(
+        &conn,
+        "events",
+        "ts TIMESTAMP, series TEXT, value REAL",
+        "1d",
+        &dir.path().join("cold"),
+    )
+    .unwrap();
+
+    let base: i64 = 1_700_000_000_000_000;
+    let tx = conn.unchecked_transaction().unwrap();
+    for i in 0..rows {
+        tx.execute(
+            "INSERT INTO events VALUES (?1, ?2, ?3)",
+            params![base + i * 1_000, format!("s{}", i % distinct), 1.5_f64],
+        )
+        .unwrap();
+    }
+    tx.commit().unwrap();
+
+    silodb::maintain(&conn, "events", base + DAY + MARGIN + HOUR).unwrap();
+
+    conn.query_row("SELECT count(*) FROM events_stats", [], |r| r.get(0))
+        .unwrap_or(0)
+}
+
+#[test]
+fn a_series_unique_per_row_gets_no_stats() {
+    // 12,000 rows, 12,000 groups: prunes nothing, costs a full copy.
+    assert_eq!(stats_rows_for(12_000, 12_000), 0);
+}
+
+#[test]
+fn a_repeating_series_keeps_its_stats() {
+    // 12,000 rows across 10 series: exactly what pruning is for.
+    assert_eq!(stats_rows_for(12_000, 10), 10);
+}
+
+#[test]
+fn a_small_file_keeps_stats_even_when_unique() {
+    // Under the guard's floor the copy is cheap, and refusing it would lose
+    // pruning on small files for no real saving.
+    assert!(stats_rows_for(500, 500) > 0);
+}
+
+#[test]
+fn the_guard_turns_on_between_those_sizes() {
+    // The boundary is a size, not a ratio alone: same degenerate shape, one
+    // side of the floor each.
+    assert!(stats_rows_for(500, 500) > 0);
+    assert_eq!(stats_rows_for(40_000, 40_000), 0);
+}

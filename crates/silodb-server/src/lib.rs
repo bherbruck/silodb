@@ -360,6 +360,37 @@ pub async fn maintenance_loop(writer: Actor, secs: u64) {
                         eprintln!("maintain('{t}') failed: {e}");
                     }
                 }
+
+                // Reset the WAL, which nothing else here does.
+                //
+                // SQLite's automatic checkpoint is passive: it copies frames
+                // into the database but can only truncate the file once no
+                // reader holds a snapshot. This server keeps its read pool
+                // connected for the life of the process, so on a busy
+                // deployment that moment rarely arrives and the WAL only
+                // grows - 293 MB against the ~4 MB the 1000-page default
+                // implies, on the instance this was found on.
+                //
+                // TRUNCATE rather than RESTART: RESTART leaves the file at its
+                // high-water mark, which is the part being paid for. A busy
+                // result is the ordinary outcome under load, not a fault - the
+                // checkpoint yields to readers rather than blocking them, and
+                // the next tick tries again.
+                if let Err(e) = conn.pragma_update(None, "wal_checkpoint", "TRUNCATE") {
+                    let busy = matches!(
+                        e,
+                        rusqlite::Error::SqliteFailure(
+                            rusqlite::ffi::Error {
+                                code: rusqlite::ErrorCode::DatabaseBusy,
+                                ..
+                            },
+                            _
+                        )
+                    );
+                    if !busy {
+                        eprintln!("wal_checkpoint failed: {e}");
+                    }
+                }
             })
             .await;
     }

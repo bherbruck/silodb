@@ -1182,17 +1182,47 @@ impl FileStatsPlan {
 pub struct FileStatsAcc<'a> {
     plan: &'a FileStatsPlan,
     cells: std::collections::HashMap<Vec<KeyVal>, Vec<Aggs>>,
+    /// Rows fed in, to weigh against the groups they collapsed into.
+    rows: usize,
+    /// Set once the row:group ratio proves these stats cannot pay for
+    /// themselves. The map is dropped at that point and nothing further
+    /// accumulates - holding a group per row is most of what compaction's
+    /// memory peak is.
+    abandoned: bool,
 }
+
+/// How many rows a stats row must stand for to be worth storing.
+///
+/// Stats earn their space two ways: skipping a file whose series cannot match
+/// an EQ constraint, and answering an aggregate that covers a whole chunk
+/// without opening the parquet. Both need groups to be fewer than rows. When a
+/// series column is effectively unique - an event id, a request id, anything
+/// per-row - every group holds one row, nothing is ever pruned, and the stats
+/// table becomes a second copy of the data with five aggregate columns bolted
+/// on. Seen in production at 0.85 stats rows per row: 830 MB of stats and index
+/// describing 67 MB of parquet, 86% of the database.
+const STATS_MIN_ROWS_PER_GROUP: usize = 4;
+
+/// Below this many rows a file's stats are too small to be worth judging. The
+/// copy costs little even at one group per row, and refusing it would lose
+/// pruning on small files for no real saving.
+const STATS_GUARD_MIN_ROWS: usize = 10_000;
 
 impl<'a> FileStatsAcc<'a> {
     pub fn new(plan: &'a FileStatsPlan) -> Self {
         FileStatsAcc {
             plan,
             cells: std::collections::HashMap::new(),
+            rows: 0,
+            abandoned: false,
         }
     }
 
     pub fn add_row(&mut self, values: &[Value]) {
+        self.rows += 1;
+        if self.give_up_if_degenerate() {
+            return;
+        }
         let key: Vec<KeyVal> = self
             .plan
             .group_idxs
@@ -1218,9 +1248,32 @@ impl<'a> FileStatsAcc<'a> {
         }
     }
 
+    /// True once this file's stats have been abandoned.
+    ///
+    /// Consulted as rows arrive rather than at flush: by flush the map is
+    /// already built, and a group per row is precisely the allocation worth
+    /// not making. Only judged past the floor, so a small file is left alone.
+    fn give_up_if_degenerate(&mut self) -> bool {
+        if self.abandoned {
+            return true;
+        }
+        if self.rows >= STATS_GUARD_MIN_ROWS
+            && self.cells.len().saturating_mul(STATS_MIN_ROWS_PER_GROUP) > self.rows
+        {
+            self.cells = std::collections::HashMap::new();
+            self.abandoned = true;
+            return true;
+        }
+        false
+    }
+
     pub fn add_batch(&mut self, batch: &arrow::array::RecordBatch) {
         use arrow::array::{Array, AsArray};
         use arrow::datatypes::{Float64Type, Int64Type, TimestampMicrosecondType};
+        self.rows += batch.num_rows();
+        if self.give_up_if_degenerate() {
+            return;
+        }
         for row in 0..batch.num_rows() {
             let key: Vec<KeyVal> = self
                 .plan
@@ -1270,6 +1323,8 @@ impl<'a> FileStatsAcc<'a> {
 
     /// Ensure the stats table exists, clear any prior rows for `path`
     /// (idempotent re-runs), and insert. Caller's ambient transaction.
+    /// Returns how many stats rows were written - zero when the guard declined
+    /// them, which is not an error.
     pub fn flush(self, conn: &Connection, path: &str) -> Result<usize> {
         conn.execute_batch(&self.plan.ddl)?;
         conn.execute(
@@ -1279,6 +1334,16 @@ impl<'a> FileStatsAcc<'a> {
             ),
             [path],
         )?;
+
+        // Stats that summarise nothing are not written. Safe to skip: the vtab
+        // prunes by "files that have stats, minus files with a matching series
+        // row", so a file with none is kept and simply not pruned - the same
+        // path pre-upgrade files already take. The DELETE above still ran, so
+        // re-compacting a file that used to carry degenerate stats clears them.
+        if self.abandoned {
+            return Ok(0);
+        }
+
         let mut stmt = conn.prepare(&self.plan.insert_sql)?;
         let n = self.cells.len();
         for (key, aggs) in self.cells {
