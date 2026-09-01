@@ -1070,6 +1070,51 @@ pub struct FileStatsPlan {
     agg_idxs: Vec<usize>,
     ddl: String,
     insert_sql: String,
+    /// Columns this plan writes, so a table left over from a different
+    /// classification can be recognised - see [`FileStatsPlan::ensure_table`].
+    expected_cols: Vec<String>,
+}
+
+impl FileStatsPlan {
+    /// Create the stats table, replacing one whose shape no longer matches.
+    ///
+    /// The DDL is CREATE TABLE IF NOT EXISTS, which cannot reshape anything.
+    /// That is fine while a table's classification never changes, and wrong
+    /// the moment it can: declaring series identity on a table that already
+    /// has files turns former group columns into measures, so the insert then
+    /// names columns the old table does not have and every write fails - the
+    /// self-heal writes nothing, silently, because its result is discarded.
+    ///
+    /// Statistics are derived data. Dropping and rebuilding costs one re-read
+    /// per file, which the backfill was going to do anyway, and losing them
+    /// entirely is already safe: a file with no stats rows is kept and simply
+    /// not pruned.
+    pub fn ensure_table(&self, conn: &Connection) -> Result<()> {
+        let existing: Vec<String> = {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT name FROM pragma_table_info({})",
+                quote_literal(&self.stats_table)
+            ))?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+
+        if !existing.is_empty() && existing != self.expected_cols {
+            conn.execute_batch(&format!(
+                "DROP INDEX IF EXISTS {};
+                 DROP TABLE IF EXISTS {};",
+                quote_ident(&format!("{}_path", self.stats_table)),
+                quote_ident(&self.stats_table),
+            ))?;
+        }
+        conn.execute_batch(&self.ddl)?;
+        Ok(())
+    }
+}
+
+/// Single-quote a string for use as a SQL literal.
+fn quote_literal(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
 }
 
 /// Name of the stats table for a logical table.
@@ -1183,6 +1228,18 @@ impl FileStatsPlan {
                 cols.push(format!("{} {ty}", quote_ident(&format!("{n}_{suffix}"))));
             }
         }
+        let expected_cols: Vec<String> = {
+            let mut v = vec!["path".to_owned()];
+            for &i in &group_idxs {
+                v.push(columns[i].name.clone());
+            }
+            for &i in &agg_idxs {
+                for suffix in ["count", "sum", "sumsq", "min", "max"] {
+                    v.push(format!("{}_{suffix}", columns[i].name));
+                }
+            }
+            v
+        };
         let ddl = format!(
             "CREATE TABLE IF NOT EXISTS {} ({});
              CREATE INDEX IF NOT EXISTS {} ON {} (path);",
@@ -1217,6 +1274,7 @@ impl FileStatsPlan {
             agg_idxs,
             ddl,
             insert_sql,
+            expected_cols,
         }
     }
 }
@@ -1357,9 +1415,33 @@ impl<'a> FileStatsAcc<'a> {
                 if i >= batch.num_columns() {
                     continue;
                 }
-                let col = batch.column(i).as_primitive::<Float64Type>();
-                if !col.is_null(row) {
-                    aggs[slot].add(col.value(row));
+                // Match on the array's real type. as_primitive is an unchecked
+                // downcast: asking a column for the wrong one panics, which
+                // takes the connection thread with it and leaves every later
+                // request failing on a dead channel.
+                //
+                // This has to accept integers because a measure is no longer
+                // REAL by construction. Once series identity can be declared,
+                // an INTEGER column that nobody named is a measure - a count,
+                // a direction - and this path is the one that re-reads it back
+                // out of parquet during backfill and merge, where add_row's
+                // Value::Integer arm never runs.
+                let col = batch.column(i);
+                let v = match col.data_type() {
+                    arrow::datatypes::DataType::Float64 => {
+                        let a = col.as_primitive::<Float64Type>();
+                        (!a.is_null(row)).then(|| a.value(row))
+                    }
+                    arrow::datatypes::DataType::Int64 => {
+                        let a = col.as_primitive::<Int64Type>();
+                        (!a.is_null(row)).then(|| a.value(row) as f64)
+                    }
+                    // Anything else is not summable; leave the accumulator
+                    // untouched rather than guessing at a number.
+                    _ => None,
+                };
+                if let Some(v) = v {
+                    aggs[slot].add(v);
                 }
             }
         }
@@ -1370,7 +1452,7 @@ impl<'a> FileStatsAcc<'a> {
     /// Returns how many stats rows were written - zero when the guard declined
     /// them, which is not an error.
     pub fn flush(self, conn: &Connection, path: &str) -> Result<usize> {
-        conn.execute_batch(&self.plan.ddl)?;
+        self.plan.ensure_table(conn)?;
         conn.execute(
             &format!(
                 "DELETE FROM {} WHERE path = ?1",
@@ -1457,7 +1539,7 @@ pub fn stats_backfill_missing(
     let ts_idx = silodb_schema::resolve_ts_index(&columns, None)
         .map_err(|reason| CompactError::BadTimestampColumn { reason })?;
     let plan = FileStatsPlan::for_table(conn, logical_table, &columns, ts_idx);
-    conn.execute_batch(&plan.ddl)?;
+    plan.ensure_table(conn)?;
 
     let mut done = 0;
     for e in silodb_catalog::entries_for_table(conn, logical_table)? {

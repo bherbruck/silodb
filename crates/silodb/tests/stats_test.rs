@@ -252,3 +252,81 @@ fn the_guard_turns_on_between_those_sizes() {
     assert!(stats_rows_for(500, 500) > 0);
     assert_eq!(stats_rows_for(40_000, 40_000), 0);
 }
+
+// --- declaring series on a table that already has files ------------------
+//
+// The upgrade path, and the one that broke a production instance: a table
+// created before series identity could be declared, compacted for days, then
+// given a series list and asked to rebuild its statistics.
+//
+// Backfill re-reads parquet, so it runs through FileStatsAcc::add_batch rather
+// than add_row. Declaring a series makes every unnamed column a measure -
+// including INTEGER ones - and add_batch downcast every measure to Float64
+// unchecked. Asking an Int64 array for Float64 panics, which killed the
+// connection thread and left every later request failing on a closed channel.
+
+/// A table with an integer measure alongside a real one, created the old way:
+/// no declared series, so the type heuristic groups on the integer.
+fn env_with_int_measure() -> Env {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("cold");
+    let conn = Connection::open_in_memory().unwrap();
+    silodb::load_module(&conn).unwrap();
+    silodb::init_table_tiered_at(
+        &conn,
+        "readings",
+        "ts TIMESTAMP, device TEXT, seq INTEGER, value REAL",
+        "1d",
+        &base,
+    )
+    .unwrap();
+    Env { conn, _dir: dir }
+}
+
+#[test]
+fn declaring_series_later_rebuilds_stats_without_panicking() {
+    let e = env_with_int_measure();
+
+    // Two days of rows, so the first bucket closes and compacts.
+    for d in 0..2i64 {
+        for i in 0..600i64 {
+            e.conn
+                .execute(
+                    "INSERT INTO readings VALUES (?1, ?2, ?3, ?4)",
+                    params![d * DAY + i * 1000, format!("dev{}", i % 4), i, 1.5_f64],
+                )
+                .unwrap();
+        }
+    }
+    let now = 2 * DAY + MARGIN + 1;
+    e.maintain(now);
+
+    let before: i64 = e.count("SELECT count(*) FROM readings_stats");
+    assert!(before > 0, "expected stats from the first compaction");
+
+    // Declare the series after the fact, exactly as an operator would when
+    // upgrading, and clear the statistics so they are rebuilt against it.
+    e.conn
+        .execute(
+            "UPDATE _silodb_policy SET series_columns = 'device' WHERE logical_table = 'readings'",
+            [],
+        )
+        .unwrap();
+    e.conn.execute("DELETE FROM readings_stats", []).unwrap();
+
+    // The old stats table still has the old shape; the rebuild has to cope
+    // with that as well as with the integer measure.
+    e.maintain(now);
+
+    // Rebuilt, grouped on the declared series - four devices, not one row per
+    // sequence number.
+    let after: i64 = e.count("SELECT count(*) FROM readings_stats");
+    assert!(after > 0, "backfill wrote nothing after declaring a series");
+    assert!(
+        after <= 8,
+        "expected at most one stats row per device per file, got {after}"
+    );
+
+    // And the data is still readable, which is the thing that actually broke.
+    assert_eq!(e.count("SELECT count(*) FROM readings"), 1200);
+}
